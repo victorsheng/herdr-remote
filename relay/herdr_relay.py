@@ -222,8 +222,93 @@ def run_herdr(*args, remote=None):
         return ""
 
 
-def get_agents_from_host(remote=None):
-    raw = run_herdr("pane", "list", remote=remote)
+def _herdr_cmd(*args, remote=None):
+    if remote:
+        return ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote, HERDR, *args]
+    return [HERDR, *args]
+
+
+async def run_herdr_async(*args, remote=None, timeout=15):
+    """run_herdr 的协程版本。
+
+    同步版用 subprocess.run 阻塞调用线程——放在 asyncio 事件循环里意味着
+    一个慢 SSH（最长 15s）会卡住 relay 对所有客户端的处理，包括其它人的
+    read_pane 和整个 poll_loop。多 remote 时 N 次超时还会串行累加。
+
+    行为与同步版保持一致：任何失败都吞掉返回空串，调用方无需 try。
+    """
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_herdr_cmd(*args, remote=remote),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return stdout.decode(errors="replace").strip()
+    except asyncio.TimeoutError:
+        # 超时必须回收子进程，否则 SSH 会留成僵尸并占住连接
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        log.warning("herdr call timed out: args=%s remote=%s", args, remote)
+        return ""
+    except Exception:
+        return ""
+
+
+async def run_herdr_rc_async(*args, remote=None, timeout=15):
+    """需要退出码的场景（send_keys 要据此回 ack）。返回 (returncode, stdout)。
+
+    与 run_herdr_async 不同，这里不吞异常——调用方需要区分"命令失败"
+    和"命令成功但无输出"。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *_herdr_cmd(*args, remote=remote),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise
+    return proc.returncode, stdout.decode(errors="replace").strip()
+
+
+async def get_agents_from_host_async(remote=None):
+    raw = await run_herdr_async("pane", "list", remote=remote)
+    return _parse_pane_list(raw, remote)
+
+
+async def get_all_agents_async():
+    """本机与所有 remote 并发查询，总耗时取最慢的一个而非累加。"""
+    results = await asyncio.gather(
+        get_agents_from_host_async(remote=None),
+        *(get_agents_from_host_async(remote=r) for r in REMOTES),
+    )
+    agents = []
+    for chunk in results:
+        agents.extend(chunk)
+    return agents
+
+
+async def read_pane_async(pane_id, remote=None):
+    raw = await run_herdr_async("pane", "read", pane_id, "--lines", "50",
+                                "--source", "recent", remote=remote)
+    lines = [l for l in raw.splitlines() if l.strip() and not CHROME_RE.search(l)]
+    return "\n".join(lines[-20:])
+
+
+def _parse_pane_list(raw, remote):
+    """解析 `herdr pane list` 的 JSON 输出。同步与异步版共用，避免两处漂移。"""
     host_label = remote or "local"
     try:
         data = json.loads(raw)
@@ -245,6 +330,10 @@ def get_agents_from_host(remote=None):
         ]
     except (json.JSONDecodeError, KeyError):
         return []
+
+
+def get_agents_from_host(remote=None):
+    return _parse_pane_list(run_herdr("pane", "list", remote=remote), remote)
 
 
 def get_all_agents():
@@ -293,8 +382,29 @@ async def poll_loop():
         await asyncio.sleep(POLL_INTERVAL)
 
 
+async def announce_blocked(pane_id, *, agent, project, host, remote):
+    """广播 blocked 并发 Web Push。轮询与事件两条路径共用，
+    避免像此前那样只有轮询路径发推送、事件路径静默。
+
+    调用方负责去重（比对 last_statuses），本函数只管发。
+    """
+    content = await read_pane_async(pane_id, remote=remote)
+    options = detect_options(content)
+    await broadcast({
+        "type": "blocked", "pane_id": pane_id,
+        "agent": agent, "project": project, "host": host,
+        "prompt": content[:500],
+        "options": options or TOOL_OPTIONS,
+    })
+    await send_web_push(
+        title=f"🐑 {project} blocked",
+        body=content[:120],
+        url=f"/?pane={pane_id}",
+    )
+
+
 async def _poll_once():
-        agents = get_all_agents()
+        agents = await get_all_agents_async()
         # Always broadcast (even empty list) so clients stay in sync
         for a in agents:
             pane_remote_map[a["pane_id"]] = a.get("remote")
@@ -304,20 +414,9 @@ async def _poll_once():
         for a in agents:
             pid, status = a["pane_id"], a["status"]
             if status == "blocked" and last_statuses.get(pid) != "blocked":
-                content = read_pane(pid, remote=a.get("remote"))
-                options = detect_options(content)
-                await broadcast({
-                    "type": "blocked", "pane_id": pid,
-                    "agent": a["agent"], "project": a["project"],
-                    "host": a.get("host", "local"),
-                    "prompt": content[:500],
-                    "options": options or TOOL_OPTIONS
-                })
-                # Web Push notification
-                await send_web_push(
-                    title=f"🐑 {a['project']} blocked",
-                    body=content[:120],
-                    url=f"/?pane={pid}",
+                await announce_blocked(
+                    pid, agent=a["agent"], project=a["project"],
+                    host=a.get("host", "local"), remote=a.get("remote"),
                 )
             # Send clear push when agent unblocks
             if status != "blocked" and last_statuses.get(pid) == "blocked":
@@ -351,21 +450,46 @@ async def event_push():
         status = agent_data.get("status", "")
         host = agent_data.get("host", "local")
 
-        if status == "blocked" and pane_id:
-            remote = pane_remote_map.get(pane_id)
-            if remote or host == "local":
-                content = read_pane(pane_id, remote=remote)
-            else:
-                content = event.get("prompt", "Agent is blocked")
-            options = detect_options(content)
-            await broadcast({
-                "type": "blocked", "pane_id": pane_id,
-                "agent": agent_data.get("agent", ""),
-                "project": agent_data.get("project", ""),
-                "host": host,
-                "prompt": content[:500],
-                "options": options or TOOL_OPTIONS
-            })
+        # 与轮询路径一致地做状态跳变判断：此前事件路径不看 last_statuses，
+        # 同一 pane 反复推 blocked 会重复广播；也不更新 last_statuses，
+        # 导致轮询随后又会把同一次 blocked 再报一遍。
+        if pane_id:
+            was_blocked = last_statuses.get(pane_id) == "blocked"
+
+            if status == "blocked" and not was_blocked:
+                remote = pane_remote_map.get(pane_id)
+                if remote or host == "local":
+                    await announce_blocked(
+                        pane_id,
+                        agent=agent_data.get("agent", ""),
+                        project=agent_data.get("project", ""),
+                        host=host, remote=remote,
+                    )
+                else:
+                    # 远端 pane 尚未建立 remote 映射时读不到内容，
+                    # 退回事件自带的 prompt，但推送照发——否则 hook 的
+                    # 提速对远端主机完全失效。
+                    content = event.get("prompt", "Agent is blocked")
+                    options = detect_options(content)
+                    await broadcast({
+                        "type": "blocked", "pane_id": pane_id,
+                        "agent": agent_data.get("agent", ""),
+                        "project": agent_data.get("project", ""),
+                        "host": host,
+                        "prompt": content[:500],
+                        "options": options or TOOL_OPTIONS,
+                    })
+                    await send_web_push(
+                        title=f"🐑 {agent_data.get('project', '')} blocked",
+                        body=content[:120],
+                        url=f"/?pane={pane_id}",
+                    )
+
+            if status and status != "blocked" and was_blocked:
+                await send_web_push("", "", clear=True)
+
+            if status:
+                last_statuses[pane_id] = status
 
         if update:
             known_panes.add(pane_id)
@@ -525,7 +649,7 @@ async def handle_client(ws):
                 remote = pane_remote_map.get(pane_id)
                 log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("respond", ip, device, pane_id, f"text={text!r}")
-                run_herdr("pane", "send-text", pane_id, text + "\n", remote=remote)
+                await run_herdr_async("pane", "send-text", pane_id, text + "\n", remote=remote)
             elif msg_type == "agent_event":
                 ok, reason = validate_agent_event(msg)
                 if not ok:
@@ -539,7 +663,7 @@ async def handle_client(ws):
                     continue
                 lines = msg.get("lines", "30")
                 remote = pane_remote_map.get(pane_id)
-                content = run_herdr("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
+                content = await run_herdr_async("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
                 await ws.send(json.dumps({"type": "pane_content", "pane_id": pane_id, "content": content}))
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
@@ -554,13 +678,13 @@ async def handle_client(ws):
                 log.info("Keys from %s (%s): pane=%s keys=%s", ip, device, pane_id, keys)
                 audit("send_keys", ip, device, pane_id, f"keys={keys}")
                 try:
-                    result = run_herdr_result("pane", "send-keys", pane_id, *keys, remote=remote)
+                    returncode, _ = await run_herdr_rc_async("pane", "send-keys", pane_id, *keys, remote=remote)
                 except Exception as e:
                     log.warning("send_keys command failed for pane %s: %s", pane_id, e)
                     await ws.send(json.dumps({"type": "error", "message": "send_keys command failed"}))
                     continue
-                if result.returncode != 0:
-                    log.warning("send_keys command failed for pane %s with exit %s", pane_id, result.returncode)
+                if returncode != 0:
+                    log.warning("send_keys command failed for pane %s with exit %s", pane_id, returncode)
                     await ws.send(json.dumps({"type": "error", "message": "send_keys command failed"}))
                     continue
                 await ws.send(json.dumps({"type": "command_result", "command": "send_keys", "ok": True}))
@@ -576,13 +700,13 @@ async def handle_client(ws):
                 remote = pane_remote_map.get(pane_id)
                 log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("send_text", ip, device, pane_id, f"text={text!r}")
-                run_herdr("pane", "send-text", pane_id, text, remote=remote)
+                await run_herdr_async("pane", "send-text", pane_id, text, remote=remote)
             elif msg_type == "create_tab":
                 workspace_id = msg.get("workspace_id", "")
                 if workspace_id:
                     log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
                     audit("create_tab", ip, device, "", f"workspace={workspace_id}")
-                    run_herdr("tab", "create", "--workspace", workspace_id, "--focus")
+                    await run_herdr_async("tab", "create", "--workspace", workspace_id, "--focus")
                     await ws.send(json.dumps({"type": "tab_created", "ok": True}))
                 else:
                     await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))

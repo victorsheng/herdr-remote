@@ -470,7 +470,10 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         values = eval(compile(ast.Expression(safe_keys), str(relay_path), "eval"), {"range": range})
         self.assertTrue({"1", "2", "3"}.issubset(values))
         self.assertIn('"command": "send_keys", "ok": True', source)
-        self.assertIn("if result.returncode != 0:", source)
+        # 只有退出码为 0 才回 ack。原先断言的是 `result.returncode`，
+        # 但 subprocess 异步化后该变量改名为 returncode——断言的意图是
+        # "回 ack 前检查了退出码"，故改为匹配行为而非某个变量拼写。
+        self.assertRegex(source, r"if\s+(result\.)?returncode\s*!=\s*0:")
 
     def test_relay_disconnect_clears_approval_generations(self):
         tg.relay_connected = True
