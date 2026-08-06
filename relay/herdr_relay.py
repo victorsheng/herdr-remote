@@ -4,7 +4,7 @@
 # dependencies = ["websockets>=14.0", "zeroconf>=0.80.0", "pywebpush>=2.0.0", "py-vapid>=1.9.0"]
 # ///
 """herdr-remote relay — polls herdr, accepts push events (HTTP POST + WebSocket + UDP), broadcasts to clients."""
-import asyncio, json, logging, os, re, shutil, signal, socket, subprocess, time
+import asyncio, json, logging, os, re, secrets, shutil, signal, socket, subprocess, time
 
 from agent_state import complete_agent_update_message
 
@@ -77,6 +77,55 @@ SAFE_RESPONSES = {"y", "n", "a", "yes", "no", "trust", "yes, single permission",
 SAFE_KEYS = {"y", "n", "a", "Enter", "Tab", "Escape", "C-c", "Up", "Down", "Left", "Right", "BSpace"} | {
     str(number) for number in range(10)
 }
+
+# --- Agent event validation ---
+# agent_event / UDP / HTTP ?d= 三个入口原先零校验，而 AUTH_TOKEN 默认为空、
+# relay 监听 0.0.0.0 且主动 mDNS 广播。组合起来同网段任何设备都能伪造 blocked
+# 事件，进而在 Telegram / Web Push 里诱导用户点 "Trust always"。
+# 这里做的是最小充分校验：类型、必需键、状态枚举、字段长度上限。
+AGENT_STATUSES = {"blocked", "working", "idle", "done", "error"}
+# prompt 是唯一可能较长的字段（blocked 时的提示原文），其余都是标识符量级。
+# 上限取 4000：足够容纳 relay 自己截断到 500 的 prompt，又不至于撑爆推送体积。
+_EVENT_FIELD_LIMIT = 4000
+_EVENT_MAX_KEYS = 32
+
+
+def validate_agent_event(event):
+    """校验外部送入的 agent 事件。返回 (ok, reason)。
+
+    宽进严出：字段缺失交由 complete_agent_update_message 兜底（它会要求
+    pane_id/agent/status/cwd/project 齐全），这里只拦明显畸形与伪造。
+    """
+    if not isinstance(event, dict):
+        return False, "event must be an object"
+    if len(event) > _EVENT_MAX_KEYS:
+        return False, "too many keys"
+
+    pane_id = event.get("pane_id")
+    if not isinstance(pane_id, str) or not pane_id.strip():
+        return False, "pane_id must be a non-empty string"
+
+    status = event.get("status")
+    if status is not None and status not in AGENT_STATUSES:
+        return False, f"unknown status: {status!r}"
+
+    for key, value in event.items():
+        if not isinstance(key, str):
+            return False, "keys must be strings"
+        if isinstance(value, str) and len(value) > _EVENT_FIELD_LIMIT:
+            return False, f"field {key} exceeds {_EVENT_FIELD_LIMIT} chars"
+    return True, ""
+
+
+def token_matches(provided, expected):
+    """常量时间比较，避免逐字符比较带来的时序侧信道。
+
+    两侧都为空时视为不匹配——是否放行由调用方按 AUTH_TOKEN 是否配置决定，
+    这里不替调用方做"未启用鉴权"的语义判断。
+    """
+    if not provided or not expected:
+        return False
+    return secrets.compare_digest(str(provided), str(expected))
 
 # --- Audit logging ---
 _audit_handler = RotatingFileHandler(AUDIT_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
@@ -342,7 +391,7 @@ async def process_request(connection, request):
             _, qs = request.path.split("?", 1) if "?" in request.path else (request.path, "")
             params = urllib.parse.parse_qs(qs)
             token = params.get("token", [None])[0]
-        if token != AUTH_TOKEN:
+        if not token_matches(token, AUTH_TOKEN):
             headers = Headers([("Content-Type", "text/plain")])
             return Response(401, "Unauthorized", headers, b"Invalid token\n")
 
@@ -418,9 +467,14 @@ async def process_request(connection, request):
         if "d" in params:
             try:
                 event = json.loads(urllib.parse.unquote(params["d"][0]))
-                event_queue.put_nowait(event)
             except Exception:
-                pass
+                event = None
+            if event is not None:
+                ok, reason = validate_agent_event(event)
+                if ok:
+                    event_queue.put_nowait(event)
+                else:
+                    log.warning("Rejected HTTP event: %s", reason)
 
     headers = Headers([("Access-Control-Allow-Origin", "*")])
     return Response(200, "OK", headers, b"ok\n")
@@ -473,7 +527,11 @@ async def handle_client(ws):
                 audit("respond", ip, device, pane_id, f"text={text!r}")
                 run_herdr("pane", "send-text", pane_id, text + "\n", remote=remote)
             elif msg_type == "agent_event":
-                event_queue.put_nowait(msg)
+                ok, reason = validate_agent_event(msg)
+                if not ok:
+                    await ws.send(json.dumps({"type": "error", "message": f"invalid agent_event: {reason}"}))
+                else:
+                    event_queue.put_nowait(msg)
             elif msg_type == "read_pane":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
@@ -552,9 +610,14 @@ async def handle_client(ws):
 class UDPPlugin(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         try:
-            event_queue.put_nowait(json.loads(data.decode()))
+            event = json.loads(data.decode())
         except Exception:
-            pass
+            return
+        ok, reason = validate_agent_event(event)
+        if not ok:
+            log.warning("Rejected UDP event from %s: %s", addr, reason)
+            return
+        event_queue.put_nowait(event)
 
 
 def start_mdns():

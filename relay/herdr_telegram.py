@@ -437,10 +437,11 @@ async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No agent matching '{query}'.")
         return
 
-    import websockets
+    # 必须走 send_keys_to_relay：它会读 relay 的 ack/error。
+    # 原先自己建连接发完就报成功，而 Telegram 侧用的键名不在 relay 的 SAFE_KEYS
+    # 里（relay 只认 C-c），会被整条拒绝——用户却看到 "Sent Ctrl+C" 的假成功。
     try:
-        async with websockets.connect(RELAY_WS) as ws:
-            await ws.send(json.dumps({"type": "send_keys", "pane_id": match["pane_id"], "keys": ["Ctrl+c"]}))
+        await send_keys_to_relay(match["pane_id"], ["C-c"])
         await update.message.reply_text(f"Sent Ctrl+C to {match['project']}")
     except Exception as e:
         await update.message.reply_text(f"Failed: {scrub(e)}")
@@ -595,10 +596,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "interrupt":
-        import websockets
+        # 同上：走会读 ack 的 helper，键名用 relay 白名单里的 "C-c"
         try:
-            async with websockets.connect(RELAY_WS) as ws:
-                await ws.send(json.dumps({"type": "send_keys", "pane_id": data["pane_id"], "keys": ["Ctrl+c"]}))
+            await send_keys_to_relay(data["pane_id"], ["C-c"])
             await query.message.reply_text("Sent Ctrl+C")
         except Exception as e:
             await query.message.reply_text(f"Failed: {scrub(e)}")
