@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>触摸目标回归测试 · herdr-remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, 'PingFang SC', sans-serif; margin: 0; padding: 20px;
+         background: #1a1b26; color: #c0caf5; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: #565f89; font-size: 0.8rem; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2f3549; }
+  th { color: #565f89; font-weight: 600; font-size: 0.72rem; }
+  td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+  .pass { color: #9ece6a; font-weight: 600; }
+  .fail { color: #f7768e; font-weight: 600; }
+  #summary { padding: 12px 14px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; }
+  #summary.ok { background: rgba(158,206,106,0.12); border: 1px solid #9ece6a; color: #9ece6a; }
+  #summary.bad { background: rgba(247,118,142,0.12); border: 1px solid #f7768e; color: #f7768e; }
+  .note { font-size: 0.76rem; color: #565f89; margin: -8px 0 18px; }
+  /* 被测页面用 iframe 真实加载 ../index.html，而不是把 CSS 抄一份进来。
+     抄一份的测试改了测试文件就能变绿，无法证明真实页面被修好。 */
+  #frame { position: absolute; left: -99999px; top: 0; width: 390px; height: 844px; border: 0; }
+</style>
+</head>
+<body>
+
+<h1>触摸目标回归测试</h1>
+<div class="sub">直接加载 <code>../index.html</code>，实测命中区尺寸与触摸相关 CSS</div>
+
+<div id="summary">运行中…</div>
+<div id="results"></div>
+
+<div class="note">
+  基准 44×44 CSS px 来自 Apple HIG。命中区按「元素自身矩形 ∪ ::after 伪元素矩形」计算——
+  项目里用不可见 <code>::after</code> 外扩命中区是既定手法（见 <code>.header button</code>），
+  故不能只量元素本身。
+</div>
+
+<iframe id="frame" src="../index.html"></iframe>
+
+<script>
+const HIG_MIN = 44;
+const rows = [];
+let allPass = true;
+let fatal = null;
+
+function record(name, actual, expected, ok, unit = 'px') {
+  if (!ok) allPass = false;
+  rows.push({ name, actual, expected, unit, ok });
+}
+
+/** 命中区 = 元素矩形与其 ::after 伪元素矩形的并集。
+    ::after 常用 position:absolute + transform 居中来外扩，getBoundingClientRect
+    量不到伪元素，故从 computedStyle 读取其宽高再与元素中心对齐推算。 */
+function hitSize(win, el) {
+  const r = el.getBoundingClientRect();
+  let w = r.width, h = r.height;
+  const after = win.getComputedStyle(el, '::after');
+  // content 为 none 表示无伪元素；有些浏览器返回 'none'，有些返回 ''
+  if (after && after.content && after.content !== 'none' && after.position === 'absolute') {
+    const aw = parseFloat(after.width), ah = parseFloat(after.height);
+    if (!Number.isNaN(aw)) w = Math.max(w, aw);
+    if (!Number.isNaN(ah)) h = Math.max(h, ah);
+  }
+  return { w: +w.toFixed(1), h: +h.toFixed(1) };
+}
+
+function run(doc, win) {
+  // ── 1) 关键控件的触摸目标尺寸 ────────────────────────────
+  // 只测默认可见、或能通过纯 CSS 显示出来的控件。
+  // 需要 WebSocket 数据才能渲染的控件（.agent/.chip/.queue-chip）用样式探针测。
+  const SELECTORS = [
+    ['顶栏按钮（Timeline）',   '.header button'],
+    ['终端返回键',             '.term-header .back'],
+    ['终端刷新键',             '.term-header .refresh-btn'],
+    ['Keys/123 切换页签',      '.tab-btn'],
+    ['终端方向键 nav-key',     '.nav-key'],
+    ['Ctrl 预设键',            '.ctrl-key'],
+    ['数字键',                 '.digit-key'],
+    ['授权按钮 Yes/No',        '.quick-actions button'],
+  ];
+
+  // 终端视图默认 display:none，强制显示以便测量其中的控件
+  const tv = doc.querySelector('.terminal-view');
+  if (tv) tv.classList.add('active');
+  for (const id of ['termKeys', 'quickDock']) {
+    const el = doc.getElementById(id);
+    if (el) el.style.display = 'flex';
+  }
+  // 数字键与 Ctrl 预设是 JS 动态生成的，测试里静态补一个同类节点即可量到 CSS
+  const keysHost = doc.getElementById('termKeys');
+  if (keysHost && !doc.querySelector('.digit-key')) {
+    const probe = doc.createElement('button');
+    probe.className = 'digit-key'; probe.textContent = '1';
+    keysHost.appendChild(probe);
+  }
+  if (keysHost && !doc.querySelector('.ctrl-key')) {
+    const probe = doc.createElement('button');
+    probe.className = 'ctrl-key'; probe.textContent = 'Ctrl C';
+    keysHost.appendChild(probe);
+  }
+  if (keysHost && !doc.querySelector('.quick-actions button')) {
+    const qa = doc.createElement('div');
+    qa.className = 'quick-actions';
+    qa.innerHTML = '<button class="btn-yes">Yes</button>';
+    keysHost.appendChild(qa);
+  }
+
+  for (const [name, sel] of SELECTORS) {
+    const el = doc.querySelector(sel);
+    if (!el) { record(`${name} 命中区`, '未找到', `≥${HIG_MIN}`, false); continue; }
+    const { w, h } = hitSize(win, el);
+    const min = Math.min(w, h);
+    record(`${name} 命中区`, `${w}×${h}`, `≥${HIG_MIN}×${HIG_MIN}`, w >= HIG_MIN && h >= HIG_MIN);
+  }
+
+  // ── 2) hover 粘滞防护 ────────────────────────────────────
+  // 规则必须包在 @media (hover: hover) 内，否则 iOS 上点完样式不消失。
+  // 遍历同文档样式表，找出裸露的 :hover 规则。
+  const bareHover = [];
+  for (const sheet of doc.styleSheets) {
+    let rules;
+    try { rules = sheet.cssRules; } catch { continue; }  // 跨域样式表跳过
+    const walk = (list, guarded) => {
+      for (const rule of list) {
+        if (rule.type === CSSRule.MEDIA_RULE) {
+          const g = guarded || /hover\s*:\s*hover/.test(rule.conditionText || '')
+                            || /pointer\s*:\s*fine/.test(rule.conditionText || '');
+          walk(rule.cssRules, g);
+        } else if (rule.selectorText && rule.selectorText.includes(':hover') && !guarded) {
+          bareHover.push(rule.selectorText);
+        }
+      }
+    };
+    walk(sheet.cssRules, false);
+  }
+  record('未受保护的 :hover 规则', bareHover.length ? bareHover.join(' / ') : '无', '无',
+         bareHover.length === 0, '');
+
+  // ── 3) 触摸相关 CSS 声明 ─────────────────────────────────
+  const body = doc.body;
+  const bodyCS = win.getComputedStyle(body);
+  // tap 高亮：非 transparent 时 iOS 会在圆角按钮上闪出方形灰块
+  const tap = bodyCS.webkitTapHighlightColor || '';
+  const tapOff = /rgba\(0,\s*0,\s*0,\s*0\)|transparent/.test(tap);
+  record('-webkit-tap-highlight-color', tap || '未设置', 'transparent', tapOff, '');
+
+  // touch-action: manipulation 作为 tap delay 保险丝
+  const btn = doc.querySelector('.nav-key') || doc.querySelector('.header button');
+  const ta = btn ? win.getComputedStyle(btn).touchAction : '';
+  record('按钮 touch-action', ta || '未设置', 'manipulation',
+         /manipulation/.test(ta), '');
+
+  // 按钮文字长按不应弹出选择气泡
+  const us = btn ? (win.getComputedStyle(btn).webkitUserSelect ||
+                    win.getComputedStyle(btn).userSelect) : '';
+  record('按钮 user-select', us || '未设置', 'none', us === 'none', '');
+
+  // ── 4) 命令面板必须避让软键盘 ────────────────────────────
+  // 面板 bottom:0 且 max-height:50dvh，若不消费 --kb-inset，
+  // 键盘弹起后列表项被完全遮住 —— 这是功能性缺陷而非手感问题。
+  const palette = doc.getElementById('cmdPalette');
+  let panel = null;
+  if (palette) {
+    // 面板是遮罩之后的那个 div
+    panel = palette.querySelector('div[style*="bottom"]') ||
+            palette.children[palette.children.length - 1];
+  }
+  if (!panel) {
+    record('命令面板避让键盘', '未找到面板', '消费 --kb-inset', false, '');
+  } else {
+    // 注入一个非零 --kb-inset 模拟键盘弹起，面板底边应随之抬升
+    palette.style.display = 'block';
+    const before = panel.getBoundingClientRect().bottom;
+    doc.documentElement.style.setProperty('--kb-inset', '300px');
+    const after = panel.getBoundingClientRect().bottom;
+    doc.documentElement.style.setProperty('--kb-inset', '0px');
+    palette.style.display = 'none';
+    const lifted = (before - after);
+    record('命令面板随键盘抬升', `${lifted.toFixed(0)}px`, '≈300px',
+           lifted >= 290);
+  }
+
+  // ── 5) 底部输入栏安全区 ──────────────────────────────────
+  // termKeys/quickDock 默认都隐藏，此时最底部是 .term-input，
+  // 它自身必须留出 safe-area-inset-bottom，否则压住 Home Indicator。
+  for (const id of ['termKeys', 'quickDock']) {
+    const el = doc.getElementById(id);
+    if (el) el.style.display = 'none';
+  }
+  const ti = doc.querySelector('.term-input');
+  if (!ti) {
+    record('.term-input 底部安全区', '未找到', '含 safe-area', false, '');
+  } else {
+    // 用 env() 的回退值探测：把回退值设成一个可识别的大数，
+    // 若样式里根本没引用 env(safe-area-inset-bottom)，padding 不会变化。
+    const pb = parseFloat(win.getComputedStyle(ti).paddingBottom);
+    // 桌面 Chrome 下 env(safe-area-inset-bottom) 为 0，故只能验证「引用了」而非具体数值：
+    // 检查 CSS 文本中该元素规则是否含 safe-area-inset-bottom
+    let referenced = false;
+    for (const sheet of doc.styleSheets) {
+      let rules; try { rules = sheet.cssRules; } catch { continue; }
+      // 注意：Chrome 支持嵌套 CSS 后，普通 CSSStyleRule 也带一个空的 cssRules，
+      // 所以不能用 `if (rule.cssRules) { 递归; continue; }` —— 那会把每条普通规则
+      // 都当成容器跳过，导致永远匹配不到。这里先判本身，再递归子规则。
+      const walk = list => {
+        for (const rule of list) {
+          if (rule.selectorText && /\.term-input(?![\w-])/.test(rule.selectorText)
+              && /safe-area-inset-bottom/.test(rule.cssText)) referenced = true;
+          if (rule.cssRules && rule.cssRules.length) walk(rule.cssRules);
+        }
+      };
+      walk(rules);
+    }
+    record('.term-input 引用 safe-area-inset-bottom', referenced ? '是' : '否', '是',
+           referenced, '');
+  }
+}
+
+const frame = document.getElementById('frame');
+frame.addEventListener('load', () => {
+  try {
+    run(frame.contentDocument, frame.contentWindow);
+  } catch (e) {
+    fatal = e.message || String(e);
+    allPass = false;
+  }
+  render();
+});
+
+function render() {
+  const tbl = ['<table><tr><th>检查项</th><th style="text-align:right">实测</th>' +
+               '<th style="text-align:right">期望</th><th>结论</th></tr>'];
+  for (const r of rows) {
+    tbl.push(`<tr>
+      <td>${r.name}</td>
+      <td class="num">${r.actual}${r.unit}</td>
+      <td class="num">${r.expected}${r.unit}</td>
+      <td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td>
+    </tr>`);
+  }
+  tbl.push('</table>');
+  document.getElementById('results').innerHTML = tbl.join('');
+
+  const s = document.getElementById('summary');
+  s.className = allPass ? 'ok' : 'bad';
+  const failed = rows.filter(r => !r.ok).length;
+  s.textContent = fatal ? `✗ 测试无法完成：${fatal}`
+    : allPass ? `✓ 全部 ${rows.length} 项通过`
+              : `✗ ${failed}/${rows.length} 项未达标`;
+
+  window.__TOUCH_RESULT__ = { allPass, fatal, rows };
+  window.__TOUCH_DONE__ = true;
+}
+</script>
+</body>
+</html>

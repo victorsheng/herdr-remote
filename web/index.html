@@ -46,6 +46,18 @@ document.addEventListener('DOMContentLoaded', () => bind());
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 *:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
+/* iOS 默认会在被点元素上闪一层半透明灰底，圆角按钮上会露出方形边角。
+   置为 transparent 后反馈完全交给各控件已有的 :active 态。 */
+html { -webkit-tap-highlight-color: transparent; }
+/* manipulation = 保留滚动与捏合、禁用双击缩放，从而免除 tap delay。
+   现代 iOS 靠 width=device-width 已默认关闭该延迟，这里是给旧 WebView
+   和改了缩放行为的辅助功能场景上的保险丝。 */
+/* user-select:none 仅作用于控件：长按 Esc / Ctrl C 等按键文字不再弹出
+   「拷贝／查询」气泡。终端内容与输入框需要可选中，故排除在外。 */
+button, .chip, .nav-key, .ctrl-key, .digit-key, .tab-btn, .queue-chip, .agent {
+  touch-action: manipulation;
+  -webkit-user-select: none; user-select: none;
+}
 /* 渐进增强顺序：旧值在前、新值在后。若把 -webkit-fill-available 写在 100dvh 之后，
    iOS 15.4+ 两者都合法，后者会覆盖 dvh 使其失效。 */
 /* PingFang SC 显式排在 -apple-system 之后：iOS 上中文本就回落到苹方，但显式声明可保证
@@ -66,7 +78,12 @@ body { line-height: 1.2; }
    满足 HIG 最小触控目标，且不占据布局空间（绝对定位不影响 flex 尺寸）。 */
 .header button { position: relative; background: none; border: none; color: var(--muted); cursor: pointer; padding: 6px; min-width: 36px; min-height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: color 0.15s, background 0.15s; }
 .header button::after { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; }
-.header button:hover { color: var(--text); background: var(--border); }
+/* 所有 :hover 必须包在 @media (hover: hover) 内：触摸屏上点击会合成一次 hover，
+   且不会有对应的 mouseout，样式便一直残留（sticky hover）。
+   .agent:hover 带 translateY + 阴影，残留时看起来像卡片被「选中卡住」了。 */
+@media (hover: hover) and (pointer: fine) {
+  .header button:hover { color: var(--text); background: var(--border); }
+}
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .dot.pulse { animation: pulse 2s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
@@ -95,7 +112,9 @@ body { line-height: 1.2; }
 .section-header { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; color: var(--muted); margin: 8px 0 4px; display: flex; align-items: center; gap: 5px; }
 .section-header:first-child { margin-top: 2px; }
 .agent { background: var(--surface); border-radius: 8px; padding: 7px 10px; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; cursor: pointer; border: 1px solid var(--border); transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease; }
-.agent:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+@media (hover: hover) and (pointer: fine) {
+  .agent:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+}
 .agent:active { transform: scale(0.99); box-shadow: none; }
 .agent .dot { width: 10px; height: 10px; }
 .agent.blocked { border-color: var(--red); background: color-mix(in srgb, var(--red) 5%, var(--surface)); }
@@ -109,7 +128,9 @@ body { line-height: 1.2; }
 .chip.alert::after { content: ''; position: absolute; top: -2px; right: -2px; width: 8px; height: 8px; border-radius: 50%; background: var(--red); border: 2px solid var(--bg); }
 .chip:active { transform: scale(0.95); }
 .chip-add { border: 2px dashed var(--border); background: transparent; color: var(--muted); font-size: 1rem; padding: 4px 12px; }
-.chip-add:hover { border-color: var(--blue); color: var(--blue); }
+@media (hover: hover) and (pointer: fine) {
+  .chip-add:hover { border-color: var(--blue); color: var(--blue); }
+}
 /* min-width:0 让 flex 子项可以收缩，否则长项目名会把右侧箭头挤出卡片。 */
 .agent .info { flex: 1; min-width: 0; }
 /* 中文在同等 font-size 下字面高度大于拉丁字母，但笔画密度高、小字号下更难辨认，
@@ -123,9 +144,14 @@ body { line-height: 1.2; }
 .terminal-view { display: none; flex-direction: column; position: fixed; inset: 0; top: calc(var(--header-h) + env(safe-area-inset-top, 0px)); bottom: var(--kb-inset, 0px); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); background: var(--bg); z-index: 50; }
 .terminal-view.active { display: flex; }
 .term-header { padding: 6px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-.term-header .back { background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 6px; display: flex; align-items: center; }
+/* 与 .header button 同一手法：视觉尺寸不变，用不可见 ::after 把命中区撑到 44×44。
+   这样既不破坏上一轮刻意压缩的顶栏密度，又满足 HIG 最小触控目标。 */
+.term-header .back { position: relative; background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 6px; display: flex; align-items: center; }
+.term-header .back::after { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; }
 .term-header .title { flex: 1; min-width: 0; font-size: 0.85rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.term-header .refresh-btn { background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; }
+/* 原本仅 16×20（* 选择器把 UA 默认 padding 清零了，只剩 SVG 本身），是全站最难点中的目标。 */
+.term-header .refresh-btn { position: relative; background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; display: flex; align-items: center; }
+.term-header .refresh-btn::after { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; }
 /* 终端是等宽上下文：word-break: break-all 会把中文和英文单词都硬切。
    中文本就允许任意换行，改用 anywhere 可保留英文单词完整性，同时中文照常折行。 */
 /* 曾改为 white-space: pre + overflow-x: auto（不折行、横向滚动，Windows Terminal
@@ -144,9 +170,16 @@ body { line-height: 1.2; }
    否则中英混排时行距会忽宽忽窄。 */
 .term-content .cjk { display: inline-block; width: 1.2041em; height: calc(var(--term-lh) * 1em); line-height: calc(var(--term-lh) * 1em); text-align: center; overflow: hidden; vertical-align: top; }
 .quick-actions { padding: 6px 10px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
-.quick-actions button { padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+/* 这是全 App 后果最重的点击（批准 / 拒绝 agent 操作），此前仅 31.5px 高。
+   误触代价不对称，故直接给足 44px 而不用 ::after 外扩——授权按钮值得占这点空间。 */
+.quick-actions button { padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; min-height: 44px; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .btn-yes { background: var(--green); color: #fff; } .btn-trust { background: var(--blue); color: #fff; } .btn-no { background: var(--red); color: #fff; }
-.term-input { border-top: 1px solid var(--border); padding: 6px 10px; display: flex; gap: 5px; background: var(--surface); flex-shrink: 0; align-items: center; }
+/* #termKeys 与 #quickDock 默认都是 display:none，此时最底部元素是本输入栏，
+   若不自留安全区就会压在 Home Indicator 上（该区域会吞掉部分触摸）。
+   两个键盘面板任一展开时，由它们各自的 padding-bottom 负责，这里改为 6px
+   避免双重留白——用 :has() 检测，不支持的浏览器退化为多留一点空白，无害。 */
+.term-input { border-top: 1px solid var(--border); padding: 6px 10px; padding-bottom: max(6px, env(safe-area-inset-bottom, 6px) - var(--kb-inset, 0px)); display: flex; gap: 5px; background: var(--surface); flex-shrink: 0; align-items: center; }
+.terminal-view:has(.term-keys:not([style*="display: none"])) .term-input { padding-bottom: 6px; }
 /* 同上：16px 防止聚焦放大（终端输入框是最常聚焦的控件，这里最关键） */
 /* 输入中文时等宽字体缺少中文字形，会逐字回退且宽度参差；
    混合字体栈让英文保持等宽、中文用苹方，输入体验更稳。 */
@@ -155,20 +188,24 @@ body { line-height: 1.2; }
 /* 键盘弹起时容器 bottom 已抬升 --kb-inset，Home Indicator 被键盘遮住，
    此时无需再留安全区；故取两者较大值而非相加，避免双重留白。 */
 .term-keys { border-top: 1px solid var(--border); padding: 6px 10px; display: flex; flex-direction: column; background: var(--surface); flex-shrink: 0; padding-bottom: max(6px, env(safe-area-inset-bottom, 6px) - var(--kb-inset, 0px)); }
-.nav-key { padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; min-height: 40px; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s; }
+/* 40 → 44px：这是终端主键盘，点击频率最高，之前差 4px 正好卡在 HIG 门槛下。
+   多出的 4px 由 padding 吸收，视觉高度变化很小。 */
+.nav-key { padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s; }
 .nav-key:active { background: var(--border); transform: scale(0.97); }
 .mod-key { font-size: 12px; }
 .mod-key.armed { background: var(--blue); border-color: var(--blue); color: #fff; }
-.tab-btn { padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.tab-btn { padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: center; }
 .tab-btn.active { background: var(--surface); color: var(--text); border-color: var(--blue); }
-.ctrl-key { padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer; min-height: 40px; }
+.ctrl-key { padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: center; }
 .ctrl-key:active { background: var(--border); }
 .ctrl-key.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, var(--border)); }
 .ctrl-key.confirm { background: var(--red); color: #fff; border-color: var(--red); }
 .digit-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 18px; font-family: monospace; font-weight: 600; cursor: pointer; min-height: 46px; display: flex; align-items: center; justify-content: center; }
 .digit-key:active { background: var(--border); }
 .queue-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border); background: color-mix(in srgb, var(--text) 5%, var(--bg)); font-family: monospace; font-size: 12px; font-weight: 500; cursor: pointer; }
-.queue-chip:hover { border-color: var(--red); }
+@media (hover: hover) and (pointer: fine) {
+  .queue-chip:hover { border-color: var(--red); }
+}
 .queue-chip.danger { border-color: color-mix(in srgb, var(--red) 40%, var(--border)); color: var(--red); }
 
 .empty { text-align: center; color: var(--muted); padding: 40px 20px; font-size: 0.88rem; line-height: 1.6; }
@@ -324,7 +361,11 @@ body { line-height: 1.2; }
 <!-- Command palette -->
 <div id="cmdPalette" style="display:none;position:fixed;inset:0;z-index:100;">
   <div onclick="closePalette()" style="position:absolute;inset:0;background:rgba(0,0,0,0.5)"></div>
-  <div style="position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:420px;max-height:50dvh;background:var(--surface);border-top-left-radius:16px;border-top-right-radius:16px;border-top:1px solid var(--border);display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,8px)">
+  <!-- bottom 必须消费 --kb-inset：面板贴底且内含 #cmdSearch，聚焦即弹键盘。
+       不抬升的话，键盘会盖住面板下半部分——而列表项是这里唯一的点击目标。
+       max-height 同步减去键盘高度，否则面板顶部会被推出视口。
+       键盘弹起时 Home Indicator 已被遮住，故安全区与键盘取较大值而非相加。 -->
+  <div style="position:absolute;bottom:var(--kb-inset,0px);left:50%;transform:translateX(-50%);width:100%;max-width:420px;max-height:calc(50dvh - var(--kb-inset,0px));background:var(--surface);border-top-left-radius:16px;border-top-right-radius:16px;border-top:1px solid var(--border);display:flex;flex-direction:column;padding-bottom:max(env(safe-area-inset-bottom,8px) - var(--kb-inset,0px),8px)">
     <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
       <span style="font-size:0.8rem;font-weight:600;flex:1">Commands</span>
       <button onclick="closePalette()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1.2rem;cursor:pointer">✕</button>
