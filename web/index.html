@@ -2,10 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- viewport-fit=cover：让页面铺满全屏（含刘海/Dynamic Island 区域），
+     由 CSS 自行用 env(safe-area-inset-*) 补内缩。不加时浏览器默认自动内缩，
+     再叠加 env() 会造成双重留白。 -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<!-- apple- 前缀不可省：它是 apple-mobile-web-app-status-bar-style 生效的前置条件 -->
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="herdr">
+<!-- black-translucent：内容延伸到状态栏下方并被其部分遮挡，故顶部需自行留出 safe-area-inset-top -->
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="manifest" href="data:application/json,{&quot;name&quot;:&quot;herdr-remote&quot;,&quot;short_name&quot;:&quot;herdr&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;%23e1e2e7&quot;,&quot;theme_color&quot;:&quot;%23e1e2e7&quot;}">
+<!-- id：iOS 16.4+ 用它作为 web app 唯一标识，跨设备同步专注模式设置。
+     icons/start_url/scope 是 meta 标签给不了的，只能由 manifest 提供。 -->
+<link rel="manifest" href="data:application/json,{&quot;id&quot;:&quot;herdr-remote&quot;,&quot;name&quot;:&quot;herdr-remote&quot;,&quot;short_name&quot;:&quot;herdr&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;start_url&quot;:&quot;./&quot;,&quot;scope&quot;:&quot;./&quot;,&quot;background_color&quot;:&quot;%23e1e2e7&quot;,&quot;theme_color&quot;:&quot;%23e1e2e7&quot;,&quot;icons&quot;:[{&quot;src&quot;:&quot;./logo.svg&quot;,&quot;sizes&quot;:&quot;any&quot;,&quot;type&quot;:&quot;image/svg%2Bxml&quot;,&quot;purpose&quot;:&quot;any&quot;}]}">
+<link rel="apple-touch-icon" href="./logo.svg">
 <title>herdr-remote</title>
 <script type="module">
 import { play, bind } from 'https://esm.sh/cuelume@0.1.2';
@@ -17,6 +27,14 @@ document.addEventListener('DOMContentLoaded', () => bind());
   --bg: #e1e2e7; --surface: #d8d9e0; --border: #b6bbd1; --text: #1f2f66; --muted: #68709a;
   --green: #587539; --red: #f52a65; --blue: #2e7de9; --orange: #8c6c3e;
   --term-bg: #1a1b26; --term-text: #c0caf5;
+  /* header 实际高度 = 上下 padding 5+5 + 按钮 36px + 1px 下边框。
+     .terminal-view 的 top 偏移必须引用此变量，否则两者会各自漂移导致终端遮住顶栏。 */
+  --header-h: 47px;
+  /* 终端行高。.cjk 的 height/line-height 必须与之相同，否则 CJK 字符会比
+     周围文字高出一截，破坏逐行对齐——故统一走这一个变量。
+     1.2 是不重叠的物理下限：字体 content area 高 = 1.172em（ascent+descent），
+     行步进小于它相邻行字形就会粘连。实测 1.15 起开始重叠。 */
+  --term-lh: 1.2;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -28,11 +46,26 @@ document.addEventListener('DOMContentLoaded', () => bind());
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 *:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
-body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; background: var(--bg); color: var(--text); min-height: 100dvh; min-height: -webkit-fill-available; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; }
+/* 渐进增强顺序：旧值在前、新值在后。若把 -webkit-fill-available 写在 100dvh 之后，
+   iOS 15.4+ 两者都合法，后者会覆盖 dvh 使其失效。 */
+/* PingFang SC 显式排在 -apple-system 之后：iOS 上中文本就回落到苹方，但显式声明可保证
+   在中英混排时英文用 SF、中文用苹方，避免部分安卓/桌面浏览器回落到衬线或黑体。 */
+body { font-family: -apple-system, system-ui, -webkit-system-font, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; min-height: -webkit-fill-available; min-height: 100dvh; display: flex; flex-direction: column; width: 100%; overflow-x: hidden; -webkit-text-size-adjust: 100%; text-rendering: optimizeLegibility; }
+/* 1.2 是不重叠的物理下限：字体 content area 约 1.17em，行步进小于它字形就粘连。
+   实测项目名(0.94rem)下限 1.2、meta(0.72rem)下限 1.15，统一取 1.2 留余量。 */
+body { line-height: 1.2; }
+/* 中文标点（，。：；）自带左右空白，行首行尾会形成视觉缺口；开启标点挤压后
+   Safari 会压缩这部分空白，段落边缘更齐整。 */
+:lang(zh), .zh-text { text-spacing-trim: space-first; }
 
-.header { padding: 12px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+/* 顶部叠加 safe-area-inset-top，避免 standalone + black-translucent 下标题压在状态栏底下。
+   左右叠加 inset-left/right：横屏时刘海位于侧边，官方明示该值会增大。 */
+.header { padding: calc(5px + env(safe-area-inset-top, 0px)) calc(12px + env(safe-area-inset-right, 0px)) 5px calc(12px + env(safe-area-inset-left, 0px)); display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); }
 .header h1 { font-size: 1rem; font-weight: 700; letter-spacing: -0.02em; }
-.header button { background: none; border: none; color: var(--muted); cursor: pointer; padding: 8px; min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: color 0.15s, background 0.15s; }
+/* 视觉尺寸收窄到 36px 以压缩顶栏高度，但用 ::after 向外撑出 44px 的不可见命中区，
+   满足 HIG 最小触控目标，且不占据布局空间（绝对定位不影响 flex 尺寸）。 */
+.header button { position: relative; background: none; border: none; color: var(--muted); cursor: pointer; padding: 6px; min-width: 36px; min-height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: color 0.15s, background 0.15s; }
+.header button::after { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; }
 .header button:hover { color: var(--text); background: var(--border); }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .dot.pulse { animation: pulse 2s infinite; }
@@ -41,78 +74,107 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
 .view { flex: 1; overflow-y: auto; }
 
 /* Settings */
-.settings { display: none; padding: 16px; }
+.settings { display: none; padding: 10px 12px; }
 .settings.active { display: block; }
-.settings h2 { font-size: 0.9rem; margin-bottom: 12px; }
-.setting-group { background: var(--surface); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
-.setting-group label { font-size: 0.75rem; color: var(--muted); display: block; margin-bottom: 6px; }
-.setting-group input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
+.settings h2 { font-size: 0.95rem; margin-bottom: 8px; }
+.setting-group { background: var(--surface); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+.setting-group label { font-size: 0.78rem; color: var(--muted); display: block; margin-bottom: 5px; }
+/* font-size 必须 ≥16px：iOS Safari 对聚焦时渲染字号 ≤15px 的输入框会自动放大页面。
+   不可改用 maximum-scale=1 规避——iOS 10 起该属性被忽略，且违反 WCAG 1.4.4。 */
+.setting-group input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; }
 .setting-group select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
-.setting-group .hint { font-size: 0.65rem; color: var(--muted); margin-top: 4px; }
+/* 0.65rem≈10.4px 的中文几乎不可读（笔画糊在一起），提到 0.72rem 并放宽行高。 */
+.setting-group .hint { font-size: 0.72rem; line-height: 1.5; color: var(--muted); margin-top: 5px; }
 .setting-group button { margin-top: 8px; padding: 8px 16px; border-radius: 6px; border: none; background: var(--green); color: #000; font-weight: 600; font-size: 13px; cursor: pointer; }
 
 
 /* Agent list */
-.agents { padding: 12px; }
-.section-header { font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; display: flex; align-items: center; gap: 5px; }
-.agent { background: var(--surface); border-radius: 12px; padding: 14px 16px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; cursor: pointer; border: 1px solid var(--border); transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease; }
+.agents { padding: 4px 8px; }
+/* text-transform: uppercase 对中文无效但会让混排的英文全大写显得突兀；
+   分组标题改用字重+字号区分，中文下更自然。 */
+.section-header { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; color: var(--muted); margin: 8px 0 4px; display: flex; align-items: center; gap: 5px; }
+.section-header:first-child { margin-top: 2px; }
+.agent { background: var(--surface); border-radius: 8px; padding: 7px 10px; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; cursor: pointer; border: 1px solid var(--border); transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease; }
 .agent:hover { border-color: color-mix(in srgb, var(--text) 20%, transparent); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
 .agent:active { transform: scale(0.99); box-shadow: none; }
 .agent .dot { width: 10px; height: 10px; }
 .agent.blocked { border-color: var(--red); background: color-mix(in srgb, var(--red) 5%, var(--surface)); }
 .workspace-card { border-color: color-mix(in srgb, var(--text) 10%, transparent); }
 .count-pill { display: inline-block; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--text) 8%, transparent); font-size: 0.65rem; }
-.chip-strip { display: flex; align-items: center; gap: 8px; overflow-x: auto; padding: 8px 12px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.chip-strip { display: flex; align-items: center; gap: 6px; overflow-x: auto; padding: 6px 10px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
 .chip-strip::-webkit-scrollbar { display: none; }
-.chip-label { font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
-.chip { padding: 6px 14px; border-radius: 9999px; border: none; font-size: 0.8rem; font-weight: 500; white-space: nowrap; cursor: pointer; position: relative; transition: all 0.15s; background: var(--border); color: var(--muted); }
+.chip-label { font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em; color: var(--muted); white-space: nowrap; }
+.chip { padding: 5px 12px; border-radius: 9999px; border: none; font-size: 0.82rem; font-weight: 500; white-space: nowrap; cursor: pointer; position: relative; transition: all 0.15s; background: var(--border); color: var(--muted); }
 .chip.active { background: var(--blue); color: #fff; }
 .chip.alert::after { content: ''; position: absolute; top: -2px; right: -2px; width: 8px; height: 8px; border-radius: 50%; background: var(--red); border: 2px solid var(--bg); }
 .chip:active { transform: scale(0.95); }
 .chip-add { border: 2px dashed var(--border); background: transparent; color: var(--muted); font-size: 1rem; padding: 4px 12px; }
 .chip-add:hover { border-color: var(--blue); color: var(--blue); }
-.agent .info { flex: 1; }
-.agent .project { font-size: 0.9rem; font-weight: 500; }
-.agent .meta { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+/* min-width:0 让 flex 子项可以收缩，否则长项目名会把右侧箭头挤出卡片。 */
+.agent .info { flex: 1; min-width: 0; }
+/* 中文在同等 font-size 下字面高度大于拉丁字母，但笔画密度高、小字号下更难辨认，
+   故正文比原来略放大；行高收紧补回卡片高度。 */
+.agent .project { font-size: 0.94rem; font-weight: 500; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent .meta { font-size: 0.72rem; color: var(--muted); margin-top: 0; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Terminal view */
-.terminal-view { display: none; flex-direction: column; position: fixed; inset: 0; top: 49px; background: var(--bg); z-index: 50; }
+/* top 与 .header 实际高度保持同步（见 --header-h）：header 已叠加 safe-area-inset-top，
+   此处必须一起加，否则终端视图会盖住 header 或错位。 */
+.terminal-view { display: none; flex-direction: column; position: fixed; inset: 0; top: calc(var(--header-h) + env(safe-area-inset-top, 0px)); bottom: var(--kb-inset, 0px); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); background: var(--bg); z-index: 50; }
 .terminal-view.active { display: flex; }
-.term-header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.term-header .back { background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 8px; }
-.term-header .title { flex: 1; font-size: 0.8rem; font-weight: 500; }
+.term-header { padding: 6px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.term-header .back { background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 6px; display: flex; align-items: center; }
+.term-header .title { flex: 1; min-width: 0; font-size: 0.85rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-header .refresh-btn { background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; }
-.term-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 12px; background: var(--term-bg); font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.8rem; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; word-break: break-all; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
-.quick-actions { padding: 8px 12px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
-.quick-actions button { padding: 10px 14px; border-radius: 8px; border: none; font-size: 0.8rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+/* 终端是等宽上下文：word-break: break-all 会把中文和英文单词都硬切。
+   中文本就允许任意换行，改用 anywhere 可保留英文单词完整性，同时中文照常折行。 */
+/* 等宽终端内容行距取 1.25：终端本身是逐行栅格，行距过大反而割裂上下文。
+   低于 1.2 时中文的 ascender 会与上一行 descender 相撞。 */
+.term-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 6px 8px; background: var(--term-bg); font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.8rem; line-height: var(--term-lh); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+/* 终端列对齐修正：终端（tmux/herdr）按 East Asian Width 把每个汉字算作 2 个字符格，
+   但浏览器里汉字前进宽度是 1em，而 Menlo 拉丁前进宽度仅 0.60205em，比值恒为 1.661。
+   换任何中文字体都无法改变（苹方/黑体/宋体的汉字都是 1em），结果含中文的行里
+   右侧 │ 边框和列对齐会整体左移。
+   这里把汉字缩放到 2 × 0.60205 = 1.2041em，使其正好占满两个 Menlo 字符格。
+   inline-block 让 width 生效；用 width 而非 font-size 缩放，避免字号被放大得比周围文字突兀。 */
+/* height/line-height 继承行框，避免 inline-block 的默认基线行为把行撑高（18.5px vs 15px 行框），
+   否则中英混排时行距会忽宽忽窄。 */
+.term-content .cjk { display: inline-block; width: 1.2041em; height: calc(var(--term-lh) * 1em); line-height: calc(var(--term-lh) * 1em); text-align: center; overflow: hidden; vertical-align: top; }
+.quick-actions { padding: 6px 10px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+.quick-actions button { padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .btn-yes { background: var(--green); color: #fff; } .btn-trust { background: var(--blue); color: #fff; } .btn-no { background: var(--red); color: #fff; }
-.term-input { border-top: 1px solid var(--border); padding: 8px 12px; display: flex; gap: 6px; background: var(--surface); flex-shrink: 0; }
-.term-input input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px; font-family: monospace; min-width: 0; }
+.term-input { border-top: 1px solid var(--border); padding: 6px 10px; display: flex; gap: 5px; background: var(--surface); flex-shrink: 0; align-items: center; }
+/* 同上：16px 防止聚焦放大（终端输入框是最常聚焦的控件，这里最关键） */
+/* 输入中文时等宽字体缺少中文字形，会逐字回退且宽度参差；
+   混合字体栈让英文保持等宽、中文用苹方，输入体验更稳。 */
+.term-input input { flex: 1; padding: 9px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-family: 'SF Mono', 'Menlo', monospace, 'PingFang SC', sans-serif; min-width: 0; }
 .term-input button:last-child { padding: 10px 14px; border-radius: 6px; border: none; background: var(--blue); color: #fff; font-weight: 700; font-size: 16px; flex-shrink: 0; }
-.term-keys { border-top: 1px solid var(--border); padding: 8px 12px; display: flex; flex-direction: column; background: var(--surface); flex-shrink: 0; padding-bottom: env(safe-area-inset-bottom, 8px); }
-.nav-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s; }
+/* 键盘弹起时容器 bottom 已抬升 --kb-inset，Home Indicator 被键盘遮住，
+   此时无需再留安全区；故取两者较大值而非相加，避免双重留白。 */
+.term-keys { border-top: 1px solid var(--border); padding: 6px 10px; display: flex; flex-direction: column; background: var(--surface); flex-shrink: 0; padding-bottom: max(6px, env(safe-area-inset-bottom, 6px) - var(--kb-inset, 0px)); }
+.nav-key { padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; min-height: 40px; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s; }
 .nav-key:active { background: var(--border); transform: scale(0.97); }
 .mod-key { font-size: 12px; }
 .mod-key.armed { background: var(--blue); border-color: var(--blue); color: #fff; }
 .tab-btn { padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
 .tab-btn.active { background: var(--surface); color: var(--text); border-color: var(--blue); }
-.ctrl-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer; min-height: 44px; }
+.ctrl-key { padding: 8px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer; min-height: 40px; }
 .ctrl-key:active { background: var(--border); }
 .ctrl-key.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, var(--border)); }
 .ctrl-key.confirm { background: var(--red); color: #fff; border-color: var(--red); }
-.digit-key { padding: 14px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 18px; font-family: monospace; font-weight: 600; cursor: pointer; min-height: 52px; display: flex; align-items: center; justify-content: center; }
+.digit-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 18px; font-family: monospace; font-weight: 600; cursor: pointer; min-height: 46px; display: flex; align-items: center; justify-content: center; }
 .digit-key:active { background: var(--border); }
 .queue-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border); background: color-mix(in srgb, var(--text) 5%, var(--bg)); font-family: monospace; font-size: 12px; font-weight: 500; cursor: pointer; }
 .queue-chip:hover { border-color: var(--red); }
 .queue-chip.danger { border-color: color-mix(in srgb, var(--red) 40%, var(--border)); color: var(--red); }
 
-.empty { text-align: center; color: var(--muted); padding: 60px 20px; font-size: 0.85rem; }
+.empty { text-align: center; color: var(--muted); padding: 40px 20px; font-size: 0.88rem; line-height: 1.6; }
 
 /* Desktop */
 @media (min-width: 768px) {
   body { max-width: 960px; margin: 0 auto; padding: 0 16px; }
   .terminal-view { position: static; display: none; }
-  .terminal-view.active { display: flex; height: calc(100dvh - 49px); }
+  .terminal-view.active { display: flex; height: calc(100dvh - var(--header-h)); }
   .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
   .section-header { grid-column: 1 / -1; }
   .chip-strip { grid-column: 1 / -1; }
@@ -122,13 +184,17 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
   body { max-width: 1100px; }
   .agents { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
 }
+/* 小屏进一步压缩。注意 header 仍须保留 safe-area 插值，
+   否则 iPhone SE 以外的窄刘海机型标题会顶到状态栏。 */
 @media (max-width: 380px) {
-  .header { padding: 10px 12px; }
-  .header h1 { font-size: 0.9rem; }
-  .agents { padding: 8px; }
-  .agent { padding: 12px; }
-  .term-input { padding: 6px 8px; gap: 4px; }
-  .term-keys { padding: 6px 8px; }
+  /* padding 改为 4+4，header 高度随之变为 45px，--header-h 必须同步覆盖 */
+  :root { --header-h: 45px; }
+  .header { padding: calc(4px + env(safe-area-inset-top, 0px)) calc(10px + env(safe-area-inset-right, 0px)) 4px calc(10px + env(safe-area-inset-left, 0px)); }
+  .header h1 { font-size: 0.92rem; }
+  .agents { padding: 3px 6px; }
+  .agent { padding: 6px 8px; }
+  .term-input { padding: 5px 8px; gap: 4px; }
+  .term-keys { padding: 5px 8px; }
 }
 @media (pointer: fine) {
   .quick-actions button { flex: none; min-width: auto; padding: 8px 18px; }
@@ -174,7 +240,7 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
 </div>
 
 <div class="view" id="timelineView" style="display:none;padding:12px;">
-  <div id="timelineList" style="font-family:monospace;font-size:0.75rem;line-height:1.8;"></div>
+  <div id="timelineList" style="font-family:monospace;font-size:0.75rem;line-height:1.2;"></div>
 </div>
 
 <div class="terminal-view" id="terminalView">
@@ -260,7 +326,7 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
       <span style="font-size:0.8rem;font-weight:600;flex:1">Commands</span>
       <button onclick="closePalette()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1.2rem;cursor:pointer">✕</button>
     </div>
-    <input id="cmdSearch" type="text" placeholder="Search commands…" autocomplete="off" autocorrect="off" style="margin:8px 12px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px" oninput="filterCommands()" />
+    <input id="cmdSearch" type="text" placeholder="Search commands…" autocomplete="off" autocorrect="off" style="margin:8px 12px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:16px" oninput="filterCommands()" />
     <div id="cmdList" style="overflow-y:auto;padding:4px 12px;"></div>
   </div>
 </div>
@@ -374,6 +440,18 @@ function tryDemo() {
   connect();
 }
 
+// East Asian Wide / Fullwidth 区间：终端按 2 个字符格计算这些字符的宽度。
+// 与 .term-content .cjk 的 1.2041em 配合，修正含中文时的列错位。
+const CJK_WIDE_RE = /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]+/g;
+
+// 终端内容来自不受信的 pane 输出，切到 innerHTML 后必须先转义再包裹 CJK，
+// 顺序不能反（先包裹会让插入的标签被转义掉）。
+function renderTermContent(text) {
+  const esc = text.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  // 转义实体（&amp; 等）本身只含 ASCII，不会被 CJK 正则误伤。
+  return esc.replace(CJK_WIDE_RE, m => `<span class="cjk">${[...m].join('</span><span class="cjk">')}</span>`);
+}
+
 function handleMessage(msg) {
   if (msg.type === 'agents') {
     // Track timeline on status changes
@@ -413,7 +491,7 @@ function handleMessage(msg) {
     const el = document.getElementById('termContent');
     const prevHeight = el.scrollHeight;
     const prevScroll = el.scrollTop;
-    el.textContent = msg.content || '(empty)';
+    el.innerHTML = renderTermContent(msg.content || '(empty)');
     if (userScrolledUp) {
       // Keep scroll position relative to bottom (content may have grown at top)
       const growth = el.scrollHeight - prevHeight;
@@ -885,6 +963,32 @@ function urlBase64ToUint8Array(base64String) {
 }
 
 initPush();
+
+// --- iOS 软键盘补偿 ---
+// position:fixed 相对 layout viewport 定位，而软键盘只缩小 visual viewport，
+// 因此终端视图底部的输入栏会被键盘遮住。iOS 上 interactive-widget 与
+// VirtualKeyboard API 均未实现（WebKit Bug 259770 / 230225），dvh 也不含键盘，
+// 唯一可行方案是监听 visualViewport 手动把遮挡高度写进 CSS 变量。
+(function initKeyboardInset() {
+  const vv = window.visualViewport;
+  if (!vv) return;  // 不支持则保持原样，--kb-inset 恒为 0
+
+  let frame = null;
+  const sync = () => {
+    if (frame) cancelAnimationFrame(frame);
+    // visualViewport 的 resize 事件在 iOS 上可能延迟或不触发，用 rAF 合并多次抖动
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      // 被键盘等 UI 占据的高度：布局视口高 - (可视视口高 + 其顶部偏移)
+      const hidden = window.innerHeight - (vv.height + vv.offsetTop);
+      document.documentElement.style.setProperty('--kb-inset', Math.max(0, Math.round(hidden)) + 'px');
+    });
+  };
+
+  vv.addEventListener('resize', sync);
+  vv.addEventListener('scroll', sync);
+  sync();
+})();
 </script>
 </body>
 </html>

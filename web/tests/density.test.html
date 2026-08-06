@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>密度回归测试 · herdr-remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, 'PingFang SC', sans-serif; margin: 0; padding: 20px;
+         background: #1a1b26; color: #c0caf5; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: #565f89; font-size: 0.8rem; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2f3549; }
+  th { color: #565f89; font-weight: 600; font-size: 0.72rem; }
+  td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+  .pass { color: #9ece6a; font-weight: 600; }
+  .fail { color: #f7768e; font-weight: 600; }
+  .gain { color: #7aa2f7; font-weight: 600; }
+  #summary { padding: 12px 14px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; }
+  #summary.ok { background: rgba(158,206,106,0.12); border: 1px solid #9ece6a; color: #9ece6a; }
+  #summary.bad { background: rgba(247,118,142,0.12); border: 1px solid #f7768e; color: #f7768e; }
+  .note { font-size: 0.76rem; color: #565f89; margin: -10px 0 20px; }
+  /* 离屏舞台：必须真实布局（不能 display:none），否则量不到尺寸。
+     用 left:-99999px 移出可视区，避免干扰页面。 */
+  #stage { position: absolute; left: -99999px; top: 0; }
+</style>
+</head>
+<body>
+
+<h1>密度回归测试</h1>
+<div class="sub">验证间距压缩后，同样 iPhone 视口内能显示更多内容</div>
+
+<div id="summary">运行中…</div>
+<div id="results"></div>
+
+<div class="note">
+  说明：CJK 宽度修正（<code>.cjk { width: 1.2041em }</code>）不在本测试范围内——
+  它让每个汉字占满 2 个字符格以修正终端列对齐，代价是每行汉字数<b>减少</b>，
+  与本测试的「显示更多」是两个独立目标。
+</div>
+
+<div id="stage"></div>
+
+<script>
+// ─────────────────────────────────────────────────────────────
+// 基线：改动前的样式值（取自 git diff 的 - 行）
+// 新值：改动后的样式值（取自 git diff 的 + 行）
+// 两组样式作用于完全相同的 DOM，唯一变量是间距/字号。
+// ─────────────────────────────────────────────────────────────
+const SHARED = `
+  * { margin:0; padding:0; box-sizing:border-box; }
+  .app { background:#1a1b26; color:#c0caf5; width:390px;
+         font-family:-apple-system, system-ui, 'PingFang SC', sans-serif; }
+  .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; background:#9ece6a; }
+  .agent .dot { width:10px; height:10px; }
+  .agent .info { flex:1; }
+  .header h1 { font-size:1rem; font-weight:700; }
+  /* 终端逐行容器：继承 .term-content 的字号与行高，自身不引入额外间距 */
+  .ln { margin:0; padding:0; }
+`;
+
+const OLD_CSS = SHARED + `
+  body { line-height: normal; }
+  .header { padding:12px 16px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #2f3549; }
+  .header button { padding:8px; min-width:44px; min-height:44px; display:flex;
+                   align-items:center; justify-content:center; border:none; background:none; }
+  .agents { padding:12px; }
+  .section-header { font-size:0.7rem; font-weight:600; letter-spacing:0.05em; text-transform:uppercase;
+                    margin:16px 0 8px; display:flex; align-items:center; gap:5px; }
+  .agent { background:#202331; border-radius:12px; padding:14px 16px; margin-bottom:8px;
+           display:flex; align-items:center; gap:8px; border:1px solid #2f3549; }
+  .agent .project { font-size:0.9rem; font-weight:500; }
+  .agent .meta { font-size:0.7rem; margin-top:2px; }
+  .term-content { padding:10px 12px; font-family:'SF Mono',Menlo,monospace;
+                  font-size:0.8rem; line-height:1.5; white-space:pre-wrap; }
+`;
+
+const NEW_CSS = SHARED + `
+  body { line-height: 1.2; }
+  .header { padding:5px 12px; display:flex; align-items:center; gap:8px; border-bottom:1px solid #2f3549; }
+  .header button { padding:6px; min-width:36px; min-height:36px; display:flex;
+                   align-items:center; justify-content:center; border:none; background:none; }
+  .agents { padding:4px 8px; }
+  .section-header { font-size:0.72rem; font-weight:600; letter-spacing:0.02em;
+                    margin:8px 0 4px; display:flex; align-items:center; gap:5px; }
+  .section-header:first-child { margin-top:2px; }
+  .agent { background:#202331; border-radius:8px; padding:7px 10px; margin-bottom:4px;
+           display:flex; align-items:center; gap:8px; border:1px solid #2f3549; }
+  .agent .project { font-size:0.94rem; font-weight:500; line-height:1.2; }
+  .agent .meta { font-size:0.72rem; margin-top:0; line-height:1.2; }
+  .term-content { padding:6px 8px; font-family:'SF Mono',Menlo,monospace;
+                  font-size:0.8rem; line-height:1.2; white-space:pre-wrap; }
+`;
+
+// 真实中文项目名，贴近实际使用场景
+const AGENT_POOL = [
+  ['风控中台重构',           'claude', 'code/risk-platform'],
+  ['订单履约服务性能优化',   'claude', 'code/order-fulfillment'],
+  ['用户增长实验平台',       'codex',  'code/growth-abtest'],
+  ['数据仓库指标治理',       'claude', 'code-dev/yqg-dw-datapilot'],
+  ['支付网关灰度发布',       'claude', 'code/payment-gateway'],
+  ['herdr-remote',           'claude', 'code-github/herdr-remote'],
+  ['内容审核模型迭代',       'claude', 'code/content-moderation'],
+  ['客服工单智能分派',       'codex',  'code/ticket-router'],
+  ['库存对账批处理优化',     'claude', 'code/inventory-recon'],
+  ['营销活动配置中心',       'claude', 'code/campaign-config'],
+  ['A/B 实验平台数据看板',   'claude', 'code/abtest-dashboard'],
+  ['风控规则引擎重构二期',   'claude', 'code/risk-engine-v2'],
+];
+
+/* 数据量必须远超视口容量，否则测到的是「数据用尽」而非「屏幕装满」，
+   会系统性低估密度收益（Pro Max 曾出现 12/12 触顶）。
+   循环取样并给重复项加序号，保证每条都是独立卡片。 */
+function makeAgents(n) {
+  return Array.from({length: n}, (_, i) => {
+    const [label, agent, cwd] = AGENT_POOL[i % AGENT_POOL.length];
+    const round = Math.floor(i / AGENT_POOL.length);
+    return round === 0 ? [label, agent, cwd]
+                       : [`${label}${round + 1}`, agent, `${cwd}-${round + 1}`];
+  });
+}
+
+const TERM_TEXT = [
+  '● 正在分析风控规则引擎的调用链路...',
+  '  已读取 src/engine/RuleEvaluator.java（完成）',
+  '  已读取 src/engine/StrategyLoader.java（完成）',
+  '● 发现问题：规则缓存在并发场景下存在竞态条件。',
+  '  建议改用 LoadingCache 并设置 refreshAfterWrite。',
+  '  是否需要我直接修改该文件并补充单元测试？',
+  '● 已生成补丁，等待确认。',
+  '  变更文件：3 个，新增 42 行，删除 17 行。',
+  '● 单元测试全部通过（耗时 1.2s）。',
+  '  覆盖率从 68% 提升到 81%。',
+].join('\n');
+
+const stage = document.getElementById('stage');
+
+/** 在给定 CSS 下构建 Agent 列表，返回视口高度内完整可见的卡片数 */
+function measureAgentList(css, viewportH, count = 40) {
+  const host = document.createElement('div');
+  host.innerHTML = `
+    <style>${css}</style>
+    <div class="app">
+      <div class="header">
+        <span class="dot"></span><h1>herdr</h1>
+        <button><svg width="18" height="18"></svg></button>
+        <button><svg width="18" height="18"></svg></button>
+      </div>
+      <div class="agents">
+        <div class="section-header"><span class="dot"></span>运行中</div>
+        ${makeAgents(count).map(([label, agent, cwd]) => `
+          <div class="agent">
+            <span class="dot"></span>
+            <div class="info">
+              <div class="project">${label}</div>
+              <div class="meta">${agent} · ${cwd}</div>
+            </div>
+            <span>›</span>
+          </div>`).join('')}
+      </div>
+    </div>`;
+  stage.appendChild(host);
+
+  const app = host.querySelector('.app');
+  const appTop = app.getBoundingClientRect().top;
+  // 完整可见 = 卡片底边未越过视口下沿
+  const visible = [...host.querySelectorAll('.agent')].filter(el => {
+    const r = el.getBoundingClientRect();
+    return (r.bottom - appTop) <= viewportH;
+  }).length;
+
+  const headerH = host.querySelector('.header').getBoundingClientRect().height;
+  const cardH = host.querySelector('.agent').getBoundingClientRect().height;
+  host.remove();
+  // 触顶说明数据量不足，测量结果不可信，直接报错而不是给出偏低的数字
+  if (visible >= count) {
+    throw new Error(`数据量不足：可见 ${visible} 张已达总数 ${count}，请增大 count`);
+  }
+  return { visible, headerH: +headerH.toFixed(1), cardH: +cardH.toFixed(1) };
+}
+
+/** 在给定 CSS 下测终端区域：固定高度内真实可见的文本行数。
+    用逐行 DOM 实测而非 lineHeight 算术推导——后者会漏掉折行、
+    以及 CJK 包裹（inline-block）可能带来的行高变化。 */
+function measureTermLines(css, areaH) {
+  const host = document.createElement('div');
+  const lines = TERM_TEXT.split('\n');
+  host.innerHTML = `<style>${css}</style>
+    <div class="app">
+      <div class="term-content" id="tc" style="width:390px">${
+        // 每行独立成块以便逐行定位；重复铺满以超出区域高度
+        Array.from({length: 12}, () =>
+          lines.map(l => `<div class="ln">${l}</div>`).join('')
+        ).join('')
+      }</div>
+    </div>`;
+  stage.appendChild(host);
+  const tc = host.querySelector('#tc');
+  const top = tc.getBoundingClientRect().top;
+  const padB = parseFloat(getComputedStyle(tc).paddingBottom);
+  const visible = [...host.querySelectorAll('.ln')].filter(el =>
+    (el.getBoundingClientRect().bottom - top) <= (areaH - padB)
+  ).length;
+  host.remove();
+  return { lines: visible };
+}
+
+// ── 执行测试 ──────────────────────────────────────────────
+const VIEWPORTS = [
+  ['iPhone SE',        667],
+  ['iPhone 14',        844],
+  ['iPhone 14 Pro Max', 932],
+];
+const TERM_AREA = 500; // 终端内容区典型可用高度
+
+const rows = [];
+let allPass = true;
+
+function record(name, oldV, newV, unit, betterIsMore) {
+  const delta = newV - oldV;
+  const ok = betterIsMore ? delta > 0 : delta < 0;
+  if (!ok) allPass = false;
+  const pct = oldV ? ((delta / oldV) * 100) : 0;
+  rows.push({ name, oldV, newV, unit, delta, pct, ok });
+}
+
+let fatal = null;
+try {
+  // 1) 各视口下可见 Agent 卡片数
+  for (const [dev, h] of VIEWPORTS) {
+    const o = measureAgentList(OLD_CSS, h);
+    const n = measureAgentList(NEW_CSS, h);
+    record(`${dev}（${h}px）可见 Agent 卡片`, o.visible, n.visible, '张', true);
+  }
+
+  // 2) 单卡片高度（越小越好）
+  {
+    const o = measureAgentList(OLD_CSS, 844);
+    const n = measureAgentList(NEW_CSS, 844);
+    record('Agent 卡片高度', o.cardH, n.cardH, 'px', false);
+    record('顶栏高度', o.headerH, n.headerH, 'px', false);
+  }
+
+  // 3) 终端可见行数
+  {
+    const o = measureTermLines(OLD_CSS, TERM_AREA);
+    const n = measureTermLines(NEW_CSS, TERM_AREA);
+    record(`终端可见行数（${TERM_AREA}px 区域）`, o.lines, n.lines, '行', true);
+  }
+
+  // 4) 行间空隙（行高 − 字号）：直接对应「两行之间看得见的间隙」
+  {
+    const gap = css => {
+      const host = document.createElement('div');
+      host.innerHTML = `<style>${css}</style>
+        <div class="app"><div class="term-content" id="tc">中文测试</div></div>`;
+      stage.appendChild(host);
+      const cs = getComputedStyle(host.querySelector('#tc'));
+      const g = parseFloat(cs.lineHeight) - parseFloat(cs.fontSize);
+      host.remove();
+      return +g.toFixed(2);
+    };
+    record('终端行间空隙', gap(OLD_CSS), gap(NEW_CSS), 'px', false);
+  }
+} catch (e) {
+  fatal = e.message || String(e);
+  allPass = false;
+}
+
+// ── 渲染结果 ──────────────────────────────────────────────
+const tbl = ['<table><tr><th>指标</th><th style="text-align:right">改动前</th>' +
+             '<th style="text-align:right">改动后</th><th style="text-align:right">变化</th>' +
+             '<th>结论</th></tr>'];
+for (const r of rows) {
+  const sign = r.delta > 0 ? '+' : '';
+  tbl.push(`<tr>
+    <td>${r.name}</td>
+    <td class="num">${r.oldV}${r.unit}</td>
+    <td class="num">${r.newV}${r.unit}</td>
+    <td class="num gain">${sign}${(+r.delta.toFixed(1))}${r.unit}
+        <span style="color:#565f89">(${sign}${r.pct.toFixed(1)}%)</span></td>
+    <td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td>
+  </tr>`);
+}
+tbl.push('</table>');
+document.getElementById('results').innerHTML = tbl.join('');
+
+const s = document.getElementById('summary');
+s.className = allPass ? 'ok' : 'bad';
+s.textContent = fatal
+  ? `✗ 测试无法完成：${fatal}`
+  : allPass
+    ? `✓ 全部 ${rows.length} 项通过：改动后在相同视口内显示更多内容`
+    : `✗ ${rows.filter(r => !r.ok).length}/${rows.length} 项未达预期`;
+
+// 供 headless 断言使用
+window.__DENSITY_RESULT__ = { allPass, fatal, rows };
+</script>
+</body>
+</html>
