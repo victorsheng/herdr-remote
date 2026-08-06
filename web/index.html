@@ -126,13 +126,14 @@ body { line-height: 1.2; }
 .term-header .back { background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 6px; display: flex; align-items: center; }
 .term-header .title { flex: 1; min-width: 0; font-size: 0.85rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-header .refresh-btn { background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; }
-/* 终端是 80 列的固定栅格，折行会破坏列对齐：表格边框、分隔线、右侧 │ 都会错位，
-   折行后的画面即所谓 "word-wrapped mess"。业界通用做法（Windows Terminal、
-   响应式表格）是不折行 + 横向滚动，这里照此处理。
-   正文段落本身不超过视口宽度，不会触发横向滚动；只有表格等宽行需要左右滑。 */
-/* 等宽终端内容行距取 1.2：终端本身是逐行栅格，行距过大反而割裂上下文。
+/* 终端是等宽上下文：word-break: break-all 会把中文和英文单词都硬切。
+   中文本就允许任意换行，改用 anywhere 可保留英文单词完整性，同时中文照常折行。 */
+/* 曾改为 white-space: pre + overflow-x: auto（不折行、横向滚动，Windows Terminal
+   的通用做法），可以修好表格列对齐，但手机上需要左右滑动才能读完一行，实测体验更差，
+   故回退为折行。宽表格的列对齐在窄屏下暂无两全解法。 */
+/* 等宽终端内容行距取 1.25：终端本身是逐行栅格，行距过大反而割裂上下文。
    低于 1.2 时中文的 ascender 会与上一行 descender 相撞。 */
-.term-content { flex: 1; overflow-y: auto; overflow-x: auto; padding: 6px 8px; background: var(--term-bg); font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.8rem; line-height: var(--term-lh); white-space: pre; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+.term-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 6px 8px; background: var(--term-bg); font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.8rem; line-height: var(--term-lh); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 /* 终端列对齐修正：终端（tmux/herdr）按 East Asian Width 把每个汉字算作 2 个字符格，
    但浏览器里汉字前进宽度是 1em，而 Menlo 拉丁前进宽度仅 0.60205em，比值恒为 1.661。
    换任何中文字体都无法改变（苹方/黑体/宋体的汉字都是 1em），结果含中文的行里
