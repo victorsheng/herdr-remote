@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>终端键盘布局测试 · herdr-remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, 'PingFang SC', sans-serif; margin: 0; padding: 20px;
+         background: #1a1b26; color: #c0caf5; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: #565f89; font-size: 0.8rem; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2f3549; }
+  th { color: #565f89; font-weight: 600; font-size: 0.72rem; }
+  td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+  .pass { color: #9ece6a; font-weight: 600; }
+  .fail { color: #f7768e; font-weight: 600; }
+  #summary { padding: 12px 14px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; }
+  #summary.ok { background: rgba(158,206,106,0.12); border: 1px solid #9ece6a; color: #9ece6a; }
+  #summary.bad { background: rgba(247,118,142,0.12); border: 1px solid #f7768e; color: #f7768e; }
+  .note { font-size: 0.76rem; color: #565f89; margin: -8px 0 18px; }
+  #frame { position: absolute; left: -99999px; top: 0; width: 393px; height: 852px; border: 0; }
+</style>
+</head>
+<body>
+
+<h1>终端键盘布局测试</h1>
+<div class="sub">直接加载 <code>../index.html</code>，用实测坐标验证方向键的几何关系</div>
+
+<div id="summary">运行中…</div>
+<div id="results"></div>
+
+<div class="note">
+  断言基于 <code>getBoundingClientRect()</code> 的真实坐标，而非检查 CSS 写法——
+  同样的倒 T 形可以用 grid-area、span、flex 等多种方式实现，
+  锁死写法会让日后合理的重构失败，锁死几何关系才是锁住用户实际看到的东西。
+</div>
+
+<iframe id="frame" src="../index.html"></iframe>
+
+<script>
+const rows = [];
+let allPass = true;
+let fatal = null;
+
+function record(name, actual, expected, ok) {
+  if (!ok) allPass = false;
+  rows.push({ name, actual, expected, ok });
+}
+
+/** 取按钮中心点；找不到返回 null */
+function center(doc, text) {
+  const btns = [...doc.querySelectorAll('#keysPad button')];
+  const el = btns.find(b => (b.textContent || '').trim() === text);
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, el };
+}
+
+function run(doc, win) {
+  // 终端视图与键盘面板默认隐藏，强制显示才能量到尺寸
+  const tv = doc.querySelector('.terminal-view');
+  if (tv) tv.classList.add('active');
+  const tk = doc.getElementById('termKeys');
+  if (tk) tk.style.display = 'flex';
+
+  const up = center(doc, '↑');
+  const down = center(doc, '↓');
+  const left = center(doc, '←');
+  const right = center(doc, '→');
+
+  if (!up || !down || !left || !right) {
+    record('四个方向键存在', '缺失', '↑↓←→ 齐全', false);
+    return;
+  }
+  record('四个方向键存在', '齐全', '↑↓←→ 齐全', true);
+
+  // ── 倒 T 形的几何定义 ──────────────────────────────
+  // 允许 1px 的舍入误差
+  const EPS = 1.5;
+
+  // 1) ↑ 与 ↓ 垂直对齐（同一列）
+  record('↑ 与 ↓ 同列', `Δx=${Math.abs(up.x - down.x).toFixed(1)}px`, '≤1.5px',
+         Math.abs(up.x - down.x) <= EPS);
+
+  // 2) ↑ 在 ↓ 正上方，且只差一行（不是隔了好几行）
+  const rowGap = down.y - up.y;
+  record('↑ 在 ↓ 上方且相邻', `Δy=${rowGap.toFixed(1)}px`, `0 < Δy ≤ ${(up.h * 1.8).toFixed(0)}px`,
+         rowGap > 0 && rowGap <= up.h * 1.8);
+
+  // 3) ← ↓ → 在同一行
+  const sameRow = Math.abs(left.y - down.y) <= EPS && Math.abs(right.y - down.y) <= EPS;
+  record('← ↓ → 同一行',
+         `←y=${left.y.toFixed(0)} ↓y=${down.y.toFixed(0)} →y=${right.y.toFixed(0)}`,
+         '三者 y 相同', sameRow);
+
+  // 4) 水平顺序必须是 ← ↓ →
+  record('水平顺序为 ← ↓ →',
+         `${left.x.toFixed(0)} < ${down.x.toFixed(0)} < ${right.x.toFixed(0)}`,
+         '递增', left.x < down.x && down.x < right.x);
+
+  // 5) ↓ 居于 ← 和 → 的中间（这是「倒 T」区别于「三个并排」的关键）
+  const mid = (left.x + right.x) / 2;
+  record('↓ 居中于 ← → 之间', `Δ=${Math.abs(down.x - mid).toFixed(1)}px`, '≤1.5px',
+         Math.abs(down.x - mid) <= EPS);
+
+  // ── 关键回归：改前 → 被挤到下一行开头，与 ↑ 不相邻 ──
+  // 改前实测：↑ 在 (373,680)，→ 在 (10,728) —— 换行了
+  record('→ 未被挤到下一行开头', `→x=${right.x.toFixed(0)}`, '不在最左侧',
+         right.x > left.x + left.w);
+
+  // ── 方案 B：↑ 两侧不留白，填入常用键 ──────────────
+  // 找出与 ↑ 同一行的所有按钮
+  const allBtns = [...doc.querySelectorAll('#keysPad button')]
+    .map(b => {
+      const r = b.getBoundingClientRect();
+      return { t: (b.textContent || '').trim(), x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })
+    .filter(b => b.t);
+  const upRow = allBtns.filter(b => Math.abs(b.y - up.y) <= EPS);
+  record('↑ 所在行已填满（方案 B）', `该行 ${upRow.length} 个键: ${upRow.map(b=>b.t).join(' ')}`,
+         '3 个键（↑ 两侧不留空）', upRow.length === 3);
+
+  // 两侧应是高频键，且必须真的能发出按键
+  const sides = upRow.filter(b => b.t !== '↑').map(b => b.t);
+  const hasHotKeys = sides.length === 2 &&
+                     sides.some(t => /esc/i.test(t)) &&
+                     sides.some(t => /enter|⏎/i.test(t));
+  record('↑ 两侧为 Esc / Enter', sides.join(' + ') || '（空）', 'Esc + Enter', hasHotKeys);
+
+  // ── 触摸目标不得因重排而缩水 ────────────────────────
+  const tooSmall = [up, down, left, right].filter(k => k.w < 44 || k.h < 44);
+  record('方向键仍满足 44×44',
+         tooSmall.length ? `${tooSmall.length} 个偏小` : `${up.w.toFixed(0)}×${up.h.toFixed(0)}`,
+         '≥44×44', tooSmall.length === 0);
+
+  // ── 不得重叠 ────────────────────────────────────────
+  const keys = [up, down, left, right];
+  let overlap = false;
+  for (let i = 0; i < keys.length; i++) {
+    for (let j = i + 1; j < keys.length; j++) {
+      const a = keys[i].el.getBoundingClientRect();
+      const b = keys[j].el.getBoundingClientRect();
+      if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) overlap = true;
+    }
+  }
+  record('方向键互不重叠', overlap ? '存在重叠' : '无重叠', '无重叠', !overlap);
+}
+
+const frame = document.getElementById('frame');
+frame.addEventListener('load', () => {
+  try { run(frame.contentDocument, frame.contentWindow); }
+  catch (e) { fatal = e.message || String(e); allPass = false; }
+  render();
+});
+
+function render() {
+  const tbl = ['<table><tr><th>检查项</th><th style="text-align:right">实测</th>' +
+               '<th style="text-align:right">期望</th><th>结论</th></tr>'];
+  for (const r of rows) {
+    tbl.push(`<tr><td>${r.name}</td><td class="num">${r.actual}</td>` +
+             `<td class="num">${r.expected}</td>` +
+             `<td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td></tr>`);
+  }
+  tbl.push('</table>');
+  document.getElementById('results').innerHTML = tbl.join('');
+
+  const s = document.getElementById('summary');
+  s.className = allPass ? 'ok' : 'bad';
+  const failed = rows.filter(r => !r.ok).length;
+  s.textContent = fatal ? `✗ 测试无法完成：${fatal}`
+    : allPass ? `✓ 全部 ${rows.length} 项通过`
+              : `✗ ${failed}/${rows.length} 项未达标`;
+
+  window.__KEYPAD_RESULT__ = { allPass, fatal, rows };
+  window.__KEYPAD_DONE__ = true;
+}
+</script>
+</body>
+</html>

@@ -308,19 +308,26 @@ body { line-height: 1.2; }
     </div>
     <!-- Keys pad -->
     <div id="keysPad" style="width:100%">
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:4px">
-        <button class="nav-key" onclick="fireKey('Escape')">Esc</button>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:4px">
+        <button class="nav-key" onclick="fireKey('Tab')">Tab</button>
         <button class="nav-key" style="grid-column:span 2" onclick="fireKey('Space')">Space</button>
+      </div>
+      <!-- 方向键排成倒 T 形：↑ 居上，← ↓ → 在下，与实体键盘一致，
+           肌肉记忆可直接复用。此前 ← ↓ ↑ 挤在一行、→ 被折到下一行开头，
+           → 与 ↑ 不相邻，连续按方向键要在两行间来回跳。
+           ↑ 两侧不留白，填入终端里最高频的 Esc / Enter（方案 B）：
+           手机竖屏空间紧张，且这两个键放在拇指易达处反而更顺手。 -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:4px">
+        <button class="nav-key" onclick="fireKey('Escape')">Esc</button>
+        <button class="nav-key" onclick="fireKey('Up')">↑</button>
         <button class="nav-key" onclick="fireKey('Enter')">⏎ Enter</button>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:4px">
-        <button class="nav-key" onclick="fireKey('Tab')">Tab</button>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:4px">
         <button class="nav-key" onclick="fireKey('Left')">←</button>
         <button class="nav-key" onclick="fireKey('Down')">↓</button>
-        <button class="nav-key" onclick="fireKey('Up')">↑</button>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:4px">
         <button class="nav-key" onclick="fireKey('Right')">→</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:4px">
         <button class="nav-key mod-key" id="modShift" onclick="armMod('shift')">⇧ Shift</button>
         <button class="nav-key mod-key" id="modCtrl" onclick="armMod('ctrl')">Ctrl</button>
       </div>
