@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>面板状态与离线缓存测试 · herdr-remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, 'PingFang SC', sans-serif; margin: 0; padding: 20px;
+         background: #1a1b26; color: #c0caf5; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: #565f89; font-size: 0.8rem; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2f3549; }
+  th { color: #565f89; font-weight: 600; font-size: 0.72rem; }
+  td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+  .pass { color: #9ece6a; font-weight: 600; }
+  .fail { color: #f7768e; font-weight: 600; }
+  #summary { padding: 12px 14px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; }
+  #summary.ok { background: rgba(158,206,106,0.12); border: 1px solid #9ece6a; color: #9ece6a; }
+  #summary.bad { background: rgba(247,118,142,0.12); border: 1px solid #f7768e; color: #f7768e; }
+  .note { font-size: 0.76rem; color: #565f89; margin: -8px 0 18px; }
+  #frame { position: absolute; left: -99999px; top: 0; width: 393px; height: 852px; border: 0; }
+</style>
+</head>
+<body>
+
+<h1>面板状态与离线缓存测试</h1>
+<div class="sub">验证键盘面板展开状态可持久化，以及 Service Worker 具备资源缓存能力</div>
+
+<div id="summary">运行中…</div>
+<div id="results"></div>
+
+<div class="note">
+  面板状态测试直接操作 <code>../index.html</code> 的真实 DOM 与 localStorage；
+  SW 测试解析 <code>../sw.js</code> 源码并实际执行其 fetch 处理逻辑，
+  而非仅检查是否出现某个关键字。
+</div>
+
+<iframe id="frame" src="../index.html"></iframe>
+
+<script>
+const rows = [];
+let allPass = true;
+let fatal = null;
+
+function record(name, actual, expected, ok) {
+  if (!ok) allPass = false;
+  rows.push({ name, actual, expected, ok });
+}
+
+const STORAGE_KEY = 'herdr_keypad_open';
+
+async function run(doc, win) {
+  // ─────────────────────────────────────────────
+  // 第 3 项：记住键盘面板展开状态
+  // ─────────────────────────────────────────────
+  const tv = doc.querySelector('.terminal-view');
+  if (tv) tv.classList.add('active');
+
+  const keys = doc.getElementById('termKeys');
+  const quick = doc.getElementById('quickDock');
+
+  if (!keys || !quick || typeof win.toggleKeysDock !== 'function') {
+    record('面板与切换函数存在', '缺失', '齐全', false);
+  } else {
+    record('面板与切换函数存在', '齐全', '齐全', true);
+
+    // 展开 keys 面板后，状态应写入 localStorage
+    win.localStorage.removeItem(STORAGE_KEY);
+    if (keys.style.display !== 'none') keys.style.display = 'none';
+    win.toggleKeysDock();                       // → 展开
+    const afterOpen = win.localStorage.getItem(STORAGE_KEY);
+    record('展开 keys 面板会记录状态', String(afterOpen), '"keys"',
+           afterOpen === 'keys');
+
+    // 收起后应清除（或记为 none），下次不再自动展开
+    win.toggleKeysDock();                       // → 收起
+    const afterClose = win.localStorage.getItem(STORAGE_KEY);
+    record('收起面板会清除状态', String(afterClose), 'null 或 "none"',
+           afterClose === null || afterClose === 'none' || afterClose === '');
+
+    // quickDock 同理，且两者互斥——记录的应是当前展开的那个
+    win.toggleQuickDock();                      // → 展开 quick
+    const afterQuick = win.localStorage.getItem(STORAGE_KEY);
+    record('展开 quick 面板会记录状态', String(afterQuick), '"quick"',
+           afterQuick === 'quick');
+    win.toggleQuickDock();                      // 复位
+  }
+
+  // 恢复逻辑：必须存在一个在打开终端时应用已存状态的函数
+  const hasRestore = typeof win.restoreKeypadState === 'function';
+  record('存在 restoreKeypadState 恢复函数', hasRestore ? '有' : '无', '有', hasRestore);
+
+  if (hasRestore) {
+    // 存 keys → 恢复后 keys 展开、quick 收起
+    win.localStorage.setItem(STORAGE_KEY, 'keys');
+    keys.style.display = 'none';
+    quick.style.display = 'none';
+    win.restoreKeypadState();
+    record('恢复 keys 展开态',
+           `keys=${keys.style.display || 'flex'} quick=${quick.style.display}`,
+           'keys 展开 / quick 收起',
+           keys.style.display !== 'none' && quick.style.display === 'none');
+
+    // 无存档 → 两个都不展开（保持默认收起，不打扰）
+    win.localStorage.removeItem(STORAGE_KEY);
+    keys.style.display = 'none';
+    quick.style.display = 'none';
+    win.restoreKeypadState();
+    record('无存档时保持收起',
+           `keys=${keys.style.display} quick=${quick.style.display}`,
+           '两者均收起',
+           keys.style.display === 'none' && quick.style.display === 'none');
+
+    // 脏数据不应导致展开错误面板或抛异常
+    win.localStorage.setItem(STORAGE_KEY, 'garbage-value');
+    keys.style.display = 'none';
+    quick.style.display = 'none';
+    let threw = false;
+    try { win.restoreKeypadState(); } catch (e) { threw = true; }
+    record('脏存档不展开且不抛异常',
+           threw ? '抛异常' : `keys=${keys.style.display} quick=${quick.style.display}`,
+           '两者均收起且不抛',
+           !threw && keys.style.display === 'none' && quick.style.display === 'none');
+    win.localStorage.removeItem(STORAGE_KEY);
+  }
+
+  // ─────────────────────────────────────────────
+  // 第 4 项：Service Worker 资源缓存
+  // ─────────────────────────────────────────────
+  const swSrc = await fetch('../sw.js').then(r => r.text());
+
+  // 必须监听 fetch —— 没有 fetch 处理器就谈不上任何缓存
+  record('SW 监听 fetch 事件',
+         /addEventListener\(\s*['"]fetch['"]/.test(swSrc) ? '是' : '否', '是',
+         /addEventListener\(\s*['"]fetch['"]/.test(swSrc));
+
+  // 必须在 install 时预缓存应用外壳
+  const hasPrecache = /caches\.open/.test(swSrc) && /addAll|cache\.put|cache\.add/.test(swSrc);
+  record('SW 预缓存应用外壳', hasPrecache ? '是' : '否', '是', hasPrecache);
+
+  // 缓存需带版本号，否则改版后旧资源永远不失效
+  const hasVersion = /CACHE[_A-Z]*\s*=\s*['"][^'"]*v?\d/i.test(swSrc);
+  record('缓存名带版本号', hasVersion ? '是' : '否', '是', hasVersion);
+
+  // 激活时必须清理旧版本缓存，否则每次发版都堆积一份
+  const cleansOld = /caches\.keys\(\)/.test(swSrc) && /caches\.delete/.test(swSrc);
+  record('激活时清理旧缓存', cleansOld ? '是' : '否', '是', cleansOld);
+
+  // WebSocket 与 relay API 不能被缓存（会拿到过期的 agent 数据）
+  const skipsNonGet = /method\s*!==?\s*['"]GET['"]/.test(swSrc);
+  record('跳过非 GET 请求', skipsNonGet ? '是' : '否', '是', skipsNonGet);
+
+  // 注册不应被 PushManager 支持与否卡住——否则不开通知的用户完全享受不到缓存
+  const pageSrc = await fetch('../index.html').then(r => r.text());
+  // 找出所有 register('/sw.js') 的位置，检查是否存在独立于 PushManager 的注册
+  const pushGateIdx = pageSrc.indexOf("!('PushManager' in window)");
+  const registerIdx = pageSrc.indexOf("serviceWorker.register");
+  const independentReg = pushGateIdx === -1 || registerIdx < pushGateIdx ||
+        /registerServiceWorker|initServiceWorker/.test(pageSrc);
+  record('SW 注册不依赖 PushManager',
+         independentReg ? '独立注册' : '被 Push 检测挡住', '独立注册', independentReg);
+}
+
+const frame = document.getElementById('frame');
+frame.addEventListener('load', async () => {
+  try { await run(frame.contentDocument, frame.contentWindow); }
+  catch (e) { fatal = e.message || String(e); allPass = false; }
+  render();
+});
+
+function render() {
+  const tbl = ['<table><tr><th>检查项</th><th style="text-align:right">实测</th>' +
+               '<th style="text-align:right">期望</th><th>结论</th></tr>'];
+  for (const r of rows) {
+    tbl.push(`<tr><td>${r.name}</td><td class="num">${r.actual}</td>` +
+             `<td class="num">${r.expected}</td>` +
+             `<td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td></tr>`);
+  }
+  tbl.push('</table>');
+  document.getElementById('results').innerHTML = tbl.join('');
+
+  const s = document.getElementById('summary');
+  s.className = allPass ? 'ok' : 'bad';
+  const failed = rows.filter(r => !r.ok).length;
+  s.textContent = fatal ? `✗ 测试无法完成：${fatal}`
+    : allPass ? `✓ 全部 ${rows.length} 项通过`
+              : `✗ ${failed}/${rows.length} 项未达标`;
+
+  window.__OFFLINE_RESULT__ = { allPass, fatal, rows };
+  window.__OFFLINE_DONE__ = true;
+}
+</script>
+</body>
+</html>

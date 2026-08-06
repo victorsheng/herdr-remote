@@ -692,6 +692,7 @@ function openTerminal(paneId) {
     qa.innerHTML='';
     ak.innerHTML='';
   }
+  restoreKeypadState();
   refreshPane();
   refreshInterval = setInterval(refreshPane, 3000);
 }
@@ -780,12 +781,37 @@ function sendQueuedKeys() {
   keyQueue=[]; armedMod=null; renderKeyQueue(); renderMods();
 }
 
+// 键盘面板的展开状态跨会话记住：手机上每次进终端都要先点开面板才能按键，
+// 白白多一次点击。记住上次的选择后，常用键盘的人再进来就是展开的。
+// 只存「哪个面板」这一个值——两者互斥，不需要各存一份。
+const KEYPAD_STATE_KEY = 'herdr_keypad_open';
+
+function saveKeypadState(which) {
+  try {
+    if (which) localStorage.setItem(KEYPAD_STATE_KEY, which);
+    else localStorage.removeItem(KEYPAD_STATE_KEY);
+  } catch (e) { /* 隐私模式下 localStorage 可能不可写，不该影响主流程 */ }
+}
+
+/** 打开终端时按上次的选择恢复面板。无存档或存档无效时保持收起，不打扰。 */
+function restoreKeypadState() {
+  const keys = document.getElementById('termKeys');
+  const quick = document.getElementById('quickDock');
+  if (!keys || !quick) return;
+  let saved = null;
+  try { saved = localStorage.getItem(KEYPAD_STATE_KEY); } catch (e) {}
+  // 只认这两个值：其它一律当没存过，避免脏数据展开出意料外的面板
+  keys.style.display = saved === 'keys' ? '' : 'none';
+  quick.style.display = saved === 'quick' ? '' : 'none';
+}
+
 function toggleKeysDock() {
   const el = document.getElementById('termKeys');
   const quick = document.getElementById('quickDock');
   const show = el.style.display === 'none';
   el.style.display = show ? '' : 'none';
   if (show) quick.style.display = 'none'; // mutual exclusive
+  saveKeypadState(show ? 'keys' : null);
   if(window.cue) cue(show ? 'page' : 'tick');
 }
 
@@ -795,6 +821,7 @@ function toggleQuickDock() {
   const show = el.style.display === 'none';
   el.style.display = show ? '' : 'none';
   if (show) keys.style.display = 'none'; // mutual exclusive
+  saveKeypadState(show ? 'quick' : null);
   if(window.cue) cue(show ? 'page' : 'tick');
 }
 
@@ -954,14 +981,31 @@ function runCommand(cmd) {
 // --- Web Push ---
 let pushSubscription = null;
 
+// SW 注册与推送解耦：SW 同时负责离线缓存，若仍挡在 PushManager 检测之后，
+// 不支持推送、或用户不开通知的场景就完全享受不到缓存。
+// 用相对路径 './sw.js' 而非 '/sw.js'——部署在子路径时绝对路径会 404。
+let swRegistration = null;
+
+async function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return null;
+  try {
+    swRegistration = await navigator.serviceWorker.register('./sw.js');
+    return swRegistration;
+  } catch (e) {
+    console.warn('Service worker registration failed:', e);
+    return null;
+  }
+}
+
 async function initPush() {
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+  const reg = await registerServiceWorker();
+  if (!reg || !('PushManager' in window)) {
+    // SW 可能已注册成功（缓存仍生效），只是这个浏览器不支持推送
     document.getElementById('pushStatus').textContent = 'Push not supported in this browser';
     document.getElementById('pushToggle').style.display = 'none';
     return;
   }
   try {
-    const reg = await navigator.serviceWorker.register('/sw.js');
     pushSubscription = await reg.pushManager.getSubscription();
     updatePushUI();
   } catch (e) {
