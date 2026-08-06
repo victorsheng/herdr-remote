@@ -630,6 +630,22 @@ async def handle_client(ws):
     log.info("Client connected: ip=%s device=%s origin=%s", ip, device, origin or "-")
     clients.add(ws)
     connected_at = time.monotonic()
+
+    # 立即把缓存快照推给这个新客户端。此前连上后不发任何东西，客户端只能干等
+    # 下一次 2 秒轮询广播——实测握手仅 75ms，首屏却要 534ms，最坏等满
+    # POLL_INTERVAL，而 agent_cache 里的数据一直都在。
+    #
+    # 只发给 ws 本人而非 broadcast：其它客户端的数据没有变化，没必要重发。
+    # 空缓存也要发，让客户端从 Loading 态切到 empty 态，否则界面会一直停在
+    # Loading 直到下一次轮询。
+    # 必须在进入消息循环之前发，否则客户端一连上就发请求时，响应会排在快照
+    # 前面，UI 拿到乱序数据。
+    try:
+        await ws.send(json.dumps({"type": "agents", "agents": list(agent_cache.values())}))
+    except Exception as e:
+        # 客户端可能刚连上就断了；这不是错误路径，不该刷 traceback
+        log.debug("Initial snapshot not delivered to %s: %s", ip, e)
+
     try:
         async for raw in ws:
             try:
