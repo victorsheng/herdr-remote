@@ -72,6 +72,9 @@ event_queue = asyncio.Queue()
 pane_remote_map = {}
 known_panes = set()
 agent_cache = {}
+# workspace_id -> display label from `herdr workspace list` / rename.
+# Pane list only has cwd basename as "project"; Space chips need this label.
+workspace_label_cache = {}
 # 窄屏模式：{目标 pane_id: 为挤窄它而分出的陪衬 pane_id}。
 # 记录而非推断——关闭时只关我们自己开的那个，避免误关用户在 Mac 上手开的 pane。
 narrow_companions = {}
@@ -327,16 +330,56 @@ async def get_agents_from_host_async(remote=None):
     return _parse_pane_list(raw, remote)
 
 
+def _parse_workspace_labels(raw):
+    """Parse `herdr workspace list` JSON into {workspace_id: label}."""
+    try:
+        data = json.loads(raw or "")
+        workspaces = data.get("result", {}).get("workspaces", [])
+        out = {}
+        for w in workspaces:
+            wid = w.get("workspace_id") or ""
+            if not wid:
+                continue
+            label = (w.get("label") or "").strip()
+            if label:
+                out[wid] = label
+        return out
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return {}
+
+
+def _apply_workspace_labels(agents, labels):
+    for a in agents:
+        wid = a.get("workspace_id") or ""
+        a["workspace_label"] = labels.get(wid, "") if wid else ""
+    return agents
+
+
+def _set_workspace_label(workspace_id, label):
+    """Update cache + in-memory agents after a successful rename."""
+    workspace_label_cache[workspace_id] = label
+    for a in agent_cache.values():
+        if a.get("workspace_id") == workspace_id:
+            a["workspace_label"] = label
+
+
 async def get_all_agents_async():
     """本机与所有 remote 并发查询，总耗时取最慢的一个而非累加。"""
+    hosts = [None, *REMOTES]
     results = await asyncio.gather(
-        get_agents_from_host_async(remote=None),
-        *(get_agents_from_host_async(remote=r) for r in REMOTES),
+        *(get_agents_from_host_async(remote=r) for r in hosts),
+        *(run_herdr_async("workspace", "list", remote=r) for r in hosts),
     )
+    n = len(hosts)
     agents = []
-    for chunk in results:
+    for chunk in results[:n]:
         agents.extend(chunk)
-    return agents
+    labels = {}
+    for raw in results[n:]:
+        labels.update(_parse_workspace_labels(raw))
+    if labels:
+        workspace_label_cache.update(labels)
+    return _apply_workspace_labels(agents, workspace_label_cache)
 
 
 async def read_pane_async(pane_id, remote=None):
@@ -449,6 +492,7 @@ def _parse_pane_list(raw, remote):
                 "host": host_label,
                 "remote": remote,
                 "workspace_id": p.get("workspace_id", ""),
+                "workspace_label": "",
                 "tab_id": p.get("tab_id", ""),
             }
             for p in panes if p.get("agent")
@@ -458,13 +502,23 @@ def _parse_pane_list(raw, remote):
 
 
 def get_agents_from_host(remote=None):
-    return _parse_pane_list(run_herdr("pane", "list", remote=remote), remote)
+    return _apply_workspace_labels(
+        _parse_pane_list(run_herdr("pane", "list", remote=remote), remote),
+        workspace_label_cache,
+    )
 
 
 def get_all_agents():
     agents = get_agents_from_host(remote=None)
     for remote in REMOTES:
         agents.extend(get_agents_from_host(remote=remote))
+    # Best-effort refresh of labels for sync callers (tests / rare paths).
+    labels = _parse_workspace_labels(run_herdr("workspace", "list"))
+    for remote in REMOTES:
+        labels.update(_parse_workspace_labels(run_herdr("workspace", "list", remote=remote)))
+    if labels:
+        workspace_label_cache.update(labels)
+        _apply_workspace_labels(agents, workspace_label_cache)
     return agents
 
 
@@ -966,6 +1020,66 @@ async def handle_client(ws):
                     await ws.send(json.dumps({"type": "tab_created", "ok": True}))
                 else:
                     await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+            elif msg_type == "create_workspace":
+                log.info("Create workspace from %s (%s)", ip, device)
+                audit("create_workspace", ip, device, "", "")
+                try:
+                    returncode, _ = await run_herdr_rc_async("workspace", "create", "--focus")
+                except Exception as e:
+                    log.warning("create_workspace failed: %s", e)
+                    await ws.send(json.dumps({"type": "error", "message": "create_workspace command failed"}))
+                    continue
+                if returncode != 0:
+                    log.warning("create_workspace failed with exit %s", returncode)
+                    await ws.send(json.dumps({"type": "error", "message": "create_workspace command failed"}))
+                    continue
+                await ws.send(json.dumps({"type": "workspace_created", "ok": True}))
+            elif msg_type == "rename_workspace":
+                workspace_id = msg.get("workspace_id", "")
+                label = (msg.get("label") or "").strip()
+                if not workspace_id:
+                    await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+                    continue
+                if not label:
+                    await ws.send(json.dumps({"type": "error", "message": "label required"}))
+                    continue
+                log.info("Rename workspace from %s (%s): workspace=%s label=%s",
+                         ip, device, workspace_id, label)
+                audit("rename_workspace", ip, device, "", f"workspace={workspace_id} label={label}")
+                try:
+                    returncode, _ = await run_herdr_rc_async(
+                        "workspace", "rename", workspace_id, label)
+                except Exception as e:
+                    log.warning("rename_workspace failed for %s: %s", workspace_id, e)
+                    await ws.send(json.dumps({"type": "error", "message": "rename_workspace command failed"}))
+                    continue
+                if returncode != 0:
+                    log.warning("rename_workspace failed for %s with exit %s", workspace_id, returncode)
+                    await ws.send(json.dumps({"type": "error", "message": "rename_workspace command failed"}))
+                    continue
+                _set_workspace_label(workspace_id, label)
+                await ws.send(json.dumps({
+                    "type": "workspace_renamed", "ok": True,
+                    "workspace_id": workspace_id, "label": label,
+                }))
+            elif msg_type == "close_workspace":
+                workspace_id = msg.get("workspace_id", "")
+                if not workspace_id:
+                    await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+                    continue
+                log.info("Close workspace from %s (%s): workspace=%s", ip, device, workspace_id)
+                audit("close_workspace", ip, device, "", f"workspace={workspace_id}")
+                try:
+                    returncode, _ = await run_herdr_rc_async("workspace", "close", workspace_id)
+                except Exception as e:
+                    log.warning("close_workspace failed for %s: %s", workspace_id, e)
+                    await ws.send(json.dumps({"type": "error", "message": "close_workspace command failed"}))
+                    continue
+                if returncode != 0:
+                    log.warning("close_workspace failed for %s with exit %s", workspace_id, returncode)
+                    await ws.send(json.dumps({"type": "error", "message": "close_workspace command failed"}))
+                    continue
+                await ws.send(json.dumps({"type": "workspace_closed", "ok": True}))
             elif msg_type == "push_subscribe":
                 sub = msg.get("subscription")
                 if sub and sub not in push_subscriptions:

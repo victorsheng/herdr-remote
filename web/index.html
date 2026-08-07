@@ -131,6 +131,17 @@ body { line-height: 1.2; }
 @media (hover: hover) and (pointer: fine) {
   .chip-add:hover { border-color: var(--blue); color: var(--blue); }
 }
+.space-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:10000; display:flex; align-items:flex-end; justify-content:center; }
+.space-sheet, .space-dialog { width:min(420px,100%); background:var(--surface); color:var(--text); border-radius:14px 14px 0 0; padding:14px 14px calc(14px + env(safe-area-inset-bottom,0px)); border:1px solid var(--border); }
+.space-dialog { align-self:center; border-radius:14px; margin:16px; width:min(360px,calc(100% - 32px)); }
+.space-sheet button, .space-dialog button { display:block; width:100%; text-align:left; padding:12px 10px; border:none; background:transparent; color:var(--text); font-size:1rem; border-radius:8px; cursor:pointer; }
+.space-sheet button:active, .space-dialog .row button:active { background:color-mix(in srgb, var(--text) 8%, transparent); }
+.space-sheet .danger, .space-dialog .danger { color:var(--red); }
+.space-dialog h3 { margin:0 0 10px; font-size:1rem; }
+.space-dialog input { width:100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text); font-size:16px; margin-bottom:12px; }
+.space-dialog .row { display:flex; gap:8px; justify-content:flex-end; }
+.space-dialog .row button { width:auto; padding:10px 14px; background:var(--border); }
+.space-dialog .row button.primary { background:var(--blue); color:#fff; }
 /* min-width:0 让 flex 子项可以收缩，否则长项目名会把右侧箭头挤出卡片。 */
 .agent .info { flex: 1; min-width: 0; }
 /* 中文在同等 font-size 下字面高度大于拉丁字母，但笔画密度高、小字号下更难辨认，
@@ -201,6 +212,52 @@ body { line-height: 1.2; }
 .ctrl-key.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, var(--border)); }
 .ctrl-key.confirm { background: var(--red); color: #fff; border-color: var(--red); }
 .digit-key { padding: 10px 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 18px; font-family: monospace; font-weight: 600; cursor: pointer; min-height: 46px; display: flex; align-items: center; justify-content: center; }
+/* Quick Actions 紧凑布局 + Snippets */
+.quick-dock-dense .qd-label {
+  font-size: 0.55rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 4px 0 2px;
+}
+.quick-dock-dense .qd-grid { display: grid; gap: 3px; margin-bottom: 4px; }
+.quick-dock-dense .qd-grid-2 { grid-template-columns: 1fr 1fr; }
+.quick-dock-dense .qd-grid-3 { grid-template-columns: repeat(3, 1fr); }
+.quick-dock-dense .qd-btn { min-height: 36px; padding: 6px 4px; font-size: 12px; }
+.snippet-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 36px;
+  padding: 6px 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  overflow: hidden;
+}
+.snippet-btn .snippet-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.snippet-btn .snippet-edit {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 4px;
+  cursor: pointer;
+  min-height: 28px;
+  min-width: 28px;
+}
 .digit-key:active { background: var(--border); }
 .queue-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border); background: color-mix(in srgb, var(--text) 5%, var(--bg)); font-family: monospace; font-size: 12px; font-weight: 500; cursor: pointer; }
 @media (hover: hover) and (pointer: fine) {
@@ -346,24 +403,49 @@ body { line-height: 1.2; }
     <div id="actionKeys" style="width:100%;margin-top:4px"></div>
   </div>
   <!-- Quick actions dock -->
-  <div class="term-keys" id="quickDock" style="display:none">
-    <div style="display:flex;align-items:center;justify-content:space-between;width:100%;margin-bottom:8px">
-      <span style="font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted)">Quick Actions</span>
+  <div class="term-keys quick-dock-dense" id="quickDock" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;width:100%;margin-bottom:4px">
+      <span style="font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted)">Quick Actions</span>
       <button onclick="toggleQuickDock()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1rem;cursor:pointer">✕</button>
     </div>
     <div style="width:100%">
-      <p style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:4px">Confirm</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px">
-        <button class="nav-key" style="color:var(--green);border-color:var(--green)" onclick="quickSend('yes')">yes</button>
-        <button class="nav-key" style="color:var(--red);border-color:var(--red)" onclick="quickSend('no')">no</button>
+      <p class="qd-label">Confirm</p>
+      <div class="qd-grid qd-grid-2">
+        <button class="nav-key qd-btn" style="color:var(--green);border-color:var(--green)" onclick="quickSend('yes')">yes</button>
+        <button class="nav-key qd-btn" style="color:var(--red);border-color:var(--red)" onclick="quickSend('no')">no</button>
       </div>
-      <p style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:4px">Common</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">
-        <button class="nav-key" onclick="quickSend('continue')">continue</button>
-        <button class="nav-key" onclick="quickSend('retry')">retry</button>
-        <button class="nav-key" onclick="quickSend('skip')">skip</button>
-        <button class="nav-key" onclick="quickSend('commit and push')">commit & push</button>
+      <p class="qd-label">Common</p>
+      <div class="qd-grid qd-grid-3">
+        <button class="nav-key qd-btn" onclick="quickSend('continue')">continue</button>
+        <button class="nav-key qd-btn" onclick="quickSend('retry')">retry</button>
+        <button class="nav-key qd-btn" onclick="quickSend('skip')">skip</button>
+        <button class="nav-key qd-btn" onclick="quickSend('commit and push')" style="grid-column:1/-1">commit & push</button>
       </div>
+      <p class="qd-label">Snippets</p>
+      <div class="qd-grid qd-grid-3" id="snippetButtons"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Snippet editor -->
+<div id="snippetEditor" style="display:none;position:fixed;inset:0;z-index:110;">
+  <div onclick="closeSnippetEditor()" style="position:absolute;inset:0;background:rgba(0,0,0,0.5)"></div>
+  <div style="position:absolute;bottom:var(--kb-inset,0px);left:50%;transform:translateX(-50%);width:100%;max-width:420px;background:var(--surface);border-top-left-radius:16px;border-top-right-radius:16px;border-top:1px solid var(--border);padding:12px 16px;padding-bottom:max(env(safe-area-inset-bottom,8px) - var(--kb-inset,0px),12px);display:flex;flex-direction:column;gap:8px">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:0.85rem;font-weight:600">Edit snippet</span>
+      <button type="button" onclick="closeSnippetEditor()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1.2rem;cursor:pointer">✕</button>
+    </div>
+    <label style="font-size:0.7rem;color:var(--muted)">Title
+      <input id="snippetTitleInput" type="text" maxlength="40" autocomplete="off"
+        style="display:block;width:100%;margin-top:4px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:16px;box-sizing:border-box" />
+    </label>
+    <label style="font-size:0.7rem;color:var(--muted)">Body
+      <textarea id="snippetBodyInput" rows="5"
+        style="display:block;width:100%;margin-top:4px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:16px;resize:vertical;box-sizing:border-box"></textarea>
+    </label>
+    <div style="display:flex;gap:8px">
+      <button type="button" onclick="closeSnippetEditor()" class="nav-key" style="flex:1">Cancel</button>
+      <button type="button" onclick="commitSnippetEditor()" class="nav-key" style="flex:1;background:var(--blue);color:#fff;border-color:var(--blue)">Save</button>
     </div>
   </div>
 </div>
@@ -387,7 +469,7 @@ body { line-height: 1.2; }
 
 <script>
 
-let ws = null, agents = [], activePane = null, refreshInterval = null, userScrolledUp = false;
+var ws = null, agents = [], activePane = null, refreshInterval = null, userScrolledUp = false;
 let timeline = [], prevStatuses = {};
 let activeWorkspace = null;
 let activeTab = null;
@@ -584,19 +666,40 @@ function handleMessage(msg) {
       if (msg.ok) setTimeout(refreshPane, 300);
       else if (msg.note) showTermToast(msg.note);
     }
+  } else if (msg.type === 'workspace_created' && msg.ok) {
+    if (window.cue) cue('sparkle');
+  } else if (msg.type === 'workspace_renamed' && msg.ok) {
+    // Chip text uses workspace_label (herdr Space name), not cwd basename.
+    if (msg.workspace_id && msg.label) {
+      for (const a of agents) {
+        if (a.workspace_id === msg.workspace_id) a.workspace_label = msg.label;
+      }
+    }
+    closeSpaceOverlays();
+    render();
+  } else if (msg.type === 'workspace_closed' && msg.ok) {
+    activeWorkspace = null;
+    activeTab = null;
+    closeSpaceOverlays();
+    render();
   } else if (msg.type === 'error' && msg.message) {
     showTermToast(msg.message);
   }
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
 function render() {
   document.getElementById('agentCount').textContent = agents.length ? `${agents.length}` : '';
   const workspaces = [...new Set(agents.map(a => a.workspace_id).filter(Boolean))];
-  if (workspaces.length <= 1) {
+  // Spec: Spaces strip always visible (0 / 1 / many) so + Space is reachable.
+  if (activeWorkspace && !workspaces.includes(activeWorkspace)) {
     activeWorkspace = null;
     activeTab = null;
-    renderAgentList(agents);
-    return;
   }
   renderWorkspaces(workspaces);
 }
@@ -609,14 +712,20 @@ function renderWorkspaces(workspaces) {
     html += `<div class="section-header" style="color:var(--red)"><span class="dot" style="background:var(--red)"></span>Needs you <span style="opacity:0.6">(${blocked.length})</span></div>`;
     html += blocked.map(a => agentCard(a)).join('');
   }
-  // Space chip strip
+  // Space chip strip (always)
   html += `<div class="chip-strip"><span class="chip-label">Spaces</span>`;
-  html += `<button class="chip${activeWorkspace===null?' active':''}" onclick="backToWorkspaces()">All</button>`;
-  for (const wsId of workspaces) {
-    const wsAgents = agents.filter(a => a.workspace_id === wsId);
-    const hasBlocked = wsAgents.some(a => a.status === 'blocked');
-    const name = wsAgents[0]?.project || wsId.slice(0, 8);
-    html += `<button class="chip${activeWorkspace===wsId?' active':''}${hasBlocked?' alert':''}" onclick="selectWorkspace('${wsId}')">${name}</button>`;
+  if (workspaces.length >= 1) {
+    html += `<button class="chip${activeWorkspace===null?' active':''}" onclick="backToWorkspaces()">All</button>`;
+    for (const wsId of workspaces) {
+      const wsAgents = agents.filter(a => a.workspace_id === wsId);
+      const hasBlocked = wsAgents.some(a => a.status === 'blocked');
+      const name = wsAgents[0]?.workspace_label || wsAgents[0]?.project || wsId.slice(0, 8);
+      html += `<button class="chip${activeWorkspace===wsId?' active':''}${hasBlocked?' alert':''}" onclick="selectWorkspace('${wsId}')">${esc(name)}</button>`;
+    }
+  }
+  html += `<button class="chip chip-add" onclick="createWorkspace()" aria-label="New Space">+</button>`;
+  if (activeWorkspace) {
+    html += `<button class="chip" onclick="openSpaceMenu()" aria-label="Space actions">⋯</button>`;
   }
   html += `</div>`;
   // Tab chip strip (always show when workspace selected)
@@ -630,7 +739,7 @@ function renderWorkspaces(workspaces) {
       const tabAgents = agents.filter(a => a.tab_id === tid);
       const hasBlocked = tabAgents.some(a => a.status === 'blocked');
       const tabLabel = tabAgents[0]?.label || 'Tab '+(i+1);
-      html += `<button class="chip${activeTab===tid?' active':''}${hasBlocked?' alert':''}" onclick="selectTab('${tid}')">${tabLabel}</button>`;
+      html += `<button class="chip${activeTab===tid?' active':''}${hasBlocked?' alert':''}" onclick="selectTab('${tid}')">${esc(tabLabel)}</button>`;
     });
     html += `<button class="chip chip-add" onclick="createTab('${activeWorkspace}')">+</button>`;
     html += `</div>`;
@@ -646,7 +755,7 @@ function renderWorkspaces(workspaces) {
   if (working.length) html += section('Working', 'var(--green)', working);
   if (done.length) html += section('Done', 'var(--muted)', done);
   if (idle.length) html += section('Idle', 'var(--muted)', idle);
-  if (!agents.length) html = '<div class="empty">Waiting for agents…</div>';
+  if (!agents.length) html += '<div class="empty">Waiting for agents…</div>';
   document.getElementById('agents').innerHTML = html;
 }
 
@@ -673,6 +782,91 @@ function createTab(workspaceId) {
   if (window.cue) cue('sparkle');
   ws.send(JSON.stringify({type:'create_tab', workspace_id: workspaceId}));
   setTimeout(() => { activeTab = null; }, 1500);
+}
+
+function createWorkspace() {
+  if (!ws) return;
+  if (window.cue) cue('sparkle');
+  ws.send(JSON.stringify({type:'create_workspace'}));
+}
+
+function closeSpaceOverlays() {
+  document.querySelectorAll('.space-overlay').forEach(el => el.remove());
+}
+
+function openSpaceMenu() {
+  if (!activeWorkspace) return;
+  closeSpaceOverlays();
+  const ov = document.createElement('div');
+  ov.className = 'space-overlay';
+  ov.onclick = (e) => { if (e.target === ov) closeSpaceOverlays(); };
+  ov.innerHTML = `<div class="space-sheet" role="menu" aria-label="Space actions">
+    <button type="button" onclick="openRenameSpace()">Rename…</button>
+    <button type="button" class="danger" onclick="openCloseSpace()">Close…</button>
+  </div>`;
+  document.body.appendChild(ov);
+}
+
+function currentSpaceLabel() {
+  const a = agents.find(x => x.workspace_id === activeWorkspace);
+  return a?.workspace_label || a?.project || activeWorkspace || '';
+}
+
+function openRenameSpace() {
+  if (!activeWorkspace) return;
+  closeSpaceOverlays();
+  const ov = document.createElement('div');
+  ov.className = 'space-overlay';
+  ov.onclick = (e) => { if (e.target === ov) closeSpaceOverlays(); };
+  const label = esc(currentSpaceLabel());
+  ov.innerHTML = `<div class="space-dialog" role="dialog" aria-label="Rename Space">
+    <h3>Rename Space</h3>
+    <input id="spaceRenameInput" value="${label}" maxlength="80" />
+    <div class="row">
+      <button type="button" onclick="closeSpaceOverlays()">Cancel</button>
+      <button type="button" class="primary" onclick="submitRenameSpace()">Save</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  const input = document.getElementById('spaceRenameInput');
+  input.focus();
+  input.select();
+}
+
+function submitRenameSpace() {
+  if (!ws || !activeWorkspace) return;
+  const input = document.getElementById('spaceRenameInput');
+  const label = (input?.value || '').trim();
+  if (!label) return;
+  ws.send(JSON.stringify({
+    type: 'rename_workspace',
+    workspace_id: activeWorkspace,
+    label,
+  }));
+}
+
+function openCloseSpace() {
+  if (!activeWorkspace) return;
+  closeSpaceOverlays();
+  const ov = document.createElement('div');
+  ov.className = 'space-overlay';
+  ov.onclick = (e) => { if (e.target === ov) closeSpaceOverlays(); };
+  ov.innerHTML = `<div class="space-dialog" role="dialog" aria-label="Close Space">
+    <h3>关闭这个 Space？</h3>
+    <div class="row">
+      <button type="button" onclick="closeSpaceOverlays()">Cancel</button>
+      <button type="button" class="danger" onclick="submitCloseSpace()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+}
+
+function submitCloseSpace() {
+  if (!ws || !activeWorkspace) return;
+  ws.send(JSON.stringify({
+    type: 'close_workspace',
+    workspace_id: activeWorkspace,
+  }));
 }
 
 function agentCard(a) {
@@ -852,12 +1046,97 @@ function sendQueuedKeys() {
 // 白白多一次点击。记住上次的选择后，常用键盘的人再进来就是展开的。
 // 只存「哪个面板」这一个值——两者互斥，不需要各存一份。
 const KEYPAD_STATE_KEY = 'herdr_keypad_open';
+var SNIPPETS_KEY = 'herdr_snippets';
+var DEFAULT_SNIPPETS = [
+  {
+    title: '并行',
+    body: '用 subagents 并行开发；本地开发不用 worktree；不要用 superpowers 相关的 TDD；最后统一验证。',
+  },
+  { title: 'Slot 2', body: '' },
+  { title: 'Slot 3', body: '' },
+];
+var snippetEditIdx = null;
 
 function saveKeypadState(which) {
   try {
     if (which) localStorage.setItem(KEYPAD_STATE_KEY, which);
     else localStorage.removeItem(KEYPAD_STATE_KEY);
   } catch (e) { /* 隐私模式下 localStorage 可能不可写，不该影响主流程 */ }
+}
+
+function normalizeSnippets(raw) {
+  if (!Array.isArray(raw) || raw.length !== 3) return DEFAULT_SNIPPETS.map(s => ({ ...s }));
+  return raw.map((s, i) => {
+    const title = (s && typeof s.title === 'string' ? s.title : '').trim() || `Slot ${i + 1}`;
+    const body = s && typeof s.body === 'string' ? s.body : '';
+    return { title, body };
+  });
+}
+
+function loadSnippets() {
+  try {
+    const raw = localStorage.getItem(SNIPPETS_KEY);
+    if (!raw) return DEFAULT_SNIPPETS.map(s => ({ ...s }));
+    return normalizeSnippets(JSON.parse(raw));
+  } catch (e) {
+    return DEFAULT_SNIPPETS.map(s => ({ ...s }));
+  }
+}
+
+function saveSnippets(list) {
+  const normalized = normalizeSnippets(list);
+  try { localStorage.setItem(SNIPPETS_KEY, JSON.stringify(normalized)); } catch (e) { /* privacy mode */ }
+  return normalized;
+}
+
+function renderSnippets() {
+  const host = document.getElementById('snippetButtons');
+  if (!host) return;
+  const list = loadSnippets();
+  host.innerHTML = list.map((s, i) => {
+    const title = esc(s.title);
+    return `<div class="snippet-btn" data-snippet-idx="${i}" role="button" tabindex="0">` +
+      `<span class="snippet-title">${title}</span>` +
+      `<button type="button" class="snippet-edit" data-edit-idx="${i}" aria-label="Edit snippet ${i + 1}">✎</button>` +
+      `</div>`;
+  }).join('');
+}
+
+function openSnippetEditor(idx) {
+  const list = loadSnippets();
+  if (idx < 0 || idx > 2) return;
+  snippetEditIdx = idx;
+  document.getElementById('snippetTitleInput').value = list[idx].title;
+  document.getElementById('snippetBodyInput').value = list[idx].body;
+  document.getElementById('snippetEditor').style.display = '';
+}
+
+function closeSnippetEditor() {
+  document.getElementById('snippetEditor').style.display = 'none';
+  snippetEditIdx = null;
+}
+
+function commitSnippetEditor() {
+  if (snippetEditIdx == null) return;
+  const list = loadSnippets();
+  list[snippetEditIdx] = {
+    title: document.getElementById('snippetTitleInput').value,
+    body: document.getElementById('snippetBodyInput').value,
+  };
+  saveSnippets(list);
+  closeSnippetEditor();
+  renderSnippets();
+}
+
+function fireSnippet(idx) {
+  const list = loadSnippets();
+  const s = list[idx];
+  if (!s) return;
+  if (!s.body.trim()) {
+    openSnippetEditor(idx);
+    return;
+  }
+  quickSend(s.body);
 }
 
 /** 打开终端时按上次的选择恢复面板。无存档或存档无效时保持收起，不打扰。 */
@@ -870,6 +1149,7 @@ function restoreKeypadState() {
   // 只认这两个值：其它一律当没存过，避免脏数据展开出意料外的面板
   keys.style.display = saved === 'keys' ? '' : 'none';
   quick.style.display = saved === 'quick' ? '' : 'none';
+  if (saved === 'quick') renderSnippets();
 }
 
 function toggleKeysDock() {
@@ -887,7 +1167,10 @@ function toggleQuickDock() {
   const keys = document.getElementById('termKeys');
   const show = el.style.display === 'none';
   el.style.display = show ? '' : 'none';
-  if (show) keys.style.display = 'none'; // mutual exclusive
+  if (show) {
+    keys.style.display = 'none'; // mutual exclusive
+    renderSnippets();
+  }
   saveKeypadState(show ? 'quick' : null);
   if(window.cue) cue(show ? 'page' : 'tick');
 }
@@ -900,6 +1183,52 @@ function quickSend(text) {
   document.getElementById('quickDock').style.display = 'none';
   setTimeout(refreshPane, 500);
 }
+
+(function wireSnippetButtons() {
+  const host = document.getElementById('snippetButtons');
+  if (!host) return;
+  let pressTimer = null;
+  let longPressFired = false;
+  host.addEventListener('click', (e) => {
+    if (longPressFired) {
+      longPressFired = false;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    const edit = e.target.closest('[data-edit-idx]');
+    if (edit) {
+      e.preventDefault();
+      e.stopPropagation();
+      openSnippetEditor(Number(edit.getAttribute('data-edit-idx')));
+      return;
+    }
+    const btn = e.target.closest('[data-snippet-idx]');
+    if (btn) fireSnippet(Number(btn.getAttribute('data-snippet-idx')));
+  });
+  host.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const btn = e.target.closest('[data-snippet-idx]');
+    if (!btn) return;
+    e.preventDefault();
+    fireSnippet(Number(btn.getAttribute('data-snippet-idx')));
+  });
+  host.addEventListener('pointerdown', (e) => {
+    const btn = e.target.closest('[data-snippet-idx]');
+    if (!btn || e.target.closest('[data-edit-idx]')) return;
+    const idx = Number(btn.getAttribute('data-snippet-idx'));
+    longPressFired = false;
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      longPressFired = true;
+      openSnippetEditor(idx);
+    }, 550);
+  });
+  const clearPress = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } };
+  host.addEventListener('pointerup', clearPress);
+  host.addEventListener('pointercancel', clearPress);
+  host.addEventListener('pointerleave', clearPress);
+})();
 
 function switchKeyTab(tab) {
   document.getElementById('tabKeys').classList.toggle('active', tab==='keys');
