@@ -74,9 +74,26 @@ known_panes = set()
 agent_cache = {}
 
 SAFE_RESPONSES = {"y", "n", "a", "yes", "no", "trust", "yes, single permission", "trust, always allow", "no (tab to edit)", "approve all pending", "configure individually", "exit (cancel subagents)"}
-SAFE_KEYS = {"y", "n", "a", "Enter", "Tab", "Escape", "C-c", "Up", "Down", "Left", "Right", "BSpace"} | {
+# herdr pane send-keys 认的是 parse_key_combo 名（backspace / bs），不是 tmux 的 BSpace。
+# 别名在送入 herdr 前归一化；白名单同时收别名与规范名，避免旧客户端被拒。
+KEY_ALIASES = {
+    "BSpace": "backspace",
+    "Backspace": "backspace",
+    "bs": "backspace",
+    # 手机端常说「删除」；herdr 没有 forward-delete，映射到退格。
+    "Delete": "backspace",
+    "Del": "backspace",
+}
+SAFE_KEYS = {"y", "n", "a", "Enter", "Tab", "Escape", "C-c", "Up", "Down", "Left", "Right",
+             "backspace", "Space"} | set(KEY_ALIASES) | {
     str(number) for number in range(10)
 }
+
+
+def normalize_key(key: str) -> str:
+    """把客户端别名归一成 herdr 能解析的键名。"""
+    return KEY_ALIASES.get(key, key)
+
 
 
 # Cursor Agent 的跟进输入框对「paste 后立刻 Enter」特别敏感：PTY 已写入、
@@ -705,10 +722,11 @@ async def handle_client(ws):
                 if pane_id not in known_panes:
                     await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
                     continue
-                keys = msg.get("keys", [])
-                if not all(k in SAFE_KEYS for k in keys):
+                raw_keys = msg.get("keys", [])
+                if not all(isinstance(k, str) and k in SAFE_KEYS for k in raw_keys):
                     await ws.send(json.dumps({"type": "error", "message": "keys contain disallowed values"}))
                     continue
+                keys = [normalize_key(k) for k in raw_keys]
                 remote = pane_remote_map.get(pane_id)
                 log.info("Keys from %s (%s): pane=%s keys=%s", ip, device, pane_id, keys)
                 audit("send_keys", ip, device, pane_id, f"keys={keys}")

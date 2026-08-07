@@ -310,7 +310,8 @@ body { line-height: 1.2; }
     <div id="keysPad" style="width:100%">
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:4px">
         <button class="nav-key" onclick="fireKey('Tab')">Tab</button>
-        <button class="nav-key" style="grid-column:span 2" onclick="fireKey('Space')">Space</button>
+        <button class="nav-key" onclick="fireKey('Space')">Space</button>
+        <button class="nav-key" onclick="fireKey('backspace')" aria-label="Backspace">⌫</button>
       </div>
       <!-- 方向键排成倒 T 形：↑ 居上，← ↓ → 在下，与实体键盘一致，
            肌肉记忆可直接复用。此前 ← ↓ ↑ 挤在一行、→ 被折到下一行开头，
@@ -761,7 +762,8 @@ function renderKeyQueue() {
   strip.style.display = 'flex';
   let html = keyQueue.map((k,i) => {
     const isDanger = DANGER_KEYS.has(k.toLowerCase());
-    const label = k.includes('+') ? k.replace('ctrl+','Ctrl ').replace('shift+','\u21e7 ') : k;
+    const label = k === 'backspace' || k === 'BSpace' || k === 'Delete' ? '\u232b'
+      : k.includes('+') ? k.replace('ctrl+','Ctrl ').replace('shift+','\u21e7 ') : k;
     return `<span class="queue-chip${isDanger?' danger':''}" onclick="removeQueueKey(${i})">${label} \u00d7</span>`;
   }).join('');
   if (armedMod) html += `<span style="color:var(--muted);font-size:12px;padding:4px">${armedMod==='shift'?'\u21e7':'Ctrl'} + \u2026</span>`;
@@ -841,7 +843,12 @@ function switchKeyTab(tab) {
   const dp = document.getElementById('digitsPad');
   dp.style.display = tab==='digits' ? 'grid' : 'none';
   if (tab==='digits' && !dp.innerHTML) {
-    dp.innerHTML = [1,2,3,4,5,6,7,8,9].map(d => `<button class="digit-key" onclick="fireKey('${d}')">${d}</button>`).join('');
+    // 1–9 后补 空 / 0 / ⌫，方便改选编号选项时退格。
+    const cells = [1,2,3,4,5,6,7,8,9].map(d => `<button class="digit-key" onclick="fireKey('${d}')">${d}</button>`);
+    cells.push(`<button class="digit-key" style="visibility:hidden" aria-hidden="true" tabindex="-1"></button>`);
+    cells.push(`<button class="digit-key" onclick="fireKey('0')">0</button>`);
+    cells.push(`<button class="digit-key" onclick="fireKey('backspace')" aria-label="Backspace">\u232b</button>`);
+    dp.innerHTML = cells.join('');
   }
 }
 

@@ -138,5 +138,19 @@ class EventQueueIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(herdr_relay.event_queue.empty(), "合法 UDP 事件应入队")
 
 
+
+class KeyAliasTests(unittest.TestCase):
+    """删除/退格键必须映射到 herdr 能解析的 backspace，而不是 tmux 的 BSpace。"""
+
+    def test_delete_aliases_normalize_to_backspace(self):
+        for alias in ("BSpace", "Backspace", "bs", "Delete", "Del", "backspace"):
+            self.assertIn(alias, herdr_relay.SAFE_KEYS, f"{alias!r} 应在白名单")
+            self.assertEqual(herdr_relay.normalize_key(alias), "backspace")
+
+    def test_unrelated_keys_pass_through(self):
+        self.assertEqual(herdr_relay.normalize_key("Enter"), "Enter")
+        self.assertEqual(herdr_relay.normalize_key("C-c"), "C-c")
+
+
 if __name__ == "__main__":
     unittest.main()
