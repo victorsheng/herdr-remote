@@ -78,6 +78,25 @@ SAFE_KEYS = {"y", "n", "a", "Enter", "Tab", "Escape", "C-c", "Up", "Down", "Left
     str(number) for number in range(10)
 }
 
+
+# Cursor Agent 的跟进输入框对「paste 后立刻 Enter」特别敏感：PTY 已写入、
+# TUI 还在消化 bracketed paste 时若收到 Enter，会把 prompt 提交出去，但原文
+# 仍留在 → 跟进框里，下一次远程输入会拼到残留后面。Claude / Codex 无此问题。
+# 实测 ≥100ms settle 可稳定清空；取 150ms 留余量。只对 cursor 生效，避免拖慢别家。
+CURSOR_PASTE_SETTLE_S = 0.15
+_CURSOR_AGENT_NAMES = frozenset({"cursor", "cursor-agent"})
+
+
+def is_cursor_agent(agent: str | None) -> bool:
+    """识别 Cursor Agent（含 cursor-agent 别名）。"""
+    return (agent or "").strip().lower() in _CURSOR_AGENT_NAMES
+
+
+async def settle_after_paste(agent: str | None) -> None:
+    """Cursor paste 后等待 TUI 消化，避免紧随其后的 Enter 留下跟进框残留。"""
+    if is_cursor_agent(agent):
+        await asyncio.sleep(CURSOR_PASTE_SETTLE_S)
+
 # --- Agent event validation ---
 # agent_event / UDP / HTTP ?d= 三个入口原先零校验，而 AUTH_TOKEN 默认为空、
 # relay 监听 0.0.0.0 且主动 mDNS 广播。组合起来同网段任何设备都能伪造 blocked
@@ -717,6 +736,10 @@ async def handle_client(ws):
                 log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("send_text", ip, device, pane_id, f"text={text!r}")
                 await run_herdr_async("pane", "send-text", pane_id, text, remote=remote)
+                # Web/Telegram 都是 send_text 后紧跟 send_keys Enter；对 Cursor
+                # 必须在两条命令之间留出 paste settle，否则跟进框会残留原文。
+                agent_name = (agent_cache.get(pane_id) or {}).get("agent")
+                await settle_after_paste(agent_name)
             elif msg_type == "create_tab":
                 workspace_id = msg.get("workspace_id", "")
                 if workspace_id:
