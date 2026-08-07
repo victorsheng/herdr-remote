@@ -72,6 +72,9 @@ event_queue = asyncio.Queue()
 pane_remote_map = {}
 known_panes = set()
 agent_cache = {}
+# 窄屏模式：{目标 pane_id: 为挤窄它而分出的陪衬 pane_id}。
+# 记录而非推断——关闭时只关我们自己开的那个，避免误关用户在 Mac 上手开的 pane。
+narrow_companions = {}
 
 SAFE_RESPONSES = {"y", "n", "a", "yes", "no", "trust", "yes, single permission", "trust, always allow", "no (tab to edit)", "approve all pending", "configure individually", "exit (cancel subagents)"}
 # herdr pane send-keys 认的是 parse_key_combo 名（backspace / bs），不是 tmux 的 BSpace。
@@ -342,6 +345,92 @@ async def read_pane_async(pane_id, remote=None):
     lines = [l for l in raw.splitlines() if l.strip() and not CHROME_RE.search(l)]
     return "\n".join(lines[-20:])
 
+
+# 布局操作被 herdr 拒绝时的原因 → 面向用户的中文说明。
+# 这些都不是错误，而是"操作在当前布局下无意义"，UI 该给出解释而不是报错。
+LAYOUT_REASONS = {
+    "single_pane": "该 tab 只有一个 pane，无需缩放",
+    "already_zoomed": "该 pane 已处于缩放状态",
+    "already_unzoomed": "该 pane 未处于缩放状态",
+    "unchanged": "布局未发生变化",
+}
+
+
+def parse_layout_panes(raw):
+    """解析 `herdr pane layout` 的输出，返回 (pane_id, width) 列表。
+
+    窄屏模式要据此判断：当前是否已分屏、关闭时该关掉哪个 pane。
+    单 pane 时返回长度为 1 的列表，splits 为空。
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    layout = (data.get("result") or {}).get("layout")
+    if not isinstance(layout, dict):
+        return []
+    out = []
+    for p in layout.get("panes") or []:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("pane_id")
+        rect = p.get("rect") or {}
+        if isinstance(pid, str):
+            out.append((pid, rect.get("width", 0)))
+    return out
+
+
+def parse_split_result(raw):
+    """解析 `herdr pane split` 的 JSON 输出，返回新建的 pane_id（失败返回 ""）。
+
+    split 的返回结构与 zoom/resize 不同：它回 {"result": {"pane": {...},
+    "type": "pane_info"}}，没有 layout / changed 字段，成功的标志就是拿到
+    新 pane_id，所以单独解析而不复用 parse_layout_result。
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return ""
+    pane = result.get("pane")
+    if not isinstance(pane, dict):
+        return ""
+    pane_id = pane.get("pane_id")
+    return pane_id if isinstance(pane_id, str) else ""
+
+
+def parse_layout_result(raw, key):
+    """解析 `herdr pane zoom/split` 的 JSON 输出。
+
+    herdr 在"操作未生效"时同样返回退出码 0（实测：单 pane 上 zoom --on 得到
+    changed:false / reason:single_pane），因此不能只看 returncode——那会让 UI
+    报出假的成功。这里统一取 changed 与 reason，由调用方据此回 ack。
+
+    返回 (ok, info)：ok 表示 JSON 结构可解析；info 含 changed/reason/layout。
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return False, {}
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return False, {}
+    payload = result.get(key)
+    if not isinstance(payload, dict):
+        return False, {}
+    layout = payload.get("layout") or {}
+    return True, {
+        "changed": bool(payload.get("changed", False)),
+        "reason": payload.get("reason"),
+        "zoomed": payload.get("zoomed"),
+        "pane_id": payload.get("pane_id", ""),
+        "focused_pane_id": payload.get("focused_pane_id", ""),
+        # panes/splits 让客户端知道当前分屏结构；单 pane 时 splits 为空数组。
+        "pane_count": len(layout.get("panes") or []),
+        "split_count": len(layout.get("splits") or []),
+    }
 
 def _parse_pane_list(raw, remote):
     """解析 `herdr pane list` 的 JSON 输出。同步与异步版共用，避免两处漂移。"""
@@ -758,6 +847,116 @@ async def handle_client(ws):
                 # 必须在两条命令之间留出 paste settle，否则跟进框会残留原文。
                 agent_name = (agent_cache.get(pane_id) or {}).get("agent")
                 await settle_after_paste(agent_name)
+            elif msg_type == "pane_zoom":
+                pane_id = msg["pane_id"]
+                if pane_id not in known_panes:
+                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    continue
+                # mode 直接进命令行，必须白名单——herdr 的取值只有这三个。
+                mode = msg.get("mode", "toggle")
+                if mode not in ("toggle", "on", "off"):
+                    await ws.send(json.dumps({"type": "error", "message": "invalid zoom mode"}))
+                    continue
+                remote = pane_remote_map.get(pane_id)
+                audit("pane_zoom", ip, device, pane_id, f"mode={mode}")
+                try:
+                    returncode, out = await run_herdr_rc_async(
+                        "pane", "zoom", "--pane", pane_id, f"--{mode}", remote=remote)
+                except Exception as e:
+                    log.warning("pane_zoom failed for pane %s: %s", pane_id, e)
+                    await ws.send(json.dumps({"type": "error", "message": "pane_zoom command failed"}))
+                    continue
+                if returncode != 0:
+                    log.warning("pane_zoom failed for pane %s with exit %s", pane_id, returncode)
+                    await ws.send(json.dumps({"type": "error", "message": "pane_zoom command failed"}))
+                    continue
+                ok, info = parse_layout_result(out, "zoom")
+                if not ok:
+                    await ws.send(json.dumps({"type": "error", "message": "pane_zoom returned unparsable output"}))
+                    continue
+                await ws.send(json.dumps({
+                    "type": "command_result", "command": "pane_zoom",
+                    # 退出码 0 但 changed=false 是常态（如单 pane），ok 必须反映 changed
+                    "ok": info["changed"], "pane_id": pane_id,
+                    "zoomed": info["zoomed"], "pane_count": info["pane_count"],
+                    "note": LAYOUT_REASONS.get(info["reason"], ""),
+                }))
+            elif msg_type == "narrow_mode":
+                # 窄屏模式：herdr 没有"设置终端列宽"的接口（89 个 socket API
+                # 方法里都没有），但 pane 变窄时 agent 的 TUI 会响应 SIGWINCH
+                # 重排。实测 133 列分屏后变 67 列，读回内容从 132 列降到 64 列。
+                # 所以这里靠"向右分出一个陪衬 pane"把目标 pane 挤窄。
+                pane_id = msg["pane_id"]
+                if pane_id not in known_panes:
+                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    continue
+                enable = bool(msg.get("enable", True))
+                remote = pane_remote_map.get(pane_id)
+                log.info("Narrow mode from %s (%s): pane=%s enable=%s", ip, device, pane_id, enable)
+                audit("narrow_mode", ip, device, pane_id, f"enable={enable}")
+
+                if enable:
+                    if pane_id in narrow_companions:
+                        await ws.send(json.dumps({
+                            "type": "command_result", "command": "narrow_mode",
+                            "ok": False, "pane_id": pane_id, "narrow": True,
+                            "note": "该 pane 已处于窄屏模式",
+                        }))
+                        continue
+                    try:
+                        # --no-focus：挤窄是为了手机端可读，不该把 Mac 上的
+                        # 焦点抢到那个空 shell 上去。
+                        returncode, out = await run_herdr_rc_async(
+                            "pane", "split", "--pane", pane_id,
+                            "--direction", "right", "--no-focus", remote=remote)
+                    except Exception as e:
+                        log.warning("narrow_mode split failed for pane %s: %s", pane_id, e)
+                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        continue
+                    if returncode != 0:
+                        log.warning("narrow_mode split failed for pane %s with exit %s", pane_id, returncode)
+                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        continue
+                    # split 与 zoom 返回结构不同：它回 {"pane": {...},
+                    # "type": "pane_info"}，没有 layout/changed，成功标志是拿到新 pane_id。
+                    companion = parse_split_result(out)
+                    if not companion:
+                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode returned unparsable output"}))
+                        continue
+                    # 记住陪衬 pane 是谁：关闭时只关我们自己开的那个，
+                    # 绝不去猜，否则可能关掉用户自己在 Mac 上开的 pane。
+                    narrow_companions[pane_id] = companion
+                    await ws.send(json.dumps({
+                        "type": "command_result", "command": "narrow_mode",
+                        "ok": True, "pane_id": pane_id, "narrow": True,
+                    }))
+                else:
+                    companion = narrow_companions.get(pane_id)
+                    if not companion:
+                        await ws.send(json.dumps({
+                            "type": "command_result", "command": "narrow_mode",
+                            "ok": False, "pane_id": pane_id, "narrow": False,
+                            "note": "该 pane 不在窄屏模式",
+                        }))
+                        continue
+                    try:
+                        returncode, _ = await run_herdr_rc_async(
+                            "pane", "close", companion, remote=remote)
+                    except Exception as e:
+                        log.warning("narrow_mode close failed for pane %s: %s", companion, e)
+                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        continue
+                    # 无论关闭成功与否都清掉映射：pane 可能已被用户在 Mac 上
+                    # 手动关掉，此时再留着映射会让窄屏模式永远开不了。
+                    narrow_companions.pop(pane_id, None)
+                    if returncode != 0:
+                        log.warning("narrow_mode close failed for pane %s with exit %s", companion, returncode)
+                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        continue
+                    await ws.send(json.dumps({
+                        "type": "command_result", "command": "narrow_mode",
+                        "ok": True, "pane_id": pane_id, "narrow": False,
+                    }))
             elif msg_type == "create_tab":
                 workspace_id = msg.get("workspace_id", "")
                 if workspace_id:
