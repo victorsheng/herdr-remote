@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Slash Live Mode 测试 · herdr-remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, 'PingFang SC', sans-serif; margin: 0; padding: 20px;
+         background: #1a1b26; color: #c0caf5; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: #565f89; font-size: 0.8rem; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2f3549; }
+  th { color: #565f89; font-weight: 600; font-size: 0.72rem; }
+  td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+  .pass { color: #9ece6a; font-weight: 600; }
+  .fail { color: #f7768e; font-weight: 600; }
+  #summary { padding: 12px 14px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; }
+  #summary.ok { background: rgba(158,206,106,0.12); border: 1px solid #9ece6a; color: #9ece6a; }
+  #summary.bad { background: rgba(247,118,142,0.12); border: 1px solid #f7768e; color: #f7768e; }
+  .note { font-size: 0.76rem; color: #565f89; margin: -8px 0 18px; }
+  #frame { position: absolute; left: -99999px; top: 0; width: 390px; height: 844px; border: 0; }
+</style>
+</head>
+<body>
+
+<h1>Slash Live Mode 测试</h1>
+<div class="sub">加载 <code>../index.html</code>，验证菜单启发式、清理键序、进入判定与常量</div>
+
+<div id="summary">运行中…</div>
+<div id="results"></div>
+
+<div class="note">
+  直接操作 iframe 内 <code>contentWindow</code> 全局：<code>looksLikeSlashMenu</code> /
+  <code>buildSlashCleanupKeys</code> / <code>shouldEnterSlashLive</code> /
+  <code>SLASH_LIVE_TIMEOUT_MS</code> / <code>SLASH_SCRUB_BACKSPACES</code>。
+</div>
+
+<iframe id="frame" src="../index.html"></iframe>
+
+<script>
+const rows = [];
+let allPass = true;
+let fatal = null;
+
+function record(name, actual, expected, ok) {
+  if (!ok) allPass = false;
+  rows.push({ name, actual, expected, ok });
+}
+
+function run(win) {
+  const {
+    looksLikeSlashMenu,
+    buildSlashCleanupKeys,
+    shouldEnterSlashLive,
+    SLASH_LIVE_TIMEOUT_MS,
+    SLASH_SCRUB_BACKSPACES,
+  } = win;
+
+  // ── 1) 全局存在性 ───────────────────────────────────────
+  const fns = [
+    ['looksLikeSlashMenu', looksLikeSlashMenu],
+    ['buildSlashCleanupKeys', buildSlashCleanupKeys],
+    ['shouldEnterSlashLive', shouldEnterSlashLive],
+  ];
+  for (const [name, fn] of fns) {
+    record(`${name} 存在`, typeof fn, 'function', typeof fn === 'function');
+  }
+
+  if (typeof looksLikeSlashMenu !== 'function') return;
+
+  // ── 2) 空 / 普通日志 → 非菜单 ───────────────────────────
+  record('空文本不成菜单', String(looksLikeSlashMenu('')), 'false', looksLikeSlashMenu('') === false);
+  record('普通日志不成菜单',
+         String(looksLikeSlashMenu('Running tests…\nok')), 'false',
+         looksLikeSlashMenu('Running tests…\nok') === false);
+
+  // ── 3) 多行 /cmd 列表 → 菜单 ────────────────────────────
+  const menuish = 'Commands\n  /clear   Clear conversation\n  /compact Compact context\n  /model   Switch model';
+  record('多条 /cmd 视为菜单', String(looksLikeSlashMenu(menuish)), 'true',
+         looksLikeSlashMenu(menuish) === true);
+
+  // ── 4) 正文里单条 /foo → 非菜单 ─────────────────────────
+  record('单条 /foo 不够', String(looksLikeSlashMenu('try /foo later')), 'false',
+         looksLikeSlashMenu('try /foo later') === false);
+
+  if (typeof buildSlashCleanupKeys !== 'function') return;
+
+  // ── 5) 清理键：仅 Escape vs Escape + backspace ──────────
+  const keysNoScrub = buildSlashCleanupKeys({ scrub: false });
+  record('清理仅 Escape', JSON.stringify(keysNoScrub), '["Escape"]',
+         JSON.stringify(keysNoScrub) === JSON.stringify(['Escape']));
+
+  const keysScrub = buildSlashCleanupKeys({ scrub: true });
+  record('清理 Escape+backspace',
+         String(keysScrub[0] === 'Escape' && keysScrub.length === 1 + SLASH_SCRUB_BACKSPACES),
+         'true',
+         keysScrub[0] === 'Escape'
+           && keysScrub.length === 1 + SLASH_SCRUB_BACKSPACES
+           && keysScrub.every((k, i) => i === 0 || k === 'backspace'));
+
+  if (typeof shouldEnterSlashLive !== 'function') return;
+
+  // ── 6) shouldEnterSlashLive ─────────────────────────────
+  record('空输入打 / 进入', String(shouldEnterSlashLive('', '/')), 'true',
+         shouldEnterSlashLive('', '/') === true);
+  record('已有正文打 / 不进', String(shouldEnterSlashLive('hello', '/')), 'false',
+         shouldEnterSlashLive('hello', '/') === false);
+  record('空输入打 a 不进', String(shouldEnterSlashLive('', 'a')), 'false',
+         shouldEnterSlashLive('', 'a') === false);
+
+  // ── 7) 常量 ─────────────────────────────────────────────
+  record('超时常量 1500', String(SLASH_LIVE_TIMEOUT_MS), '1500', SLASH_LIVE_TIMEOUT_MS === 1500);
+  record('scrub 上限 8', String(SLASH_SCRUB_BACKSPACES), '8', SLASH_SCRUB_BACKSPACES === 8);
+}
+
+function finish() {
+  const tbl = ['<table><tr><th>检查项</th><th style="text-align:right">实测</th>' +
+               '<th style="text-align:right">期望</th><th>结论</th></tr>'];
+  for (const r of rows) {
+    tbl.push(`<tr><td>${r.name}</td><td class="num">${r.actual}</td>` +
+             `<td class="num">${r.expected}</td>` +
+             `<td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td></tr>`);
+  }
+  tbl.push('</table>');
+  document.getElementById('results').innerHTML = tbl.join('');
+
+  const s = document.getElementById('summary');
+  s.className = allPass && !fatal ? 'ok' : 'bad';
+  const failed = rows.filter(r => !r.ok).length;
+  s.textContent = fatal ? `✗ 测试无法完成：${fatal}`
+    : allPass ? `✓ 全部 ${rows.length} 项通过`
+              : `✗ ${failed}/${rows.length} 项未达标`;
+
+  window.__SLASH_LIVE_RESULT__ = { allPass, fatal, rows };
+  window.__SLASH_LIVE_DONE__ = true;
+}
+
+const frame = document.getElementById('frame');
+frame.addEventListener('load', () => {
+  try { run(frame.contentWindow); }
+  catch (e) { fatal = e.message || String(e); allPass = false; }
+  finish();
+});
+</script>
+</body>
+</html>

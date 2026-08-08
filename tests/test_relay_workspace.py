@@ -82,20 +82,39 @@ class WorkspaceHandlerTests(unittest.IsolatedAsyncioTestCase):
         _reset()
 
     async def test_create_workspace_passes_focus_and_succeeds(self):
+        create_stdout = json.dumps({
+            "id": "cli:workspace:create",
+            "result": {
+                "type": "workspace_created",
+                "workspace": {
+                    "workspace_id": "w9",
+                    "label": "Fresh",
+                },
+                "root_pane": {
+                    "pane_id": "w9:p1",
+                },
+            },
+        })
         ws = FakeWebSocket(incoming=[json.dumps({"type": "create_workspace"})])
         with mock.patch.object(
             herdr_relay, "run_herdr_rc_async", new_callable=mock.AsyncMock,
-            return_value=(0, ""),
-        ) as rc, mock.patch.object(herdr_relay, "audit") as audit:
+            return_value=(0, create_stdout),
+        ) as rc, mock.patch.object(herdr_relay, "audit") as audit, \
+             mock.patch.object(herdr_relay, "_poll_once", new_callable=mock.AsyncMock) as poll:
             await herdr_relay.handle_client(ws)
 
         rc.assert_awaited_once_with("workspace", "create", "--focus")
         audit.assert_called()
+        poll.assert_awaited()
         types = [m["type"] for m in _non_snapshot(ws.sent_messages())]
         self.assertIn("workspace_created", types)
         created = next(m for m in ws.sent_messages() if m.get("type") == "workspace_created")
         self.assertTrue(created["ok"])
-
+        self.assertEqual(created.get("workspace_id"), "w9")
+        self.assertEqual(created.get("label"), "Fresh")
+        self.assertEqual(created.get("pane_id"), "w9:p1")
+        self.assertEqual(herdr_relay.workspace_label_cache.get("w9"), "Fresh")
+        self.assertIn("w9:p1", herdr_relay.known_panes)
     async def test_create_workspace_nonzero_exit_sends_error(self):
         ws = FakeWebSocket(incoming=[json.dumps({"type": "create_workspace"})])
         with mock.patch.object(
@@ -162,6 +181,7 @@ class WorkspaceHandlerTests(unittest.IsolatedAsyncioTestCase):
         audit.assert_called()
         closed = next(m for m in ws.sent_messages() if m.get("type") == "workspace_closed")
         self.assertTrue(closed["ok"])
+        self.assertEqual(closed.get("workspace_id"), "w1")
 
     async def test_close_workspace_missing_id_or_nonzero_exit(self):
         _reset()

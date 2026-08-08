@@ -54,7 +54,12 @@ export default {
     server.addEventListener('message', (event) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'read_pane') {
+        if (msg.type === 'ping') {
+          let t = 0;
+          try { t = parseInt(msg.t, 10) || 0; } catch { t = 0; }
+          if (!Number.isFinite(t)) t = 0;
+          server.send(JSON.stringify({ type: 'pong', t }));
+        } else if (msg.type === 'read_pane') {
           server.send(JSON.stringify({
             type: 'pane_content', pane_id: msg.pane_id,
             content: `$ herdr agent session\n\n[demo mode -- read-only preview]\n\nAgent: ${msg.pane_id.split(':')[1]}\nProject: ${agents.find(a => a.pane_id === msg.pane_id)?.project || 'unknown'}\n\n  Compiled successfully\n  Running tests...\n\n  PASS src/index.test.ts\n  PASS src/utils.test.ts\n\nAll tests passed.`

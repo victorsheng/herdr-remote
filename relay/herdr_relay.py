@@ -4,7 +4,8 @@
 # dependencies = ["websockets>=14.0", "zeroconf>=0.80.0", "pywebpush>=2.0.0", "py-vapid>=1.9.0"]
 # ///
 """herdr-remote relay — polls herdr, accepts push events (HTTP POST + WebSocket + UDP), broadcasts to clients."""
-import asyncio, json, logging, os, re, secrets, shutil, signal, socket, subprocess, time
+import asyncio, gzip, json, logging, os, re, secrets, shlex, shutil, signal, socket, struct, subprocess, time
+from pathlib import Path
 
 from agent_state import complete_agent_update_message
 
@@ -67,6 +68,9 @@ CHROME_RE = re.compile(
 )
 
 clients = set()
+BIN_GZIP_CAP = "bin-gzip-v1"
+BIN_GZIP_TYPES = frozenset({"agents", "pane_content", "git_diff", "git_show"})
+client_caps = {}  # ws -> set[str]
 last_statuses = {}
 event_queue = asyncio.Queue()
 pane_remote_map = {}
@@ -348,6 +352,355 @@ def _parse_workspace_labels(raw):
         return {}
 
 
+def _parse_workspace_created(raw):
+    """Parse `herdr workspace create` JSON → (workspace_id, label, pane_id)."""
+    try:
+        data = json.loads(raw or "")
+        result = data.get("result") or {}
+        ws = result.get("workspace") or {}
+        root = result.get("root_pane") or {}
+        wid = (ws.get("workspace_id") or result.get("workspace_id") or "").strip()
+        label = (ws.get("label") or "").strip()
+        pane_id = (root.get("pane_id") or "").strip()
+        return wid, label, pane_id
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return "", "", ""
+
+
+def _parse_git_porcelain(raw):
+    """Parse `git status --porcelain=v1 -b` into branch/files/clean."""
+    branch = ""
+    files = []
+    for line in (raw or "").splitlines():
+        if line.startswith("## "):
+            branch = line[3:].strip()
+        elif len(line) >= 4 and line[2] == " ":
+            status = line[:2].strip() or line[0]
+            files.append({"status": status, "path": line[3:]})
+    clean = not files
+    return {"branch": branch, "files": files, "clean": clean}
+
+
+def _format_git_status_text(branch, files):
+    lines = []
+    if branch:
+        head = branch.split("...")[0]
+        lines.append(f"## {branch}")
+        lines.append(f"On branch {head}")
+    if not files:
+        lines.append("nothing to commit, working tree clean")
+    else:
+        for item in files:
+            lines.append(f"{item['status']:>3}  {item['path']}")
+    return "\n".join(lines)
+
+
+def _resolve_git_target(pane_id="", workspace_id=""):
+    """Resolve (cwd, remote, workspace_id) from known panes."""
+    pane_id = (pane_id or "").strip()
+    workspace_id = (workspace_id or "").strip()
+    if pane_id:
+        if pane_id not in known_panes:
+            return None, None, ""
+        agent = agent_cache.get(pane_id) or {}
+        cwd = (agent.get("cwd") or "").strip()
+        remote = pane_remote_map.get(pane_id)
+        ws = agent.get("workspace_id") or workspace_id
+        return cwd or None, remote, ws
+    if workspace_id:
+        for pid in known_panes:
+            agent = agent_cache.get(pid) or {}
+            if agent.get("workspace_id") != workspace_id:
+                continue
+            cwd = (agent.get("cwd") or "").strip()
+            if cwd:
+                return cwd, pane_remote_map.get(pid), workspace_id
+        return None, None, workspace_id
+    return None, None, ""
+
+
+def _sanitize_git_path(path):
+    """Return a safe repo-relative path, or None if rejected."""
+    if path is None:
+        return None
+    p = str(path).strip().replace("\\", "/")
+    if not p or p.startswith("/") or p.startswith("~"):
+        return None
+    if p.startswith("./"):
+        p = p[2:]
+    parts = [part for part in p.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+GIT_TEXT_LIMIT = 200 * 1024  # ~200KB
+
+
+def _truncate_git_text(text, limit=GIT_TEXT_LIMIT):
+    raw = text if isinstance(text, str) else ""
+    if len(raw.encode("utf-8", errors="replace")) <= limit:
+        return raw, False
+    encoded = raw.encode("utf-8", errors="replace")[:limit]
+    return encoded.decode("utf-8", errors="ignore"), True
+
+
+_BASE_CANDIDATES = ("origin/main", "main", "master")
+
+
+def _pick_base_ref(existing):
+    """Pick first candidate present in `existing` (ordered preference)."""
+    have = set(existing or [])
+    for name in _BASE_CANDIDATES:
+        if name in have:
+            return name
+    return None
+
+
+def _parse_git_name_status(raw):
+    files = []
+    for line in (raw or "").splitlines():
+        if not line.strip():
+            continue
+        # format: STATUS<TAB>path  (or STATUS<TAB>old<TAB>new for renames)
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0].strip() or "?"
+        path = parts[-1]
+        files.append({"status": status, "path": path})
+    return files
+
+
+async def _run_git_async(cwd, remote, args, timeout=10):
+    """Run git -C cwd … locally or via SSH. Returns (returncode, stdout, stderr)."""
+    if remote:
+        inner = "git -C " + shlex.quote(cwd) + " " + " ".join(shlex.quote(a) for a in args)
+        cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote, inner]
+    else:
+        cmd = ["git", "-C", cwd, *args]
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return -1, b"", b"timeout"
+    except Exception as e:
+        return -1, b"", str(e).encode()
+    return proc.returncode, stdout, stderr
+
+
+async def detect_git_base_async(cwd, remote=None, timeout=10):
+    found = []
+    for cand in _BASE_CANDIDATES:
+        rc, out, _ = await _run_git_async(
+            cwd, remote, ["rev-parse", "--verify", cand], timeout=timeout)
+        if rc == 0 and out.strip():
+            found.append(cand)
+    return _pick_base_ref(found)
+
+
+async def fetch_git_diff_async(cwd, path, mode="worktree", base="", remote=None, timeout=10,
+                               untracked=False):
+    safe = _sanitize_git_path(path)
+    if not safe:
+        return {"ok": False, "message": "invalid path", "path": path or ""}
+    if not cwd:
+        return {"ok": False, "message": "cwd required", "path": safe}
+
+    mode = (mode or "worktree").strip() or "worktree"
+    resolved_base = ""
+    if mode == "base":
+        resolved_base = (base or "").strip() or await detect_git_base_async(
+            cwd, remote=remote, timeout=timeout)
+        if not resolved_base:
+            return {"ok": False, "message": "could not resolve base branch", "path": safe}
+        rc, out, err = await _run_git_async(
+            cwd, remote, ["diff", resolved_base, "--", safe], timeout=timeout)
+    else:
+        mode = "worktree"
+        if untracked:
+            # Client already knows porcelain "??" — skip empty HEAD diff round-trip.
+            rc, out, err = await _run_git_async(
+                cwd, remote,
+                ["diff", "--no-index", "--", "/dev/null", safe],
+                timeout=timeout,
+            )
+        else:
+            rc, out, err = await _run_git_async(
+                cwd, remote, ["diff", "HEAD", "--", safe], timeout=timeout)
+            if rc == 0 and not out.strip():
+                # Likely untracked: synthesize add diff via --no-index (exit 1 is normal)
+                rc2, out2, err2 = await _run_git_async(
+                    cwd, remote,
+                    ["diff", "--no-index", "--", "/dev/null", safe],
+                    timeout=timeout,
+                )
+                if out2.strip():
+                    rc, out, err = rc2, out2, err2
+                elif rc2 == -1:
+                    return {"ok": False, "message": err2.decode(errors="replace") or "diff failed",
+                            "path": safe}
+
+    if rc not in (0, 1) and not out.strip():
+        # git diff returns 1 when --no-index finds differences; treat stdout as success
+        msg = err.decode(errors="replace").strip() or "git diff failed"
+        return {"ok": False, "message": msg, "path": safe}
+
+    text = out.decode(errors="replace")
+    # Match git's own binary notice line only — not the substring inside source diffs.
+    if any(
+        line.startswith("Binary files ") and line.endswith(" differ")
+        for line in text.splitlines()
+    ):
+        return {"ok": False, "message": "binary file", "path": safe}
+
+    text, truncated = _truncate_git_text(text)
+    return {
+        "ok": True,
+        "path": safe,
+        "mode": mode,
+        "base": (base or "").strip(),
+        "resolved_base": resolved_base if mode == "base" else "",
+        "text": text or "(no diff)",
+        "truncated": truncated,
+        "cwd": cwd,
+    }
+
+
+async def fetch_git_show_async(cwd, path, remote=None, timeout=10):
+    safe = _sanitize_git_path(path)
+    if not safe:
+        return {"ok": False, "message": "invalid path", "path": path or ""}
+    if not cwd:
+        return {"ok": False, "message": "cwd required", "path": safe}
+
+    if remote:
+        inner = (
+            "head -c " + str(GIT_TEXT_LIMIT + 1) + " "
+            + shlex.quote(f"{cwd.rstrip('/')}/{safe}")
+        )
+        cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote, inner]
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            return {"ok": False, "message": "read timed out", "path": safe}
+        except Exception as e:
+            return {"ok": False, "message": f"read failed: {e}", "path": safe}
+        if proc.returncode not in (0, None) and not stdout:
+            return {"ok": False, "message": stderr.decode(errors="replace").strip() or "read failed",
+                    "path": safe}
+        data = stdout
+    else:
+        full = Path(cwd) / safe
+        try:
+            full = full.resolve()
+            root = Path(cwd).resolve()
+            if root not in full.parents and full != root:
+                return {"ok": False, "message": "path escapes cwd", "path": safe}
+            data = full.read_bytes()
+        except FileNotFoundError:
+            return {"ok": False, "message": "file not found", "path": safe}
+        except Exception as e:
+            return {"ok": False, "message": f"read failed: {e}", "path": safe}
+
+    if b"\x00" in data[:8192]:
+        return {"ok": False, "message": "binary file", "path": safe}
+
+    text = data.decode("utf-8", errors="replace")
+    text, truncated = _truncate_git_text(text)
+    return {
+        "ok": True,
+        "path": safe,
+        "text": text,
+        "truncated": truncated,
+        "cwd": cwd,
+    }
+
+
+async def fetch_git_status_async(cwd, remote=None, timeout=10, mode="worktree", base=""):
+    """Run read-only git status (worktree porcelain or vs-base name-status)."""
+    if not cwd:
+        return {"ok": False, "message": "cwd required"}
+
+    mode = (mode or "worktree").strip() or "worktree"
+    if mode == "base":
+        resolved_base = (base or "").strip() or await detect_git_base_async(
+            cwd, remote=remote, timeout=timeout)
+        if not resolved_base:
+            return {"ok": False, "message": "could not resolve base branch"}
+        rc, stdout, stderr = await _run_git_async(
+            cwd, remote, ["diff", "--name-status", resolved_base], timeout=timeout)
+        if rc == -1:
+            err = stderr.decode(errors="replace").strip()
+            if err == "timeout":
+                return {"ok": False, "message": "git status timed out"}
+            return {"ok": False, "message": f"git status failed: {err}" if err else "git status failed"}
+        if rc != 0:
+            err = stderr.decode(errors="replace").strip()
+            return {"ok": False, "message": err or "git diff --name-status failed"}
+        files = _parse_git_name_status(stdout.decode(errors="replace"))
+        clean = not files
+        if clean:
+            text = f"## vs {resolved_base}\nnothing to commit, working tree clean"
+        else:
+            lines = [f"## vs {resolved_base}"]
+            for item in files:
+                lines.append(f"{item['status']:>3}  {item['path']}")
+            text = "\n".join(lines)
+        return {
+            "ok": True,
+            "clean": clean,
+            "branch": "",
+            "files": files,
+            "text": text,
+            "cwd": cwd,
+            "mode": "base",
+            "base": (base or "").strip(),
+            "resolved_base": resolved_base,
+        }
+
+    rc, stdout, stderr = await _run_git_async(
+        cwd, remote, ["status", "--porcelain=v1", "-b"], timeout=timeout)
+    if rc == -1:
+        err = stderr.decode(errors="replace").strip()
+        if err == "timeout":
+            return {"ok": False, "message": "git status timed out"}
+        return {"ok": False, "message": f"git status failed: {err}" if err else "git status failed"}
+    if rc != 0:
+        err = stderr.decode(errors="replace").strip()
+        return {"ok": False, "message": err or "not a git repository"}
+    parsed = _parse_git_porcelain(stdout.decode(errors="replace"))
+    text = _format_git_status_text(parsed["branch"], parsed["files"])
+    return {
+        "ok": True,
+        "clean": parsed["clean"],
+        "branch": parsed["branch"],
+        "files": parsed["files"],
+        "text": text,
+        "cwd": cwd,
+    }
+
+
 def _apply_workspace_labels(agents, labels):
     for a in agents:
         wid = a.get("workspace_id") or ""
@@ -484,7 +837,8 @@ def _parse_pane_list(raw, remote):
         return [
             {
                 "pane_id": p["pane_id"],
-                "agent": p.get("agent", ""),
+                # 空 shell pane（新建 Space 后尚未启动 agent）也要进列表，否则手机端看不到、用不了。
+                "agent": p.get("agent") or "shell",
                 "label": p.get("label", ""),
                 "status": p.get("agent_status", "unknown"),
                 "cwd": p.get("cwd", ""),
@@ -495,7 +849,7 @@ def _parse_pane_list(raw, remote):
                 "workspace_label": "",
                 "tab_id": p.get("tab_id", ""),
             }
-            for p in panes if p.get("agent")
+            for p in panes if p.get("pane_id")
         ]
     except (json.JSONDecodeError, KeyError):
         return []
@@ -537,12 +891,69 @@ def detect_options(text):
     return None
 
 
+def encode_hgz1(msg: dict) -> bytes:
+    raw = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+    typ = str(msg.get("type") or "")
+    typ_b = typ.encode("utf-8")
+    if len(typ_b) > 0xFFFF:
+        raise ValueError("type too long")
+    compressed = gzip.compress(raw, compresslevel=6)
+    flags = 1
+    payload = compressed
+    return b"HGZ1" + bytes([flags]) + struct.pack(">H", len(typ_b)) + typ_b + struct.pack(">I", len(raw)) + payload
+
+
+def parse_hgz1_header(frame: bytes):
+    if len(frame) < 11 or frame[:4] != b"HGZ1":
+        raise ValueError("bad HGZ1 magic")
+    flags = frame[4]
+    type_len = struct.unpack(">H", frame[5:7])[0]
+    typ = frame[7:7 + type_len].decode("utf-8")
+    raw_len = struct.unpack(">I", frame[7 + type_len:11 + type_len])[0]
+    payload = frame[11 + type_len:]
+    return typ, flags, raw_len, payload
+
+
+def decode_hgz1(frame: bytes) -> dict:
+    typ, flags, raw_len, payload = parse_hgz1_header(frame)
+    if flags & 1:
+        raw = gzip.decompress(payload)
+    else:
+        raw = payload
+    if len(raw) != raw_len:
+        raise ValueError("raw_len mismatch")
+    msg = json.loads(raw.decode("utf-8"))
+    if msg.get("type") != typ:
+        raise ValueError("type mismatch")
+    return msg
+
+
+def encode_for_client(msg: dict, caps) -> str | bytes:
+    """Return str JSON or bytes HGZ1. Non-whitelist / no cap / no shrink → str."""
+    caps = caps or set()
+    typ = msg.get("type")
+    if typ not in BIN_GZIP_TYPES or BIN_GZIP_CAP not in caps:
+        return json.dumps(msg, separators=(",", ":"))
+    raw = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+    try:
+        frame = encode_hgz1(msg)
+    except Exception:
+        return raw.decode("utf-8")
+    if len(frame) >= len(raw):
+        return raw.decode("utf-8")
+    return frame
+
+
+async def send_to_client(ws, msg: dict):
+    data = encode_for_client(msg, client_caps.get(ws, set()))
+    await ws.send(data)
+
+
 async def broadcast(msg):
-    data = json.dumps(msg)
     dead = set()
     for ws in list(clients):
         try:
-            await ws.send(data)
+            await send_to_client(ws, msg)
         except (ConnectionClosedError, ConnectionClosedOK):
             dead.add(ws)
         except Exception:
@@ -550,6 +961,8 @@ async def broadcast(msg):
     if dead:
         log.debug("Removed %d dead client(s)", len(dead))
     clients.difference_update(dead)
+    for ws in dead:
+        client_caps.pop(ws, None)
 
 
 async def poll_loop():
@@ -808,38 +1221,46 @@ async def handle_client(ws):
 
     log.info("Client connected: ip=%s device=%s origin=%s", ip, device, origin or "-")
     clients.add(ws)
+    client_caps[ws] = set()
     connected_at = time.monotonic()
 
-    # 立即把缓存快照推给这个新客户端。此前连上后不发任何东西，客户端只能干等
-    # 下一次 2 秒轮询广播——实测握手仅 75ms，首屏却要 534ms，最坏等满
-    # POLL_INTERVAL，而 agent_cache 里的数据一直都在。
-    #
-    # 只发给 ws 本人而非 broadcast：其它客户端的数据没有变化，没必要重发。
-    # 空缓存也要发，让客户端从 Loading 态切到 empty 态，否则界面会一直停在
-    # Loading 直到下一次轮询。
-    # 必须在进入消息循环之前发，否则客户端一连上就发请求时，响应会排在快照
-    # 前面，UI 拿到乱序数据。
+    # 立即推缓存快照（先于消息循环），避免客户端干等轮询。
+    # 此时 hello 通常尚未到达，首包多半是明文 JSON；后续白名单消息在
+    # hello(bin-gzip-v1) 之后走 HGZ1。传输层 permessage-deflate 仍覆盖首包。
     try:
-        await ws.send(json.dumps({"type": "agents", "agents": list(agent_cache.values())}))
+        await send_to_client(ws, {"type": "agents", "agents": list(agent_cache.values())})
     except Exception as e:
-        # 客户端可能刚连上就断了；这不是错误路径，不该刷 traceback
         log.debug("Initial snapshot not delivered to %s: %s", ip, e)
 
     try:
         async for raw in ws:
+            if isinstance(raw, (bytes, bytearray)) and not (len(raw) and raw[:1] in (b"{", b"[")):
+                continue
+            if isinstance(raw, (bytes, bytearray)):
+                try:
+                    raw = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
             msg_type = msg.get("type")
-            if msg_type == "respond":
+            if msg_type == "hello":
+                caps = msg.get("caps") or []
+                if isinstance(caps, list):
+                    client_caps[ws] = {str(c) for c in caps if isinstance(c, str)}
+                else:
+                    client_caps[ws] = set()
+                continue
+            elif msg_type == "respond":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
                 text = msg.get("text", "")
                 if text.strip().lower() not in SAFE_RESPONSES:
-                    await ws.send(json.dumps({"type": "error", "message": "response not in allowlist"}))
+                    await send_to_client(ws, {"type": "error", "message": "response not in allowlist"})
                     continue
                 remote = pane_remote_map.get(pane_id)
                 log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
@@ -848,26 +1269,34 @@ async def handle_client(ws):
             elif msg_type == "agent_event":
                 ok, reason = validate_agent_event(msg)
                 if not ok:
-                    await ws.send(json.dumps({"type": "error", "message": f"invalid agent_event: {reason}"}))
+                    await send_to_client(ws, {"type": "error", "message": f"invalid agent_event: {reason}"})
                 else:
                     event_queue.put_nowait(msg)
+            elif msg_type == "ping":
+                # Lightweight RTT probe — echo client timestamp, never audit.
+                t = msg.get("t", 0)
+                try:
+                    t = int(t)
+                except (TypeError, ValueError):
+                    t = 0
+                await send_to_client(ws, {"type": "pong", "t": t})
             elif msg_type == "read_pane":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
                 lines = msg.get("lines", "30")
                 remote = pane_remote_map.get(pane_id)
                 content = await run_herdr_async("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
-                await ws.send(json.dumps({"type": "pane_content", "pane_id": pane_id, "content": content}))
+                await send_to_client(ws, {"type": "pane_content", "pane_id": pane_id, "content": content})
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
                 raw_keys = msg.get("keys", [])
                 if not all(isinstance(k, str) and k in SAFE_KEYS for k in raw_keys):
-                    await ws.send(json.dumps({"type": "error", "message": "keys contain disallowed values"}))
+                    await send_to_client(ws, {"type": "error", "message": "keys contain disallowed values"})
                     continue
                 keys = [normalize_key(k) for k in raw_keys]
                 remote = pane_remote_map.get(pane_id)
@@ -877,21 +1306,21 @@ async def handle_client(ws):
                     returncode, _ = await run_herdr_rc_async("pane", "send-keys", pane_id, *keys, remote=remote)
                 except Exception as e:
                     log.warning("send_keys command failed for pane %s: %s", pane_id, e)
-                    await ws.send(json.dumps({"type": "error", "message": "send_keys command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "send_keys command failed"})
                     continue
                 if returncode != 0:
                     log.warning("send_keys command failed for pane %s with exit %s", pane_id, returncode)
-                    await ws.send(json.dumps({"type": "error", "message": "send_keys command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "send_keys command failed"})
                     continue
-                await ws.send(json.dumps({"type": "command_result", "command": "send_keys", "ok": True}))
+                await send_to_client(ws, {"type": "command_result", "command": "send_keys", "ok": True})
             elif msg_type == "send_text":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
                 text = msg.get("text", "")
                 if not text or len(text) > 1000:
-                    await ws.send(json.dumps({"type": "error", "message": "text empty or too long"}))
+                    await send_to_client(ws, {"type": "error", "message": "text empty or too long"})
                     continue
                 remote = pane_remote_map.get(pane_id)
                 log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
@@ -904,12 +1333,12 @@ async def handle_client(ws):
             elif msg_type == "pane_zoom":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
                 # mode 直接进命令行，必须白名单——herdr 的取值只有这三个。
                 mode = msg.get("mode", "toggle")
                 if mode not in ("toggle", "on", "off"):
-                    await ws.send(json.dumps({"type": "error", "message": "invalid zoom mode"}))
+                    await send_to_client(ws, {"type": "error", "message": "invalid zoom mode"})
                     continue
                 remote = pane_remote_map.get(pane_id)
                 audit("pane_zoom", ip, device, pane_id, f"mode={mode}")
@@ -918,23 +1347,23 @@ async def handle_client(ws):
                         "pane", "zoom", "--pane", pane_id, f"--{mode}", remote=remote)
                 except Exception as e:
                     log.warning("pane_zoom failed for pane %s: %s", pane_id, e)
-                    await ws.send(json.dumps({"type": "error", "message": "pane_zoom command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "pane_zoom command failed"})
                     continue
                 if returncode != 0:
                     log.warning("pane_zoom failed for pane %s with exit %s", pane_id, returncode)
-                    await ws.send(json.dumps({"type": "error", "message": "pane_zoom command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "pane_zoom command failed"})
                     continue
                 ok, info = parse_layout_result(out, "zoom")
                 if not ok:
-                    await ws.send(json.dumps({"type": "error", "message": "pane_zoom returned unparsable output"}))
+                    await send_to_client(ws, {"type": "error", "message": "pane_zoom returned unparsable output"})
                     continue
-                await ws.send(json.dumps({
+                await send_to_client(ws, {
                     "type": "command_result", "command": "pane_zoom",
                     # 退出码 0 但 changed=false 是常态（如单 pane），ok 必须反映 changed
                     "ok": info["changed"], "pane_id": pane_id,
                     "zoomed": info["zoomed"], "pane_count": info["pane_count"],
                     "note": LAYOUT_REASONS.get(info["reason"], ""),
-                }))
+                })
             elif msg_type == "narrow_mode":
                 # 窄屏模式：herdr 没有"设置终端列宽"的接口（89 个 socket API
                 # 方法里都没有），但 pane 变窄时 agent 的 TUI 会响应 SIGWINCH
@@ -942,7 +1371,7 @@ async def handle_client(ws):
                 # 所以这里靠"向右分出一个陪衬 pane"把目标 pane 挤窄。
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
                 enable = bool(msg.get("enable", True))
                 remote = pane_remote_map.get(pane_id)
@@ -951,12 +1380,37 @@ async def handle_client(ws):
 
                 if enable:
                     if pane_id in narrow_companions:
-                        await ws.send(json.dumps({
+                        await send_to_client(ws, {
                             "type": "command_result", "command": "narrow_mode",
                             "ok": False, "pane_id": pane_id, "narrow": True,
                             "note": "该 pane 已处于窄屏模式",
-                        }))
+                        })
                         continue
+                    # 若当前 pane 已经 ≤80 列，再 split 会挤成「左边一条」，拒绝继续挤窄。
+                    try:
+                        lrc, lout = await run_herdr_rc_async(
+                            "pane", "layout", "--pane", pane_id, remote=remote)
+                    except Exception as e:
+                        log.warning("narrow_mode layout probe failed for pane %s: %s", pane_id, e)
+                        lrc, lout = 1, ""
+                    if lrc == 0:
+                        width = 0
+                        for pid, w in parse_layout_panes(lout):
+                            if pid == pane_id:
+                                try:
+                                    width = int(w or 0)
+                                except (TypeError, ValueError):
+                                    width = 0
+                                break
+                        if width and width <= 80:
+                            # 虚拟窄屏：无需陪衬 pane，关闭时只清标记
+                            narrow_companions[pane_id] = ""
+                            await send_to_client(ws, {
+                                "type": "command_result", "command": "narrow_mode",
+                                "ok": True, "pane_id": pane_id, "narrow": True,
+                                "note": f"当前已 {width} 列，未再分屏",
+                            })
+                            continue
                     try:
                         # --no-focus：挤窄是为了手机端可读，不该把 Mac 上的
                         # 焦点抢到那个空 shell 上去。
@@ -965,83 +1419,125 @@ async def handle_client(ws):
                             "--direction", "right", "--no-focus", remote=remote)
                     except Exception as e:
                         log.warning("narrow_mode split failed for pane %s: %s", pane_id, e)
-                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        await send_to_client(ws, {"type": "error", "message": "narrow_mode command failed"})
                         continue
                     if returncode != 0:
                         log.warning("narrow_mode split failed for pane %s with exit %s", pane_id, returncode)
-                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        await send_to_client(ws, {"type": "error", "message": "narrow_mode command failed"})
                         continue
                     # split 与 zoom 返回结构不同：它回 {"pane": {...},
                     # "type": "pane_info"}，没有 layout/changed，成功标志是拿到新 pane_id。
                     companion = parse_split_result(out)
                     if not companion:
-                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode returned unparsable output"}))
+                        await send_to_client(ws, {"type": "error", "message": "narrow_mode returned unparsable output"})
                         continue
                     # 记住陪衬 pane 是谁：关闭时只关我们自己开的那个，
                     # 绝不去猜，否则可能关掉用户自己在 Mac 上开的 pane。
                     narrow_companions[pane_id] = companion
-                    await ws.send(json.dumps({
+                    await send_to_client(ws, {
                         "type": "command_result", "command": "narrow_mode",
                         "ok": True, "pane_id": pane_id, "narrow": True,
-                    }))
+                    })
                 else:
-                    companion = narrow_companions.get(pane_id)
-                    if not companion:
-                        await ws.send(json.dumps({
+                    if pane_id not in narrow_companions:
+                        await send_to_client(ws, {
                             "type": "command_result", "command": "narrow_mode",
                             "ok": False, "pane_id": pane_id, "narrow": False,
                             "note": "该 pane 不在窄屏模式",
-                        }))
+                        })
+                        continue
+                    companion = narrow_companions.get(pane_id) or ""
+                    if not companion:
+                        # 虚拟窄屏（开启时已足够窄、未创建陪衬）
+                        narrow_companions.pop(pane_id, None)
+                        await send_to_client(ws, {
+                            "type": "command_result", "command": "narrow_mode",
+                            "ok": True, "pane_id": pane_id, "narrow": False,
+                        })
                         continue
                     try:
                         returncode, _ = await run_herdr_rc_async(
                             "pane", "close", companion, remote=remote)
                     except Exception as e:
                         log.warning("narrow_mode close failed for pane %s: %s", companion, e)
-                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        await send_to_client(ws, {"type": "error", "message": "narrow_mode command failed"})
                         continue
                     # 无论关闭成功与否都清掉映射：pane 可能已被用户在 Mac 上
                     # 手动关掉，此时再留着映射会让窄屏模式永远开不了。
                     narrow_companions.pop(pane_id, None)
                     if returncode != 0:
                         log.warning("narrow_mode close failed for pane %s with exit %s", companion, returncode)
-                        await ws.send(json.dumps({"type": "error", "message": "narrow_mode command failed"}))
+                        await send_to_client(ws, {"type": "error", "message": "narrow_mode command failed"})
                         continue
-                    await ws.send(json.dumps({
+                    await send_to_client(ws, {
                         "type": "command_result", "command": "narrow_mode",
                         "ok": True, "pane_id": pane_id, "narrow": False,
-                    }))
+                    })
             elif msg_type == "create_tab":
                 workspace_id = msg.get("workspace_id", "")
                 if workspace_id:
                     log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
                     audit("create_tab", ip, device, "", f"workspace={workspace_id}")
                     await run_herdr_async("tab", "create", "--workspace", workspace_id, "--focus")
-                    await ws.send(json.dumps({"type": "tab_created", "ok": True}))
+                    await send_to_client(ws, {"type": "tab_created", "ok": True})
                 else:
-                    await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+                    await send_to_client(ws, {"type": "error", "message": "workspace_id required"})
             elif msg_type == "create_workspace":
                 log.info("Create workspace from %s (%s)", ip, device)
                 audit("create_workspace", ip, device, "", "")
                 try:
-                    returncode, _ = await run_herdr_rc_async("workspace", "create", "--focus")
+                    returncode, stdout = await run_herdr_rc_async("workspace", "create", "--focus")
                 except Exception as e:
                     log.warning("create_workspace failed: %s", e)
-                    await ws.send(json.dumps({"type": "error", "message": "create_workspace command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "create_workspace command failed"})
                     continue
                 if returncode != 0:
                     log.warning("create_workspace failed with exit %s", returncode)
-                    await ws.send(json.dumps({"type": "error", "message": "create_workspace command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "create_workspace command failed"})
                     continue
-                await ws.send(json.dumps({"type": "workspace_created", "ok": True}))
+                wid, label, pane_id = _parse_workspace_created(stdout)
+                if wid and label:
+                    _set_workspace_label(wid, label)
+                elif wid:
+                    workspace_label_cache.setdefault(wid, wid)
+                if pane_id:
+                    # 立刻登记，避免等下一轮 poll 才允许 read_pane / send_text
+                    known_panes.add(pane_id)
+                    pane_remote_map.setdefault(pane_id, None)
+                    agent_cache[pane_id] = {
+                        "pane_id": pane_id,
+                        "agent": "shell",
+                        "label": label,
+                        "status": "unknown",
+                        "cwd": "",
+                        "project": label or wid,
+                        "host": "local",
+                        "remote": None,
+                        "workspace_id": wid,
+                        "workspace_label": label,
+                        "tab_id": "",
+                    }
+                payload = {"type": "workspace_created", "ok": True}
+                if wid:
+                    payload["workspace_id"] = wid
+                if label:
+                    payload["label"] = label
+                if pane_id:
+                    payload["pane_id"] = pane_id
+                await send_to_client(ws, payload)
+                # 推一帧 agents，让其它客户端也能立刻看到空 shell pane
+                try:
+                    await _poll_once()
+                except Exception as e:
+                    log.warning("post-create poll failed: %s", e)
             elif msg_type == "rename_workspace":
                 workspace_id = msg.get("workspace_id", "")
                 label = (msg.get("label") or "").strip()
                 if not workspace_id:
-                    await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+                    await send_to_client(ws, {"type": "error", "message": "workspace_id required"})
                     continue
                 if not label:
-                    await ws.send(json.dumps({"type": "error", "message": "label required"}))
+                    await send_to_client(ws, {"type": "error", "message": "label required"})
                     continue
                 log.info("Rename workspace from %s (%s): workspace=%s label=%s",
                          ip, device, workspace_id, label)
@@ -1051,21 +1547,21 @@ async def handle_client(ws):
                         "workspace", "rename", workspace_id, label)
                 except Exception as e:
                     log.warning("rename_workspace failed for %s: %s", workspace_id, e)
-                    await ws.send(json.dumps({"type": "error", "message": "rename_workspace command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "rename_workspace command failed"})
                     continue
                 if returncode != 0:
                     log.warning("rename_workspace failed for %s with exit %s", workspace_id, returncode)
-                    await ws.send(json.dumps({"type": "error", "message": "rename_workspace command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "rename_workspace command failed"})
                     continue
                 _set_workspace_label(workspace_id, label)
-                await ws.send(json.dumps({
+                await send_to_client(ws, {
                     "type": "workspace_renamed", "ok": True,
                     "workspace_id": workspace_id, "label": label,
-                }))
+                })
             elif msg_type == "close_workspace":
                 workspace_id = msg.get("workspace_id", "")
                 if not workspace_id:
-                    await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
+                    await send_to_client(ws, {"type": "error", "message": "workspace_id required"})
                     continue
                 log.info("Close workspace from %s (%s): workspace=%s", ip, device, workspace_id)
                 audit("close_workspace", ip, device, "", f"workspace={workspace_id}")
@@ -1073,32 +1569,121 @@ async def handle_client(ws):
                     returncode, _ = await run_herdr_rc_async("workspace", "close", workspace_id)
                 except Exception as e:
                     log.warning("close_workspace failed for %s: %s", workspace_id, e)
-                    await ws.send(json.dumps({"type": "error", "message": "close_workspace command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "close_workspace command failed"})
                     continue
                 if returncode != 0:
                     log.warning("close_workspace failed for %s with exit %s", workspace_id, returncode)
-                    await ws.send(json.dumps({"type": "error", "message": "close_workspace command failed"}))
+                    await send_to_client(ws, {"type": "error", "message": "close_workspace command failed"})
                     continue
-                await ws.send(json.dumps({"type": "workspace_closed", "ok": True}))
+                workspace_label_cache.pop(workspace_id, None)
+                await send_to_client(ws, {
+                    "type": "workspace_closed", "ok": True,
+                    "workspace_id": workspace_id,
+                })
+            elif msg_type == "git_status":
+                pane_id = msg.get("pane_id", "")
+                workspace_id = msg.get("workspace_id", "")
+                mode = msg.get("mode", "worktree")
+                base = msg.get("base", "")
+                cwd, remote, resolved_ws = _resolve_git_target(pane_id, workspace_id)
+                if not cwd:
+                    await send_to_client(ws, {
+                        "type": "git_status", "ok": False,
+                        "message": "unknown pane or workspace, or cwd unavailable",
+                        "workspace_id": resolved_ws or workspace_id or "",
+                        "pane_id": pane_id or "",
+                    })
+                    continue
+                log.info("Git status from %s (%s): cwd=%s remote=%s mode=%s",
+                         ip, device, cwd, remote or "local", mode or "worktree")
+                audit("git_status", ip, device, pane_id or resolved_ws, f"cwd={cwd}")
+                result = await fetch_git_status_async(
+                    cwd, remote=remote, mode=mode, base=base)
+                payload = {"type": "git_status", **result}
+                if pane_id:
+                    payload["pane_id"] = pane_id
+                if resolved_ws:
+                    payload["workspace_id"] = resolved_ws
+                await send_to_client(ws, payload)
+            elif msg_type == "git_diff":
+                pane_id = msg.get("pane_id", "")
+                workspace_id = msg.get("workspace_id", "")
+                path = msg.get("path", "")
+                mode = msg.get("mode", "worktree")
+                base = msg.get("base", "")
+                if not _sanitize_git_path(path):
+                    await send_to_client(ws, {
+                        "type": "git_diff", "ok": False,
+                        "message": "invalid path",
+                        "path": path or "",
+                    })
+                    continue
+                cwd, remote, resolved_ws = _resolve_git_target(pane_id, workspace_id)
+                if not cwd:
+                    await send_to_client(ws, {
+                        "type": "git_diff", "ok": False,
+                        "message": "unknown pane or workspace, or cwd unavailable",
+                        "path": path or "",
+                    })
+                    continue
+                audit("git_diff", ip, device, pane_id or resolved_ws, f"cwd={cwd} path={path}")
+                result = await fetch_git_diff_async(
+                    cwd, path, mode=mode, base=base, remote=remote,
+                    untracked=bool(msg.get("untracked")),
+                )
+                payload = {"type": "git_diff", **result}
+                if pane_id:
+                    payload["pane_id"] = pane_id
+                if resolved_ws:
+                    payload["workspace_id"] = resolved_ws
+                await send_to_client(ws, payload)
+            elif msg_type == "git_show":
+                pane_id = msg.get("pane_id", "")
+                workspace_id = msg.get("workspace_id", "")
+                path = msg.get("path", "")
+                if not _sanitize_git_path(path):
+                    await send_to_client(ws, {
+                        "type": "git_show", "ok": False,
+                        "message": "invalid path",
+                        "path": path or "",
+                    })
+                    continue
+                cwd, remote, resolved_ws = _resolve_git_target(pane_id, workspace_id)
+                if not cwd:
+                    await send_to_client(ws, {
+                        "type": "git_show", "ok": False,
+                        "message": "unknown pane or workspace, or cwd unavailable",
+                        "path": path or "",
+                    })
+                    continue
+                audit("git_show", ip, device, pane_id or resolved_ws, f"cwd={cwd} path={path}")
+                result = await fetch_git_show_async(cwd, path, remote=remote)
+                payload = {"type": "git_show", **result}
+                if pane_id:
+                    payload["pane_id"] = pane_id
+                if resolved_ws:
+                    payload["workspace_id"] = resolved_ws
+                await send_to_client(ws, payload)
             elif msg_type == "push_subscribe":
                 sub = msg.get("subscription")
                 if sub and sub not in push_subscriptions:
                     push_subscriptions.append(sub)
                     _save_push_subs()
                     log.info("Push subscription added from %s (%s)", ip, device)
-                await ws.send(json.dumps({"type": "push_subscribed", "ok": True}))
+                await send_to_client(ws, {"type": "push_subscribed", "ok": True})
             elif msg_type == "push_unsubscribe":
                 sub = msg.get("subscription")
                 if sub and sub in push_subscriptions:
                     push_subscriptions.remove(sub)
                     _save_push_subs()
-                await ws.send(json.dumps({"type": "push_unsubscribed", "ok": True}))
+                await send_to_client(ws, {"type": "push_unsubscribed", "ok": True})
     except (ConnectionClosedError, ConnectionClosedOK):
         pass
     finally:
         duration = int(time.monotonic() - connected_at)
         log.info("Client disconnected: ip=%s device=%s duration=%ds", ip, device, duration)
         clients.discard(ws)
+        client_caps.pop(ws, None)
 
 
 class UDPPlugin(asyncio.DatagramProtocol):
@@ -1142,7 +1727,14 @@ async def main():
         log.warning("UDP 8376 in use, plugin push disabled")
     asyncio.create_task(poll_loop())
     asyncio.create_task(event_push())
-    server = await serve(handle_client, "0.0.0.0", WS_PORT, process_request=process_request)
+    # permessage-deflate: browsers negotiate automatically when offered
+    server = await serve(
+        handle_client,
+        "0.0.0.0",
+        WS_PORT,
+        process_request=process_request,
+        compression="deflate",
+    )
     hosts = ["local"] + REMOTES
     log.info("herdr-remote relay on :%d (WebSocket + HTTP POST)", WS_PORT)
     log.info("Polling: %s", ", ".join(hosts))

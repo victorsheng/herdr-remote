@@ -65,6 +65,8 @@ def _reset():
     herdr_relay.known_panes.clear()
     herdr_relay.pane_remote_map.clear()
     herdr_relay.clients.clear()
+    if hasattr(herdr_relay, "client_caps"):
+        herdr_relay.client_caps.clear()
 
 
 class InitialSnapshotTests(unittest.IsolatedAsyncioTestCase):

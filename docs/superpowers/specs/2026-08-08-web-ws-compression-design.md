@@ -92,6 +92,8 @@ On `ws.onmessage`:
 
 On `ws.onopen` (after connected): send `hello` with `caps: ["bin-gzip-v1"]` before or immediately after the first ping.
 
+**Initial snapshot timing:** Relay still pushes the cached `agents` snapshot **immediately** on connect (before the message loop), so UI does not wait on poll and snapshot ordering stays ahead of early client requests. That first snapshot usually precedes `hello`, so it is typically plain JSON (still eligible for permessage-deflate). Subsequent whitelist messages after `hello` use HGZ1 when beneficial.
+
 ## Demo worker
 
 - Prefer: accept `hello`, emit HGZ1 for mock `agents` / `pane_content` when capable.

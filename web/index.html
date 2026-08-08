@@ -142,6 +142,28 @@ body { line-height: 1.2; }
 .space-dialog .row { display:flex; gap:8px; justify-content:flex-end; }
 .space-dialog .row button { width:auto; padding:10px 14px; background:var(--border); }
 .space-dialog .row button.primary { background:var(--blue); color:#fff; }
+.git-dialog { width:min(420px,calc(100% - 24px)); max-height:85vh; display:flex; flex-direction:column; }
+.git-dialog pre { margin:0; max-height:50vh; overflow:auto; padding:10px; border-radius:8px; background:var(--term-bg); color:var(--term-text); font-family:'SF Mono','Menlo',monospace; font-size:0.75rem; line-height:1.35; white-space:pre-wrap; overflow-wrap:anywhere; }
+.git-dialog .meta { font-size:0.72rem; color:var(--muted); margin:0 0 8px; word-break:break-all; }
+.git-dialog .git-mode { display:flex; gap:6px; margin:0 0 8px; }
+.git-dialog .git-mode button { flex:1; text-align:center; padding:8px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--muted); font-size:0.82rem; width:auto; }
+.git-dialog .git-mode button.active { background:var(--blue); color:#fff; border-color:var(--blue); }
+.git-dialog .git-base-row { display:flex; gap:6px; margin:0 0 8px; align-items:center; }
+.git-dialog .git-base-row input { flex:1; margin:0; }
+.git-dialog .git-base-row button { width:auto; flex-shrink:0; padding:10px 12px; background:var(--border); border:none; border-radius:8px; color:var(--text); font-size:0.82rem; cursor:pointer; }
+.git-dialog .git-file-list { list-style:none; margin:0; padding:0; max-height:45vh; overflow:auto; }
+.git-dialog .git-file-list li { display:flex; gap:8px; padding:10px 8px; border-bottom:1px solid var(--border); cursor:pointer; font-family:'SF Mono','Menlo',monospace; font-size:0.78rem; }
+.git-dialog .git-file-list li:active { background:color-mix(in srgb, var(--text) 8%, transparent); }
+.git-dialog .git-file-list .st { color:var(--orange); flex-shrink:0; min-width:2.2em; }
+.git-dialog .git-view-toggle { display:flex; gap:6px; margin:0 0 8px; }
+.git-dialog .git-view-toggle button { flex:1; text-align:center; padding:8px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--muted); font-size:0.82rem; width:auto; }
+.git-dialog .git-view-toggle button.active { background:var(--blue); color:#fff; border-color:var(--blue); }
+.git-file-dialog pre { margin:0; max-height:55vh; overflow:auto; padding:10px; border-radius:8px; background:var(--term-bg); color:var(--term-text); font-family:'SF Mono','Menlo',monospace; font-size:0.72rem; line-height:1.35; white-space:pre; overflow-wrap:normal; }
+.git-file-dialog .diff-add { color:var(--green); }
+.git-file-dialog .diff-del { color:var(--red); }
+.git-file-dialog .diff-hunk { color:var(--blue); }
+.git-file-overlay { z-index:10001; }
+.chip.dirty::before { content:''; display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--orange); margin-right:4px; vertical-align:middle; }
 /* min-width:0 让 flex 子项可以收缩，否则长项目名会把右侧箭头挤出卡片。 */
 .agent .info { flex: 1; min-width: 0; }
 /* 中文在同等 font-size 下字面高度大于拉丁字母，但笔画密度高、小字号下更难辨认，
@@ -154,15 +176,48 @@ body { line-height: 1.2; }
    此处必须一起加，否则终端视图会盖住 header 或错位。 */
 .terminal-view { display: none; flex-direction: column; position: fixed; inset: 0; top: calc(var(--header-h) + env(safe-area-inset-top, 0px)); bottom: var(--kb-inset, 0px); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); background: var(--bg); z-index: 50; }
 .terminal-view.active { display: flex; }
-.term-header { padding: 6px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-/* 与 .header button 同一手法：视觉尺寸不变，用不可见 ::after 把命中区撑到 44×44。
-   这样既不破坏上一轮刻意压缩的顶栏密度，又满足 HIG 最小触控目标。 */
-.term-header .back { position: relative; background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 4px 6px; display: flex; align-items: center; }
-.term-header .back::after { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; }
+.term-header { padding: 6px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.term-header .back { position: relative; background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 8px; min-width: 40px; min-height: 40px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 8px; }
 .term-header .title { flex: 1; min-width: 0; font-size: 0.85rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 原本仅 16×20（* 选择器把 UA 默认 padding 清零了，只剩 SVG 本身），是全站最难点中的目标。 */
-.term-header .refresh-btn { position: relative; background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; display: flex; align-items: center; }
-.term-header .refresh-btn::after { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; }
+/* 右侧动作：用真实 40×40 触控区 + 间距，禁止再用重叠的 ::after 外扩（4 个 44px
+   热区叠在一起正是 git/窄屏/缩放 容易误点的原因）。 */
+.term-header-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; position: relative; }
+.term-header .refresh-btn { position: relative; background: none; border: none; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px; padding: 8px; border-radius: 8px; flex-shrink: 0; -webkit-tap-highlight-color: transparent; }
+.term-header .refresh-btn:active { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
+.term-header .refresh-btn.active-layout { color: var(--blue); }
+/* 缩放/窄屏收进菜单，避免顶栏四个图标挤在一起误触把 pane 挤成一条 */
+.layout-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 160px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+  z-index: 60;
+  padding: 4px;
+}
+.layout-menu.open { display: block; }
+.layout-menu button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 12px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.9rem;
+  border-radius: 8px;
+  cursor: pointer;
+  min-height: 44px;
+}
+.layout-menu button:active { background: color-mix(in srgb, var(--text) 8%, transparent); }
+.layout-menu button .hint { margin-left: auto; font-size: 0.72rem; color: var(--muted); }
+.layout-menu button.on { color: var(--blue); }
 /* 终端是等宽上下文：word-break: break-all 会把中文和英文单词都硬切。
    中文本就允许任意换行，改用 anywhere 可保留英文单词完整性，同时中文照常折行。 */
 /* 曾改为 white-space: pre + overflow-x: auto（不折行、横向滚动，Windows Terminal
@@ -344,14 +399,25 @@ body { line-height: 1.2; }
   <div class="term-header">
     <button class="back" onclick="closeTerminal()" aria-label="Back to agent list"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
     <span class="title" id="termTitle"></span>
-    <button class="refresh-btn" id="zoomBtn" onclick="togglePaneZoom()" aria-label="Toggle pane zoom" title="缩放 pane"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
-    <button class="refresh-btn" id="narrowBtn" onclick="toggleNarrowMode()" aria-label="Toggle narrow mode" title="窄屏模式（让 agent 按手机宽度重排）"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v18"/><path d="M16 3v18"/><path d="M2 12h4"/><path d="M18 12h4"/></svg></button>
-    <button class="refresh-btn" onclick="refreshPane()" aria-label="Refresh pane"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></button>
+    <div class="term-header-actions">
+      <button class="refresh-btn" id="layoutMenuBtn" onclick="toggleLayoutMenu(event)" aria-label="Layout" aria-haspopup="true" aria-expanded="false" title="布局（缩放 / 窄屏）"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="18" rx="1"/></svg></button>
+      <button class="refresh-btn" onclick="requestGitStatus()" aria-label="Git status" title="查看 git status"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2a2 2 0 0 1-2 2H8a2 2 0 0 0-2 2v2"/><path d="M12 12V9"/></svg></button>
+      <button class="refresh-btn" onclick="refreshPane()" aria-label="Refresh pane"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></button>
+      <div class="layout-menu" id="layoutMenu" role="menu">
+        <button type="button" role="menuitem" onclick="runLayoutAction('zoom')">
+          <span>缩放 pane</span><span class="hint" id="layoutZoomHint">全屏</span>
+        </button>
+        <button type="button" role="menuitem" id="layoutNarrowItem" onclick="runLayoutAction('narrow')">
+          <span>窄屏模式</span><span class="hint" id="layoutNarrowHint">重排 TUI</span>
+        </button>
+      </div>
+    </div>
   </div>
   <div class="term-content" id="termContent">Loading…</div>
   <div class="quick-actions" id="quickActions"></div>
   <div class="term-input">
     <button onclick="openCommandPalette()" aria-label="Commands" style="padding:10px 12px;border-radius:6px;border:1px solid var(--blue);background:var(--bg);color:var(--blue);font-weight:700;font-size:14px;flex-shrink:0">/</button>
+    <span id="slashLiveBadge" hidden style="font-size:0.65rem;font-weight:700;letter-spacing:0.04em;color:var(--blue);flex-shrink:0">LIVE /</span>
     <input id="termInput" placeholder="Type…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
     <button onclick="toggleQuickDock()" aria-label="Quick actions" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--orange);flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>
     <button onclick="toggleKeysDock()" aria-label="Keys" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--muted);flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.001M10 8h.001M14 8h.001M18 8h.001M8 12h.001M12 12h.001M16 12h.001M7 16h10"/></svg></button>
@@ -470,9 +536,62 @@ body { line-height: 1.2; }
 <script>
 
 var ws = null, agents = [], activePane = null, refreshInterval = null, userScrolledUp = false;
+var inputMode = 'buffered', slashLiveTimer = null, slashMenuSeen = false, slashComposing = false;
 let timeline = [], prevStatuses = {};
 let activeWorkspace = null;
 let activeTab = null;
+let connState = 'disconnected';
+let lastRttMs = null;
+let lastPongAt = 0;
+let connLiveAt = 0;
+let pingTimer = null;
+let staleTimer = null;
+const PING_INTERVAL_MS = 5000;
+const STALE_MS = 15000;
+const RTT_GOOD_MS = 150;
+const RTT_OK_MS = 400;
+/** workspace_id → label；含尚无 agent 的空 Space，避免 + 后芯片消失 */
+let workspaceLabels = {};
+/** workspace_id → true/false；最近一次 git status 是否 dirty，用于芯片提示 */
+let workspaceGitDirty = {};
+/** 当前 git status 对话框上下文（pane / mode / base） */
+let gitStatusContext = { pane_id: '', workspace_id: '', mode: 'worktree', base: '', resolved_base: '' };
+/**
+ * 文件内容缓存：entryKey → { diff?, show? }
+ * 同一次 git status 会话内复用，避免手机端每次点开都等一轮 ~RTT。
+ */
+let gitFileCache = {};
+/** 在途请求：`${entryKey}:diff|show` → true，防止连点/双发 */
+let gitFileInflight = {};
+/** 当前文件 overlay 状态 */
+let _gitFileState = null;
+
+function gitFileEntryKey(path) {
+  const mode = gitStatusContext.mode || 'worktree';
+  const base = gitStatusContext.base || gitStatusContext.resolved_base || '';
+  return `${mode}|${base}|${path || ''}`;
+}
+
+function clearGitFileCache() {
+  gitFileCache = {};
+  gitFileInflight = {};
+}
+
+function gitFileTargetPayload(extra = {}) {
+  const payload = { ...extra };
+  if (gitStatusContext.pane_id || activePane) {
+    payload.pane_id = gitStatusContext.pane_id || activePane;
+  } else if (gitStatusContext.workspace_id) {
+    payload.workspace_id = gitStatusContext.workspace_id;
+  } else {
+    return null;
+  }
+  return payload;
+}
+
+function effectiveGitBase() {
+  return gitStatusContext.base || gitStatusContext.resolved_base || '';
+}
 
 // Settings — auto-detect relay when served from same origin
 const autoRelayUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
@@ -495,9 +614,14 @@ function toggleSettings() {
   document.getElementById('agentListView').style.display = show ? 'none' : '';
   document.getElementById('timelineView').style.display = 'none';
   if (show) {
-    document.getElementById('settingsStatus').innerHTML = ws && ws.readyState === 1
-      ? `<span style="color:var(--green)">● Connected</span> · ${agents.length} agents`
-      : `<span style="color:var(--red)">● Disconnected</span>`;
+    if (ws && ws.readyState === 1) {
+      const rtt = lastRttMs != null ? ` · ${lastRttMs}ms` : '';
+      document.getElementById('settingsStatus').innerHTML =
+        `<span style="color:${rttColor(lastRttMs)}">● Connected${rtt}</span> · ${agents.length} agents`;
+    } else {
+      document.getElementById('settingsStatus').innerHTML =
+        `<span style="color:var(--red)">● Disconnected</span>`;
+    }
   }
 }
 
@@ -532,6 +656,104 @@ function saveAndConnect() {
 }
 
 // Connection
+function clearPingTimers() {
+  if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  if (staleTimer) { clearTimeout(staleTimer); staleTimer = null; }
+}
+
+function rttColor(ms) {
+  if (ms == null) return 'var(--green)';
+  if (ms < RTT_GOOD_MS) return 'var(--green)';
+  if (ms <= RTT_OK_MS) return 'var(--orange)';
+  return 'var(--red)';
+}
+
+function sendPing() {
+  if (!ws || ws.readyState !== 1 || document.hidden) return;
+  try { ws.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch (_) {}
+}
+
+function resetStaleTimer() {
+  if (staleTimer) clearTimeout(staleTimer);
+  staleTimer = setTimeout(() => { refreshConnLabel(); }, STALE_MS);
+}
+
+function startPingLoop() {
+  clearPingTimers();
+  lastRttMs = null;
+  lastPongAt = 0;
+  connLiveAt = Date.now();
+  sendPing();
+  pingTimer = setInterval(sendPing, PING_INTERVAL_MS);
+  resetStaleTimer();
+}
+
+function refreshConnLabel() {
+  const dot = document.getElementById('statusDot');
+  const label = document.getElementById('connLabel');
+  if (connState === 'connecting') {
+    dot.style.background = 'var(--orange)';
+    label.textContent = 'connecting…';
+    label.style.color = 'var(--orange)';
+    return;
+  }
+  if (connState !== 'connected') {
+    dot.style.background = 'var(--red)';
+    label.textContent = 'offline';
+    label.style.color = 'var(--red)';
+    return;
+  }
+  const ref = lastPongAt || connLiveAt;
+  const isStale = ref > 0 && (Date.now() - ref >= STALE_MS);
+  if (isStale) {
+    dot.style.background = 'var(--red)';
+    label.textContent = lastRttMs != null ? `live · ${lastRttMs}ms` : 'live · —';
+    label.style.color = 'var(--red)';
+    return;
+  }
+  if (lastRttMs != null) {
+    const color = rttColor(lastRttMs);
+    dot.style.background = color;
+    label.textContent = `live · ${lastRttMs}ms`;
+    label.style.color = color;
+  } else {
+    dot.style.background = 'var(--green)';
+    label.textContent = 'live';
+    label.style.color = 'var(--green)';
+  }
+}
+
+const BIN_GZIP_CAP = 'bin-gzip-v1';
+
+async function gunzipU8(data) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('DecompressionStream unavailable');
+  }
+  const ds = new DecompressionStream('gzip');
+  const ab = await new Response(new Blob([data]).stream().pipeThrough(ds)).arrayBuffer();
+  return new Uint8Array(ab);
+}
+
+async function decodeHgz1(buf) {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (u8.length < 11 || u8[0] !== 0x48 || u8[1] !== 0x47 || u8[2] !== 0x5a || u8[3] !== 0x31) {
+    throw new Error('bad HGZ1');
+  }
+  const flags = u8[4];
+  const typeLen = (u8[5] << 8) | u8[6];
+  let o = 7;
+  const typ = new TextDecoder().decode(u8.subarray(o, o + typeLen));
+  o += typeLen;
+  const rawLen = ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]) >>> 0;
+  o += 4;
+  let raw = u8.subarray(o);
+  if (flags & 1) raw = await gunzipU8(raw);
+  if (raw.length !== rawLen) throw new Error('raw_len mismatch');
+  const msg = JSON.parse(new TextDecoder().decode(raw));
+  if (msg.type !== typ) throw new Error('type mismatch');
+  return msg;
+}
+
 function connect() {
   let url = localStorage.getItem('herdr_relay_url') || (isSelfRelay ? autoRelayUrl : (isDemo ? DEMO_RELAY : ''));
   if (!url) { showSetup(); return; }
@@ -542,19 +764,43 @@ function connect() {
   let wsUrl = url;
   if (token) wsUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
   ws = new WebSocket(wsUrl);
-  ws.onopen = () => { setStatus('connected'); if(window.cue) cue('ready'); };
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    setStatus('connected');
+    try { ws.send(JSON.stringify({ type: 'hello', caps: [BIN_GZIP_CAP] })); } catch (_) {}
+    startPingLoop();
+    if (window.cue) cue('ready');
+  };
   ws.onclose = () => { setStatus('disconnected'); setTimeout(connect, 3000); };
   ws.onerror = () => setStatus('disconnected');
-  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+  ws.onmessage = async (e) => {
+    try {
+      let msg;
+      if (typeof e.data === 'string') msg = JSON.parse(e.data);
+      else msg = await decodeHgz1(e.data);
+      handleMessage(msg);
+    } catch (err) {
+      console.warn('ws message decode failed', err);
+    }
+  };
 }
 
 function setStatus(s) {
-  const dot = document.getElementById('statusDot');
-  const label = document.getElementById('connLabel');
-  dot.style.background = s==='connected'?'var(--green)':s==='connecting'?'var(--orange)':'var(--red)';
-  label.textContent = s==='connected'?'live':s==='connecting'?'connecting…':'offline';
-  label.style.color = s==='connected'?'var(--green)':s==='connecting'?'var(--orange)':'var(--red)';
+  connState = s;
+  if (s !== 'connected') {
+    clearPingTimers();
+    if (s === 'disconnected') {
+      lastRttMs = null;
+      lastPongAt = 0;
+      connLiveAt = 0;
+    }
+  }
+  refreshConnLabel();
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && connState === 'connected') sendPing();
+});
 
 function showSetup() {
   document.getElementById('agents').innerHTML = `<div class="empty">
@@ -603,6 +849,15 @@ function renderTermContent(text) {
 }
 
 function handleMessage(msg) {
+  if (msg.type === 'pong') {
+    const t = Number(msg.t);
+    // t===0 是 relay 对缺省/非法时间戳的回显，不能拿来算 RTT
+    if (Number.isFinite(t) && t > 0) lastRttMs = Math.max(0, Math.round(Date.now() - t));
+    lastPongAt = Date.now();
+    resetStaleTimer();
+    refreshConnLabel();
+    return;
+  }
   if (msg.type === 'agents') {
     // Track timeline on status changes
     for (const a of msg.agents) {
@@ -613,7 +868,11 @@ function handleMessage(msg) {
       }
       prevStatuses[a.pane_id] = a.status;
     }
-    agents = msg.agents; render();
+    agents = msg.agents;
+    for (const a of agents) {
+      if (a.workspace_id && a.workspace_label) workspaceLabels[a.workspace_id] = a.workspace_label;
+    }
+    render();
   }
   else if (msg.type === 'agent_update') {
     const update = msg.agent;
@@ -622,6 +881,9 @@ function handleMessage(msg) {
     const previousStatus = existing?.status || prevStatuses[update.pane_id];
     if (existing) Object.assign(existing, update);
     else agents.push({...update});
+    if (update.workspace_id && update.workspace_label) {
+      workspaceLabels[update.workspace_id] = update.workspace_label;
+    }
     if (previousStatus && previousStatus !== update.status) {
       timeline.unshift({project: update.project, agent: update.agent, status: update.status, time: new Date()});
       if (timeline.length > 100) timeline.pop();
@@ -649,14 +911,22 @@ function handleMessage(msg) {
     } else {
       el.scrollTop = el.scrollHeight;
     }
+    if (inputMode === 'slash-live' && !slashMenuSeen && looksLikeSlashMenu(msg.content || '')) {
+      slashMenuSeen = true;
+      clearSlashLiveTimer();
+    }
   } else if (msg.type === 'command_result') {
     // 布局操作常常"合法但未生效"（如单 pane 时 zoom），relay 用 ok=false + note
     // 表达这种情况，与 error 区分开——它不是失败，只是没什么可做。
     if (msg.command === 'narrow_mode') {
+      // 即使 ok=false（已处于窄屏 / 不在窄屏），也要按服务端回的 narrow 同步本地状态，
+      // 否则客户端会反复发 enable=True，配合误触容易把布局挤烂。
+      if (typeof msg.narrow === 'boolean') {
+        if (msg.narrow) narrowPanes.add(msg.pane_id);
+        else narrowPanes.delete(msg.pane_id);
+      }
       if (msg.ok) {
-        if (msg.narrow) narrowPanes.add(msg.pane_id); else narrowPanes.delete(msg.pane_id);
-        showTermToast(msg.narrow ? '已切到窄屏模式' : '已退出窄屏模式');
-        // TUI 重排需要一点时间，等 SIGWINCH 生效后再读
+        showTermToast(msg.note || (msg.narrow ? '已切到窄屏模式' : '已退出窄屏模式'));
         setTimeout(refreshPane, 500);
       } else if (msg.note) {
         showTermToast(msg.note);
@@ -666,11 +936,65 @@ function handleMessage(msg) {
       if (msg.ok) setTimeout(refreshPane, 300);
       else if (msg.note) showTermToast(msg.note);
     }
+  } else if (msg.type === 'git_status') {
+    if (msg.workspace_id && msg.ok) {
+      workspaceGitDirty[msg.workspace_id] = !msg.clean;
+      render();
+    }
+    if (msg.resolved_base) gitStatusContext.resolved_base = msg.resolved_base;
+    showGitStatusDialog(msg);
+  } else if (msg.type === 'git_diff') {
+    const path = msg.path || '';
+    const key = gitFileEntryKey(path);
+    const entry = gitFileCache[key] || (gitFileCache[key] = {});
+    entry.diff = { ...msg, view: 'diff' };
+    delete gitFileInflight[`${key}:diff`];
+    if (_gitFileState && _gitFileState.path === path && (_gitFileState.view || 'diff') === 'diff') {
+      showGitFileDialog({ ...msg, view: 'diff' });
+      if (msg.ok) prefetchGitShow(path);
+    }
+  } else if (msg.type === 'git_show') {
+    const path = msg.path || '';
+    const key = gitFileEntryKey(path);
+    const entry = gitFileCache[key] || (gitFileCache[key] = {});
+    entry.show = { ...msg, view: 'full' };
+    delete gitFileInflight[`${key}:show`];
+    // 预取时不打断 Diff 视图；仅当用户正在看/等待全文时才切换
+    if (_gitFileState && _gitFileState.path === path && _gitFileState.view === 'full') {
+      showGitFileDialog({ ...msg, view: 'full' });
+    }
   } else if (msg.type === 'workspace_created' && msg.ok) {
     if (window.cue) cue('sparkle');
+    if (msg.workspace_id) {
+      workspaceLabels[msg.workspace_id] = msg.label || workspaceLabels[msg.workspace_id] || msg.workspace_id;
+      activeWorkspace = msg.workspace_id;
+      activeTab = null;
+    }
+    // 新建的是空 shell pane，立刻打开终端，避免还得回 herdr 里手输命令才「看得见」
+    if (msg.pane_id) {
+      const stub = agents.find(a => a.pane_id === msg.pane_id);
+      if (!stub) {
+        agents.push({
+          pane_id: msg.pane_id,
+          agent: 'shell',
+          label: msg.label || '',
+          status: 'unknown',
+          cwd: '',
+          project: msg.label || msg.workspace_id || '',
+          workspace_id: msg.workspace_id || '',
+          workspace_label: msg.label || '',
+          tab_id: '',
+        });
+      }
+      render();
+      openTerminal(msg.pane_id);
+    } else {
+      render();
+    }
   } else if (msg.type === 'workspace_renamed' && msg.ok) {
     // Chip text uses workspace_label (herdr Space name), not cwd basename.
     if (msg.workspace_id && msg.label) {
+      workspaceLabels[msg.workspace_id] = msg.label;
       for (const a of agents) {
         if (a.workspace_id === msg.workspace_id) a.workspace_label = msg.label;
       }
@@ -678,6 +1002,7 @@ function handleMessage(msg) {
     closeSpaceOverlays();
     render();
   } else if (msg.type === 'workspace_closed' && msg.ok) {
+    if (msg.workspace_id) delete workspaceLabels[msg.workspace_id];
     activeWorkspace = null;
     activeTab = null;
     closeSpaceOverlays();
@@ -693,9 +1018,36 @@ function esc(s) {
   }[c]));
 }
 
+/** 中间省略：长 Space 名在手机芯片上两端都留辨识度。按码点计，避免把 surrogate 拆坏。 */
+function midEllipsis(s, max = 12) {
+  const chars = [...String(s ?? '')];
+  if (chars.length <= max) return chars.join('');
+  const keep = Math.max(max - 1, 2);
+  const head = Math.ceil(keep / 2);
+  const tail = Math.floor(keep / 2);
+  return chars.slice(0, head).join('') + '…' + chars.slice(-tail).join('');
+}
+
+function saveChipScroll() {
+  const out = {};
+  document.querySelectorAll('#agents .chip-strip[data-strip]').forEach(el => {
+    out[el.dataset.strip] = el.scrollLeft;
+  });
+  return out;
+}
+
+function restoreChipScroll(saved) {
+  if (!saved) return;
+  document.querySelectorAll('#agents .chip-strip[data-strip]').forEach(el => {
+    const v = saved[el.dataset.strip];
+    if (typeof v === 'number') el.scrollLeft = v;
+  });
+}
+
 function render() {
   document.getElementById('agentCount').textContent = agents.length ? `${agents.length}` : '';
-  const workspaces = [...new Set(agents.map(a => a.workspace_id).filter(Boolean))];
+  const fromAgents = agents.map(a => a.workspace_id).filter(Boolean);
+  const workspaces = [...new Set([...Object.keys(workspaceLabels), ...fromAgents])];
   // Spec: Spaces strip always visible (0 / 1 / many) so + Space is reachable.
   if (activeWorkspace && !workspaces.includes(activeWorkspace)) {
     activeWorkspace = null;
@@ -705,6 +1057,7 @@ function render() {
 }
 
 function renderWorkspaces(workspaces) {
+  const chipScroll = saveChipScroll();
   let html = '';
   // Hoist blocked agents
   const blocked = agents.filter(a => a.status === 'blocked');
@@ -712,26 +1065,33 @@ function renderWorkspaces(workspaces) {
     html += `<div class="section-header" style="color:var(--red)"><span class="dot" style="background:var(--red)"></span>Needs you <span style="opacity:0.6">(${blocked.length})</span></div>`;
     html += blocked.map(a => agentCard(a)).join('');
   }
-  // Space chip strip (always)
-  html += `<div class="chip-strip"><span class="chip-label">Spaces</span>`;
+  // Space chip strip (always). + / ⋯ 固定在左侧，避免横向滚动或重绘后找不到。
+  html += `<div class="chip-strip" data-strip="spaces"><span class="chip-label">Spaces</span>`;
+  html += `<button class="chip chip-add" onclick="createWorkspace()" aria-label="New Space">+</button>`;
+  if (activeWorkspace) {
+    html += `<button class="chip" onclick="openSpaceMenu()" aria-label="Space actions">⋯</button>`;
+  }
   if (workspaces.length >= 1) {
     html += `<button class="chip${activeWorkspace===null?' active':''}" onclick="backToWorkspaces()">All</button>`;
     for (const wsId of workspaces) {
       const wsAgents = agents.filter(a => a.workspace_id === wsId);
       const hasBlocked = wsAgents.some(a => a.status === 'blocked');
-      const name = wsAgents[0]?.workspace_label || wsAgents[0]?.project || wsId.slice(0, 8);
-      html += `<button class="chip${activeWorkspace===wsId?' active':''}${hasBlocked?' alert':''}" onclick="selectWorkspace('${wsId}')">${esc(name)}</button>`;
+      const name = workspaceLabels[wsId]
+        || wsAgents[0]?.workspace_label
+        || wsAgents[0]?.project
+        || wsId.slice(0, 8);
+      const short = midEllipsis(name, 12);
+      const titleAttr = short !== name ? ` title="${esc(name)}"` : '';
+      const dirtyCls = workspaceGitDirty[wsId] === false ? '' : workspaceGitDirty[wsId] ? ' dirty' : '';
+      html += `<button class="chip${activeWorkspace===wsId?' active':''}${hasBlocked?' alert':''}${dirtyCls}" onclick="selectWorkspace('${wsId}')"${titleAttr}>${esc(short)}</button>`;
     }
-  }
-  html += `<button class="chip chip-add" onclick="createWorkspace()" aria-label="New Space">+</button>`;
-  if (activeWorkspace) {
-    html += `<button class="chip" onclick="openSpaceMenu()" aria-label="Space actions">⋯</button>`;
   }
   html += `</div>`;
   // Tab chip strip (always show when workspace selected)
   if (activeWorkspace) {
     const wsTabs = [...new Set(agents.filter(a => a.workspace_id === activeWorkspace).map(a => a.tab_id).filter(Boolean))];
-    html += `<div class="chip-strip"><span class="chip-label">Tabs</span>`;
+    html += `<div class="chip-strip" data-strip="tabs"><span class="chip-label">Tabs</span>`;
+    html += `<button class="chip chip-add" onclick="createTab('${activeWorkspace}')" aria-label="New Tab">+</button>`;
     if (wsTabs.length > 1) {
       html += `<button class="chip${!activeTab?' active':''}" onclick="selectTab(null)">All</button>`;
     }
@@ -741,7 +1101,6 @@ function renderWorkspaces(workspaces) {
       const tabLabel = tabAgents[0]?.label || 'Tab '+(i+1);
       html += `<button class="chip${activeTab===tid?' active':''}${hasBlocked?' alert':''}" onclick="selectTab('${tid}')">${esc(tabLabel)}</button>`;
     });
-    html += `<button class="chip chip-add" onclick="createTab('${activeWorkspace}')">+</button>`;
     html += `</div>`;
   }
   // Agent list (filtered)
@@ -757,6 +1116,7 @@ function renderWorkspaces(workspaces) {
   if (idle.length) html += section('Idle', 'var(--muted)', idle);
   if (!agents.length) html += '<div class="empty">Waiting for agents…</div>';
   document.getElementById('agents').innerHTML = html;
+  restoreChipScroll(chipScroll);
 }
 
 function renderAgentList(list) {
@@ -801,6 +1161,7 @@ function openSpaceMenu() {
   ov.className = 'space-overlay';
   ov.onclick = (e) => { if (e.target === ov) closeSpaceOverlays(); };
   ov.innerHTML = `<div class="space-sheet" role="menu" aria-label="Space actions">
+    <button type="button" onclick="requestGitStatus('${activeWorkspace}')">Git status…</button>
     <button type="button" onclick="openRenameSpace()">Rename…</button>
     <button type="button" class="danger" onclick="openCloseSpace()">Close…</button>
   </div>`;
@@ -808,8 +1169,11 @@ function openSpaceMenu() {
 }
 
 function currentSpaceLabel() {
-  const a = agents.find(x => x.workspace_id === activeWorkspace);
-  return a?.workspace_label || a?.project || activeWorkspace || '';
+  return workspaceLabels[activeWorkspace]
+    || agents.find(x => x.workspace_id === activeWorkspace)?.workspace_label
+    || agents.find(x => x.workspace_id === activeWorkspace)?.project
+    || activeWorkspace
+    || '';
 }
 
 function openRenameSpace() {
@@ -869,6 +1233,300 @@ function submitCloseSpace() {
   }));
 }
 
+function requestGitStatus(workspaceId, options = {}) {
+  if (!ws) return;
+  clearGitFileCache();
+  document.querySelectorAll('.git-file-overlay').forEach(el => el.remove());
+  if (!options.keepOverlay) closeSpaceOverlays();
+
+  const wsId = workspaceId
+    || gitStatusContext.workspace_id
+    || agents.find(a => a.pane_id === activePane)?.workspace_id
+    || activeWorkspace;
+  const paneId = options.pane_id !== undefined
+    ? options.pane_id
+    : (gitStatusContext.pane_id || activePane || '');
+  const mode = options.mode || gitStatusContext.mode || 'worktree';
+  const base = options.base !== undefined ? options.base : (gitStatusContext.base || '');
+
+  gitStatusContext = {
+    pane_id: paneId || '',
+    workspace_id: wsId || '',
+    mode,
+    base,
+    resolved_base: mode === 'base' ? (gitStatusContext.resolved_base || '') : '',
+  };
+
+  const payload = { type: 'git_status', mode, base };
+  if (paneId) payload.pane_id = paneId;
+  else if (wsId) payload.workspace_id = wsId;
+  else return;
+  ws.send(JSON.stringify(payload));
+}
+
+function setGitStatusMode(mode) {
+  if (mode !== 'worktree' && mode !== 'base') return;
+  if (gitStatusContext.mode === mode) return;
+  gitStatusContext.mode = mode;
+  clearGitFileCache();
+  requestGitStatus(null, { keepOverlay: true, mode, base: gitStatusContext.base || '' });
+}
+
+function applyGitBase() {
+  const input = document.querySelector('.git-overlay:not(.git-file-overlay) .git-base-row input');
+  const base = input ? input.value.trim() : (gitStatusContext.base || '');
+  gitStatusContext.mode = 'base';
+  gitStatusContext.base = base;
+  clearGitFileCache();
+  requestGitStatus(null, { keepOverlay: true, mode: 'base', base });
+}
+
+function showGitStatusDialog(msg) {
+  document.querySelectorAll('.git-overlay').forEach(el => el.remove());
+  if (msg.resolved_base) gitStatusContext.resolved_base = msg.resolved_base;
+  if (msg.mode) gitStatusContext.mode = msg.mode;
+  const mode = gitStatusContext.mode || 'worktree';
+  const basePrefill = gitStatusContext.base || gitStatusContext.resolved_base || msg.resolved_base || '';
+
+  const ov = document.createElement('div');
+  ov.className = 'space-overlay git-overlay';
+  ov.onclick = (e) => { if (e.target === ov) ov.remove(); };
+
+  const modeBar = `<div class="git-mode" role="tablist" aria-label="Git compare mode">
+    <button type="button" class="${mode === 'worktree' ? 'active' : ''}" data-git-mode="worktree">Working tree</button>
+    <button type="button" class="${mode === 'base' ? 'active' : ''}" data-git-mode="base">vs base</button>
+  </div>`;
+  const baseRow = mode === 'base'
+    ? `<div class="git-base-row">
+        <input type="text" value="${esc(basePrefill)}" placeholder="origin/main" aria-label="Base ref" spellcheck="false">
+        <button type="button" data-git-apply-base>Apply</button>
+      </div>`
+    : '';
+
+  let body = '';
+  if (!msg.ok) {
+    body = `<p style="margin:0;color:var(--red)">${esc(msg.message || 'git status failed')}</p>`;
+  } else if (msg.clean) {
+    const cwd = msg.cwd ? `<div class="meta">${esc(msg.cwd)}</div>` : '';
+    const hint = mode === 'base' && (msg.resolved_base || basePrefill)
+      ? `<div class="meta">vs ${esc(msg.resolved_base || basePrefill)}</div>` : '';
+    body = `${cwd}${hint}<p style="margin:0;color:var(--muted)">工作区干净</p>`;
+  } else {
+    const cwd = msg.cwd ? `<div class="meta">${esc(msg.cwd)}</div>` : '';
+    const files = msg.files || [];
+    const list = files.length
+      ? `<ul class="git-file-list">${files.map(f => {
+          const path = f.path || '';
+          const st = f.status || '?';
+          return `<li data-path="${esc(path)}" data-status="${esc(st)}" role="button" tabindex="0"><span class="st">${esc(st)}</span><span>${esc(path)}</span></li>`;
+        }).join('')}</ul>`
+      : `<pre>${esc(msg.text || '(empty)')}</pre>`;
+    body = `${cwd}${list}`;
+  }
+
+  const count = (msg.files || []).length;
+  const title = !msg.ok ? 'Git status'
+    : msg.clean ? 'Git status · clean'
+    : `Git status · ${count} changed`;
+  ov.innerHTML = `<div class="space-dialog git-dialog" role="dialog" aria-label="Git status">
+    <h3>${esc(title)}</h3>
+    ${modeBar}
+    ${baseRow}
+    ${body}
+    <div class="row"><button type="button" class="primary" data-git-close-status>Close</button></div>
+  </div>`;
+  document.body.appendChild(ov);
+
+  ov.querySelectorAll('[data-git-mode]').forEach(btn => {
+    btn.addEventListener('click', () => setGitStatusMode(btn.getAttribute('data-git-mode')));
+  });
+  const applyBtn = ov.querySelector('[data-git-apply-base]');
+  if (applyBtn) applyBtn.addEventListener('click', applyGitBase);
+  const baseInput = ov.querySelector('.git-base-row input');
+  if (baseInput) {
+    baseInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); applyGitBase(); }
+    });
+  }
+  ov.querySelectorAll('.git-file-list li[data-path]').forEach(li => {
+    const path = li.getAttribute('data-path') || '';
+    const status = li.getAttribute('data-status') || '';
+    const open = () => openGitFile(path, status);
+    // 手指按下即开始拉 diff，抢在 click 前藏掉一部分 RTT
+    li.addEventListener('pointerdown', (e) => {
+      if (e.button != null && e.button !== 0) return;
+      warmGitDiff(path, status);
+    });
+    li.addEventListener('click', open);
+    li.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
+  });
+  const closeBtn = ov.querySelector('[data-git-close-status]');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      document.querySelectorAll('.git-file-overlay').forEach(el => el.remove());
+      ov.remove();
+    });
+  }
+}
+
+function isUntrackedStatus(status) {
+  const st = String(status || '').trim();
+  // porcelain: "??"; name-status vs base: "A" for newly added may still be tracked — only ?? is safe
+  return st === '??' || st === '?';
+}
+
+/** 不打开弹层，只把 diff 请求发出去（供 pointerdown 预热） */
+function warmGitDiff(path, status = '') {
+  if (!ws || !path) return;
+  const key = gitFileEntryKey(path);
+  const entry = gitFileCache[key] || (gitFileCache[key] = {});
+  if (entry.diff) return;
+  const inflightKey = `${key}:diff`;
+  if (gitFileInflight[inflightKey]) return;
+  const payload = gitFileTargetPayload({
+    type: 'git_diff',
+    path,
+    mode: gitStatusContext.mode || 'worktree',
+    base: effectiveGitBase(),
+  });
+  if (!payload) return;
+  if (isUntrackedStatus(status)) payload.untracked = true;
+  gitFileInflight[inflightKey] = true;
+  ws.send(JSON.stringify(payload));
+}
+
+function openGitFile(path, status = '') {
+  if (!ws || !path) return;
+  const key = gitFileEntryKey(path);
+  const entry = gitFileCache[key] || (gitFileCache[key] = {});
+
+  // 缓存命中：立刻展示，省掉手机端一整轮 RTT
+  if (entry.diff) {
+    showGitFileDialog({ ...entry.diff, view: 'diff' });
+    if (!entry.show) prefetchGitShow(path);
+    return;
+  }
+
+  const inflightKey = `${key}:diff`;
+  if (gitFileInflight[inflightKey]) {
+    showGitFileDialog({ loading: true, path, view: 'diff', ok: true });
+    return;
+  }
+
+  const payload = gitFileTargetPayload({
+    type: 'git_diff',
+    path,
+    mode: gitStatusContext.mode || 'worktree',
+    base: effectiveGitBase(),
+  });
+  if (!payload) return;
+  if (isUntrackedStatus(status)) payload.untracked = true;
+
+  gitFileInflight[inflightKey] = true;
+  showGitFileDialog({ loading: true, path, view: 'diff', ok: true });
+  ws.send(JSON.stringify(payload));
+}
+
+function prefetchGitShow(path) {
+  if (!ws || !path) return;
+  const key = gitFileEntryKey(path);
+  const entry = gitFileCache[key] || (gitFileCache[key] = {});
+  if (entry.show) return;
+  const inflightKey = `${key}:show`;
+  if (gitFileInflight[inflightKey]) return;
+  const payload = gitFileTargetPayload({ type: 'git_show', path });
+  if (!payload) return;
+  gitFileInflight[inflightKey] = true;
+  ws.send(JSON.stringify(payload));
+}
+
+function colorizeDiffText(text) {
+  return esc(text || '').split('\n').map(line => {
+    if (line.startsWith('+') && !line.startsWith('+++')) return `<span class="diff-add">${line}</span>`;
+    if (line.startsWith('-') && !line.startsWith('---')) return `<span class="diff-del">${line}</span>`;
+    if (line.startsWith('@@')) return `<span class="diff-hunk">${line}</span>`;
+    return line;
+  }).join('\n');
+}
+
+function showGitFileDialog(state) {
+  document.querySelectorAll('.git-file-overlay').forEach(el => el.remove());
+  const ov = document.createElement('div');
+  ov.className = 'space-overlay git-overlay git-file-overlay';
+  ov.onclick = (e) => { if (e.target === ov) ov.remove(); };
+  const view = state.view || 'diff';
+  const mode = state.mode || gitStatusContext.mode || 'worktree';
+  const resolved = state.resolved_base || (mode === 'base' ? (gitStatusContext.resolved_base || gitStatusContext.base || '') : '');
+  const subtitle = mode === 'base'
+    ? `vs base${resolved ? ' · ' + resolved : ''}`
+    : 'Working tree';
+
+  let body;
+  if (state.loading) {
+    body = `<p style="margin:0;color:var(--muted)">Loading…</p>`;
+  } else if (state.ok === false) {
+    body = `<p style="margin:0;color:var(--red)">${esc(state.message || 'failed')}</p>`;
+  } else {
+    const pre = view === 'diff'
+      ? `<pre>${colorizeDiffText(state.text)}</pre>`
+      : `<pre>${esc(state.text || '')}</pre>`;
+    const trunc = state.truncated ? `<div class="meta">… truncated</div>` : '';
+    body = pre + trunc;
+  }
+
+  ov.innerHTML = `<div class="space-dialog git-dialog git-file-dialog" role="dialog" aria-label="Git file">
+    <h3>${esc(state.path || '')}</h3>
+    <div class="meta">${esc(subtitle)}</div>
+    <div class="git-view-toggle" role="tablist" aria-label="Diff or full file">
+      <button type="button" class="${view === 'diff' ? 'active' : ''}" data-git-view="diff">Diff</button>
+      <button type="button" class="${view === 'full' ? 'active' : ''}" data-git-view="full">全文</button>
+    </div>
+    ${body}
+    <div class="row"><button type="button" class="primary" data-git-close-file>Close</button></div>
+  </div>`;
+  document.body.appendChild(ov);
+  _gitFileState = { ...state, view, mode, resolved_base: resolved };
+
+  ov.querySelectorAll('[data-git-view]').forEach(btn => {
+    btn.addEventListener('click', () => switchGitFileView(btn.getAttribute('data-git-view')));
+  });
+  const closeBtn = ov.querySelector('[data-git-close-file]');
+  if (closeBtn) closeBtn.addEventListener('click', () => ov.remove());
+}
+
+function switchGitFileView(view) {
+  const st = _gitFileState || {};
+  const path = st.path;
+  if (!path || !ws) return;
+  const key = gitFileEntryKey(path);
+  const entry = gitFileCache[key] || (gitFileCache[key] = {});
+
+  if (view === 'diff') {
+    if (entry.diff) {
+      showGitFileDialog({ ...entry.diff, view: 'diff' });
+      return;
+    }
+    openGitFile(path);
+    return;
+  }
+
+  if (entry.show) {
+    showGitFileDialog({ ...entry.show, view: 'full' });
+    return;
+  }
+
+  const inflightKey = `${key}:show`;
+  showGitFileDialog({ ...st, loading: true, view: 'full', ok: true });
+  if (gitFileInflight[inflightKey]) return;
+
+  const payload = gitFileTargetPayload({ type: 'git_show', path });
+  if (!payload) return;
+  gitFileInflight[inflightKey] = true;
+  ws.send(JSON.stringify(payload));
+}
+
 function agentCard(a) {
   const color = a.status==='blocked'?'var(--red)':a.status==='working'?'var(--green)':'var(--muted)';
   const pulseClass = a.status==='working'?' pulse':'';
@@ -888,6 +1546,9 @@ function section(title, color, list) {
 }
 
 function openTerminal(paneId) {
+  if (activePane && activePane !== paneId) {
+    exitSlashLive({ submitted: false, scrub: true });
+  }
   activePane = paneId; paneLines = 200; userScrolledUp = false;
   const a = agents.find(x => x.pane_id===paneId);
   document.getElementById('termTitle').textContent = a?`${a.label||a.project} · ${a.agent}`:paneId;
@@ -911,10 +1572,11 @@ function openTerminal(paneId) {
   }
   restoreKeypadState();
   refreshPane();
-  refreshInterval = setInterval(refreshPane, 3000);
+  setPaneRefreshInterval(BUFFERED_REFRESH_MS);
 }
 
 function closeTerminal() {
+  exitSlashLive({ submitted: false, scrub: true });
   activePane = null; clearInterval(refreshInterval);
   document.getElementById('terminalView').classList.remove('active');
   document.getElementById('agentListView').style.display = '';
@@ -924,11 +1586,20 @@ let paneLines = 200;
 function refreshPane() { if(ws&&activePane) ws.send(JSON.stringify({type:'read_pane',pane_id:activePane,lines:paneLines})); }
 function loadMore() { paneLines = Math.min(paneLines + 500, 5000); refreshPane(); }
 function sendText() {
-  const i=document.getElementById('termInput');
-  if(!i.value||!ws||!activePane)return;
-  ws.send(JSON.stringify({type:'send_text',pane_id:activePane,text:i.value}));
-  ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:['Enter']}));
-  i.value=''; setTimeout(refreshPane,500);
+  const i = document.getElementById('termInput');
+  if (!ws || !activePane) return;
+  if (inputMode === 'slash-live') {
+    ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'] }));
+    i.value = '';
+    exitSlashLive({ submitted: true });
+    setTimeout(refreshPane, 500);
+    return;
+  }
+  if (!i.value) return;
+  ws.send(JSON.stringify({ type: 'send_text', pane_id: activePane, text: i.value }));
+  ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'] }));
+  i.value = '';
+  setTimeout(refreshPane, 500);
 }
 function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(refreshPane,300);}
 function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(refreshPane,300);}
@@ -952,12 +1623,49 @@ function toggleNarrowMode() {
 }
 
 function updateNarrowBtn() {
-  const btn = document.getElementById('narrowBtn');
-  if (!btn) return;
-  const on = narrowPanes.has(activePane);
-  btn.style.color = on ? 'var(--blue)' : 'var(--muted)';
-  btn.title = on ? '退出窄屏模式' : '窄屏模式（让 agent 按手机宽度重排）';
+  const btn = document.getElementById('layoutMenuBtn');
+  const item = document.getElementById('layoutNarrowItem');
+  const hint = document.getElementById('layoutNarrowHint');
+  const on = !!(activePane && narrowPanes.has(activePane));
+  if (btn) {
+    btn.classList.toggle('active-layout', on);
+    btn.title = on ? '布局（窄屏已开）' : '布局（缩放 / 窄屏）';
+  }
+  if (item) item.classList.toggle('on', on);
+  if (hint) hint.textContent = on ? '已开启' : '重排 TUI';
 }
+
+function toggleLayoutMenu(ev) {
+  if (ev) ev.stopPropagation();
+  const menu = document.getElementById('layoutMenu');
+  const btn = document.getElementById('layoutMenuBtn');
+  if (!menu) return;
+  const open = !menu.classList.contains('open');
+  menu.classList.toggle('open', open);
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) updateNarrowBtn();
+}
+
+function closeLayoutMenu() {
+  const menu = document.getElementById('layoutMenu');
+  const btn = document.getElementById('layoutMenuBtn');
+  if (menu) menu.classList.remove('open');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+function runLayoutAction(kind) {
+  closeLayoutMenu();
+  if (kind === 'zoom') togglePaneZoom();
+  else if (kind === 'narrow') toggleNarrowMode();
+}
+
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('layoutMenu');
+  if (!menu || !menu.classList.contains('open')) return;
+  if (menu.contains(e.target)) return;
+  if (e.target.closest && e.target.closest('#layoutMenuBtn')) return;
+  closeLayoutMenu();
+});
 
 // 轻量提示：布局操作常常"合法但未生效"（如单 pane 时 zoom），
 // 需要一句解释，但不值得打断式弹窗。
@@ -990,6 +1698,18 @@ const DANGER_KEYS = new Set(['ctrl+c','ctrl+d','ctrl+z']);
 
 function fireKey(k) {
   if(window.cue) cue('tick');
+  if (inputMode === 'slash-live' && (k === 'Escape' || k === 'Enter') && keyQueue.length === 0 && !armedMod) {
+    if (k === 'Enter') {
+      sendKeys(['Enter']);
+      const input = document.getElementById('termInput');
+      if (input) input.value = '';
+      exitSlashLive({ submitted: true });
+      return;
+    }
+    exitSlashLive({ submitted: false, scrub: true });
+    setTimeout(refreshPane, 300);
+    return;
+  }
   const composed = armedMod ? `${armedMod}+${k}` : k;
   if (keyQueue.length > 0 || armedMod) {
     keyQueue.push(composed);
@@ -1285,7 +2005,62 @@ function pressCtrl(label) {
 function toggleArrows(){}
 function hideArrows(){}
 function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.send(JSON.stringify({type:'respond',pane_id:activePane,text:t}));document.getElementById('quickActions').innerHTML='';setTimeout(refreshPane,500);}
-document.getElementById('termInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendText();}});
+(function wireTermInput() {
+  const input = document.getElementById('termInput');
+  if (!input) return;
+
+  input.addEventListener('compositionstart', () => { slashComposing = true; });
+  input.addEventListener('compositionend', (e) => {
+    slashComposing = false;
+    if (inputMode !== 'slash-live' || !ws || !activePane) return;
+    const text = e.data || '';
+    if (text) {
+      if (!liveSendText(text)) return;
+      refreshPane();
+    }
+  });
+
+  input.addEventListener('beforeinput', (e) => {
+    if (inputMode === 'buffered' && e.inputType === 'insertText' && shouldEnterSlashLive(input.value, e.data || '')) {
+      e.preventDefault();
+      enterSlashLive({ seedSlash: true });
+      return;
+    }
+    if (inputMode !== 'slash-live' || slashComposing) return;
+    if (!ws || !activePane) return;
+
+    if (e.inputType === 'insertText' && e.data) {
+      if (!liveSendText(e.data)) return;
+      refreshPane();
+      return;
+    }
+    if (e.inputType === 'deleteContentBackward' || e.inputType === 'deleteContentForward') {
+      ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['backspace'] }));
+      refreshPane();
+    }
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (inputMode === 'slash-live') {
+        if (!ws || !activePane) return;
+        ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'] }));
+        input.value = '';
+        exitSlashLive({ submitted: true });
+        setTimeout(refreshPane, 500);
+        return;
+      }
+      sendText();
+      return;
+    }
+    if (e.key === 'Escape' && inputMode === 'slash-live') {
+      e.preventDefault();
+      exitSlashLive({ submitted: false, scrub: true });
+      setTimeout(refreshPane, 300);
+    }
+  });
+})();
 document.getElementById('termContent').addEventListener('scroll', function() {
   const el = this;
   userScrolledUp = (el.scrollHeight - el.scrollTop - el.clientHeight) > 50;
@@ -1293,6 +2068,107 @@ document.getElementById('termContent').addEventListener('scroll', function() {
 });
 
 if (savedUrl) setTimeout(connect, 100); else showSetup();
+
+// --- Slash Live Mode helpers (also covered by web/tests/slash-live.test.html) ---
+var SLASH_LIVE_TIMEOUT_MS = 1500;
+var SLASH_SCRUB_BACKSPACES = 8;
+var SLASH_REFRESH_MS = 400;
+var BUFFERED_REFRESH_MS = 3000;
+
+function looksLikeSlashMenu(text) {
+  if (!text || typeof text !== 'string') return false;
+  const hits = text.split('\n').filter(line => /^\s*\/[a-zA-Z][\w-]*/.test(line));
+  return hits.length >= 2;
+}
+
+function buildSlashCleanupKeys({ scrub }) {
+  const keys = ['Escape'];
+  if (scrub) {
+    for (let i = 0; i < SLASH_SCRUB_BACKSPACES; i++) keys.push('backspace');
+  }
+  return keys;
+}
+
+function shouldEnterSlashLive(currentValue, incomingChar) {
+  return (!currentValue || currentValue === '') && incomingChar === '/';
+}
+
+function setInputMode(mode) {
+  inputMode = mode;
+  const badge = document.getElementById('slashLiveBadge');
+  if (badge) badge.hidden = mode !== 'slash-live';
+  const input = document.getElementById('termInput');
+  if (input) input.placeholder = mode === 'slash-live' ? 'Slash live…' : 'Type…';
+}
+
+function clearSlashLiveTimer() {
+  if (slashLiveTimer) { clearTimeout(slashLiveTimer); slashLiveTimer = null; }
+}
+
+function setPaneRefreshInterval(ms) {
+  if (refreshInterval) clearInterval(refreshInterval);
+  if (activePane) refreshInterval = setInterval(refreshPane, ms);
+}
+
+function cleanupSlashRemote({ scrub }) {
+  if (!ws || !activePane) return;
+  const keys = buildSlashCleanupKeys({ scrub });
+  ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys }));
+}
+
+function liveSendText(text) {
+  if (!ws || !activePane) {
+    exitSlashLive({ submitted: false, scrub: false, openFallback: true });
+    return false;
+  }
+  ws.send(JSON.stringify({ type: 'send_text', pane_id: activePane, text }));
+  return true;
+}
+
+function exitSlashLive({ submitted, scrub, openFallback } = {}) {
+  if (inputMode !== 'slash-live') {
+    if (openFallback) openCommandPaletteFallback();
+    return;
+  }
+  clearSlashLiveTimer();
+  if (!submitted) cleanupSlashRemote({ scrub: !!scrub });
+  setInputMode('buffered');
+  slashMenuSeen = false;
+  const input = document.getElementById('termInput');
+  if (input && !submitted) input.value = '';
+  setPaneRefreshInterval(BUFFERED_REFRESH_MS);
+  if (openFallback) openCommandPaletteFallback();
+}
+
+function enterSlashLive({ seedSlash }) {
+  if (!ws || !activePane) {
+    openCommandPaletteFallback();
+    return;
+  }
+  const input = document.getElementById('termInput');
+  if (input) input.value = seedSlash ? '/' : (input.value || '');
+  setInputMode('slash-live');
+  slashMenuSeen = false;
+  setPaneRefreshInterval(SLASH_REFRESH_MS);
+  if (seedSlash && !liveSendText('/')) {
+    // liveSendText 已 exit + fallback；勿再挂超时定时器
+    return;
+  }
+  refreshPane();
+  clearSlashLiveTimer();
+  slashLiveTimer = setTimeout(() => {
+    if (inputMode === 'slash-live' && !slashMenuSeen) {
+      exitSlashLive({ submitted: false, scrub: true, openFallback: true });
+    }
+  }, SLASH_LIVE_TIMEOUT_MS);
+}
+
+function openCommandPaletteFallback() {
+  document.getElementById('cmdPalette').style.display = '';
+  document.getElementById('cmdSearch').value = '';
+  filterCommands();
+  document.getElementById('cmdSearch').focus();
+}
 
 // --- Command Palette ---
 const COMMANDS = {
@@ -1351,11 +2227,11 @@ function getAgentCommands() {
 }
 
 function openCommandPalette() {
-  if(window.cue) cue('page');
-  document.getElementById('cmdPalette').style.display = '';
-  document.getElementById('cmdSearch').value = '';
-  filterCommands();
-  document.getElementById('cmdSearch').focus();
+  if (window.cue) cue('page');
+  const input = document.getElementById('termInput');
+  if (input) input.value = '';
+  enterSlashLive({ seedSlash: true });
+  if (input) input.focus();
 }
 function closePalette() { document.getElementById('cmdPalette').style.display = 'none'; }
 
