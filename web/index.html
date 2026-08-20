@@ -250,6 +250,11 @@ body { line-height: 1.2; }
 /* 输入中文时等宽字体缺少中文字形，会逐字回退且宽度参差；
    混合字体栈让英文保持等宽、中文用苹方，输入体验更稳。 */
 .term-input input { flex: 1; padding: 9px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 16px; font-family: 'SF Mono', 'Menlo', monospace, 'PingFang SC', sans-serif; min-width: 0; }
+.term-field { flex: 1; min-width: 0; position: relative; display: flex; align-items: center; }
+.term-field input { width: 100%; padding-right: 34px; }
+.clear-term-btn { position: absolute; right: 4px; width: 28px; height: 28px; padding: 0; border: none; border-radius: 50%; background: transparent; color: var(--muted); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.clear-term-btn[hidden] { display: none; }
+.clear-term-btn:active { background: var(--border); color: var(--text); }
 .term-input button:last-child { padding: 10px 14px; border-radius: 6px; border: none; background: var(--blue); color: #fff; font-weight: 700; font-size: 16px; flex-shrink: 0; }
 /* 键盘弹起时容器 bottom 已抬升 --kb-inset，Home Indicator 被键盘遮住，
    此时无需再留安全区；故取两者较大值而非相加，避免双重留白。 */
@@ -418,7 +423,12 @@ body { line-height: 1.2; }
   <div class="term-input">
     <button onclick="openCommandPalette()" aria-label="Commands" style="padding:10px 12px;border-radius:6px;border:1px solid var(--blue);background:var(--bg);color:var(--blue);font-weight:700;font-size:14px;flex-shrink:0">/</button>
     <span id="slashLiveBadge" hidden style="font-size:0.65rem;font-weight:700;letter-spacing:0.04em;color:var(--blue);flex-shrink:0">LIVE /</span>
-    <input id="termInput" placeholder="Type…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+    <div class="term-field">
+      <input id="termInput" placeholder="Type…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+      <button type="button" id="clearTermBtn" class="clear-term-btn" onclick="clearTermInput()" aria-label="清空" hidden>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
     <button onclick="toggleQuickDock()" aria-label="Quick actions" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--orange);flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>
     <button onclick="toggleKeysDock()" aria-label="Keys" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--muted);flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.001M10 8h.001M14 8h.001M18 8h.001M8 12h.001M12 12h.001M16 12h.001M7 16h10"/></svg></button>
     <button onclick="sendText()" aria-label="Send" style="padding:10px 14px;border-radius:6px;border:none;background:var(--blue);color:#fff;flex-shrink:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
@@ -540,10 +550,12 @@ var inputMode = 'buffered', slashLiveTimer = null, slashMenuSeen = false, slashC
 let timeline = [], prevStatuses = {};
 let activeWorkspace = null;
 let activeTab = null;
-let connState = 'disconnected';
+var connState = 'disconnected';
 let lastRttMs = null;
-let lastPongAt = 0;
-let connLiveAt = 0;
+var lastPongAt = 0;
+var connLiveAt = 0;
+var pendingSubmit = null;
+const SEND_ACK_TIMEOUT_MS = 15000;
 let pingTimer = null;
 let staleTimer = null;
 const PING_INTERVAL_MS = 5000;
@@ -771,7 +783,11 @@ function connect() {
     startPingLoop();
     if (window.cue) cue('ready');
   };
-  ws.onclose = () => { setStatus('disconnected'); setTimeout(connect, 3000); };
+  ws.onclose = () => {
+    if (pendingSubmit) failPendingSubmit('连接断开，内容已保留');
+    setStatus('disconnected');
+    setTimeout(connect, 3000);
+  };
   ws.onerror = () => setStatus('disconnected');
   ws.onmessage = async (e) => {
     try {
@@ -916,6 +932,7 @@ function handleMessage(msg) {
       clearSlashLiveTimer();
     }
   } else if (msg.type === 'command_result') {
+    onSubmitAck(msg);
     // 布局操作常常"合法但未生效"（如单 pane 时 zoom），relay 用 ok=false + note
     // 表达这种情况，与 error 区分开——它不是失败，只是没什么可做。
     if (msg.command === 'narrow_mode') {
@@ -1008,7 +1025,7 @@ function handleMessage(msg) {
     closeSpaceOverlays();
     render();
   } else if (msg.type === 'error' && msg.message) {
-    showTermToast(msg.message);
+    if (!onSubmitAck(msg)) showTermToast(msg.message);
   }
 }
 
@@ -1585,21 +1602,163 @@ function closeTerminal() {
 let paneLines = 200;
 function refreshPane() { if(ws&&activePane) ws.send(JSON.stringify({type:'read_pane',pane_id:activePane,lines:paneLines})); }
 function loadMore() { paneLines = Math.min(paneLines + 500, 5000); refreshPane(); }
+function wsCanSend() {
+  if (!ws) return false;
+  if (ws.readyState != null && ws.readyState !== 1) return false;
+  if (connState === 'disconnected' || connState === 'connecting') return false;
+  const ref = lastPongAt || connLiveAt;
+  if (ref > 0 && Date.now() - ref >= STALE_MS) return false;
+  return true;
+}
+
+function newSubmitId() {
+  return 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function clearPendingSubmitTimer() {
+  if (pendingSubmit && pendingSubmit.timer) {
+    clearTimeout(pendingSubmit.timer);
+    pendingSubmit.timer = null;
+  }
+}
+
+function beginPendingSubmit({ text, paneId, id, phase }) {
+  clearPendingSubmitTimer();
+  pendingSubmit = {
+    text: text || '',
+    paneId,
+    id,
+    phase,
+    timer: setTimeout(() => { failPendingSubmit('发送超时，内容已保留'); }, SEND_ACK_TIMEOUT_MS),
+  };
+}
+
+function failPendingSubmit(note) {
+  if (!pendingSubmit) return;
+  const kept = pendingSubmit.text;
+  clearPendingSubmitTimer();
+  pendingSubmit = null;
+  const i = document.getElementById('termInput');
+  if (i && !i.value && kept) i.value = kept;
+  syncClearTermBtn();
+  if (note) showTermToast(note);
+  if (window.cue) cue('error');
+}
+
+function completePendingSubmit() {
+  if (!pendingSubmit) return;
+  const kept = pendingSubmit.text;
+  clearPendingSubmitTimer();
+  pendingSubmit = null;
+  const i = document.getElementById('termInput');
+  if (i && i.value === kept) i.value = '';
+  syncClearTermBtn();
+  setTimeout(refreshPane, 500);
+}
+
+function syncClearTermBtn() {
+  const i = document.getElementById('termInput');
+  const btn = document.getElementById('clearTermBtn');
+  if (!btn) return;
+  btn.hidden = !(i && i.value);
+}
+
+function clearTermInput() {
+  const i = document.getElementById('termInput');
+  if (i) i.value = '';
+  if (pendingSubmit) {
+    clearPendingSubmitTimer();
+    pendingSubmit = null;
+  }
+  if (inputMode === 'slash-live') {
+    exitSlashLive({ submitted: false, scrub: true });
+  }
+  syncClearTermBtn();
+  if (i) i.focus();
+}
+
+function onSubmitAck(msg) {
+  if (!pendingSubmit) return false;
+  if (msg.id && msg.id !== pendingSubmit.id) return false;
+  if (msg.type === 'error') {
+    if (msg.id === pendingSubmit.id) {
+      failPendingSubmit(msg.message || '发送失败，内容已保留');
+      return true;
+    }
+    return false;
+  }
+  if (msg.type !== 'command_result') return false;
+  if (msg.id !== pendingSubmit.id) return false;
+  if (!msg.ok) {
+    failPendingSubmit(msg.note || msg.message || '发送失败，内容已保留');
+    return true;
+  }
+  if (pendingSubmit.phase === 'text' && msg.command === 'send_text') {
+    pendingSubmit.phase = 'enter';
+    try {
+      if (!wsCanSend()) {
+        failPendingSubmit('网络不可用，内容已保留');
+        return true;
+      }
+      ws.send(JSON.stringify({
+        type: 'send_keys', pane_id: pendingSubmit.paneId, keys: ['Enter'], id: pendingSubmit.id,
+      }));
+    } catch (_) {
+      failPendingSubmit('发送失败，内容已保留');
+    }
+    return true;
+  }
+  if ((pendingSubmit.phase === 'enter' || pendingSubmit.phase === 'enter-only') && msg.command === 'send_keys') {
+    completePendingSubmit();
+    return true;
+  }
+  return false;
+}
+
+function submitLiveEnter(inputEl) {
+  if (!activePane || pendingSubmit) return;
+  if (!wsCanSend()) {
+    showTermToast('网络不可用，未发送');
+    if (window.cue) cue('error');
+    return;
+  }
+  const id = newSubmitId();
+  try {
+    ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'], id }));
+  } catch (_) {
+    showTermToast('发送失败，内容已保留');
+    if (window.cue) cue('error');
+    return;
+  }
+  beginPendingSubmit({ text: inputEl ? inputEl.value : '', paneId: activePane, id, phase: 'enter-only' });
+  exitSlashLive({ submitted: true });
+}
+
 function sendText() {
   const i = document.getElementById('termInput');
-  if (!ws || !activePane) return;
+  if (!activePane) return;
+  if (pendingSubmit) return;
   if (inputMode === 'slash-live') {
-    ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'] }));
-    i.value = '';
-    exitSlashLive({ submitted: true });
-    setTimeout(refreshPane, 500);
+    submitLiveEnter(i);
     return;
   }
   if (!i.value) return;
-  ws.send(JSON.stringify({ type: 'send_text', pane_id: activePane, text: i.value }));
-  ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'] }));
-  i.value = '';
-  setTimeout(refreshPane, 500);
+  if (!wsCanSend()) {
+    showTermToast('网络不可用，消息未发送');
+    if (window.cue) cue('error');
+    return;
+  }
+  const text = i.value;
+  const id = newSubmitId();
+  try {
+    ws.send(JSON.stringify({ type: 'send_text', pane_id: activePane, text, id }));
+  } catch (_) {
+    showTermToast('发送失败，内容已保留');
+    if (window.cue) cue('error');
+    return;
+  }
+  beginPendingSubmit({ text, paneId: activePane, id, phase: 'text' });
+  syncClearTermBtn();
 }
 function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(refreshPane,300);}
 function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(refreshPane,300);}
@@ -1700,10 +1859,8 @@ function fireKey(k) {
   if(window.cue) cue('tick');
   if (inputMode === 'slash-live' && (k === 'Escape' || k === 'Enter') && keyQueue.length === 0 && !armedMod) {
     if (k === 'Enter') {
-      sendKeys(['Enter']);
       const input = document.getElementById('termInput');
-      if (input) input.value = '';
-      exitSlashLive({ submitted: true });
+      submitLiveEnter(input);
       return;
     }
     exitSlashLive({ submitted: false, scrub: true });
@@ -2040,17 +2197,10 @@ function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.s
     }
   });
 
+  input.addEventListener('input', () => { syncClearTermBtn(); });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      if (inputMode === 'slash-live') {
-        if (!ws || !activePane) return;
-        ws.send(JSON.stringify({ type: 'send_keys', pane_id: activePane, keys: ['Enter'] }));
-        input.value = '';
-        exitSlashLive({ submitted: true });
-        setTimeout(refreshPane, 500);
-        return;
-      }
       sendText();
       return;
     }
@@ -2136,6 +2286,7 @@ function exitSlashLive({ submitted, scrub, openFallback } = {}) {
   slashMenuSeen = false;
   const input = document.getElementById('termInput');
   if (input && !submitted) input.value = '';
+  syncClearTermBtn();
   setPaneRefreshInterval(BUFFERED_REFRESH_MS);
   if (openFallback) openCommandPaletteFallback();
 }
@@ -2147,6 +2298,7 @@ function enterSlashLive({ seedSlash }) {
   }
   const input = document.getElementById('termInput');
   if (input) input.value = seedSlash ? '/' : (input.value || '');
+  syncClearTermBtn();
   setInputMode('slash-live');
   slashMenuSeen = false;
   setPaneRefreshInterval(SLASH_REFRESH_MS);

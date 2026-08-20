@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>发送 ack 后再清输入框 · herdr-remote</title>
+<style>
+  body { font-family: -apple-system, system-ui, 'PingFang SC', sans-serif; margin: 0; padding: 20px;
+         background: #1a1b26; color: #c0caf5; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: #565f89; font-size: 0.8rem; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 20px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2f3549; }
+  th { color: #565f89; font-weight: 600; font-size: 0.72rem; }
+  td.num { font-family: 'SF Mono', Menlo, monospace; text-align: right; }
+  .pass { color: #9ece6a; font-weight: 600; }
+  .fail { color: #f7768e; font-weight: 600; }
+  #summary { padding: 12px 14px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; }
+  #summary.ok { background: rgba(158,206,106,0.12); border: 1px solid #9ece6a; color: #9ece6a; }
+  #summary.bad { background: rgba(247,118,142,0.12); border: 1px solid #f7768e; color: #f7768e; }
+  .note { font-size: 0.76rem; color: #565f89; margin: -8px 0 18px; }
+  #frame { position: absolute; left: -99999px; top: 0; width: 390px; height: 844px; border: 0; }
+</style>
+</head>
+<body>
+
+<h1>发送 ack 后再清输入框</h1>
+<div class="sub">网络差时 <code>ws.send</code> 进缓冲不等于送达；必须等 relay ack 再删输入</div>
+
+<div id="summary">运行中…</div>
+<div id="results"></div>
+
+<div class="note">
+  加载 <code>../index.html</code>，mock WebSocket，验证 <code>sendText</code>
+  在 send_text + Enter 都成功前保留原文。
+</div>
+
+<iframe id="frame" src="../index.html?v=clear-btn"></iframe>
+
+<script>
+const rows = [];
+let allPass = true;
+let fatal = null;
+
+function record(name, actual, expected, ok) {
+  if (!ok) allPass = false;
+  rows.push({ name, actual, expected, ok });
+}
+
+function mockLiveWs(win, sent) {
+  win.connState = 'connected';
+  win.lastPongAt = Date.now();
+  win.connLiveAt = Date.now();
+  win.activePane = 'w1:p1';
+  win.ws = {
+    readyState: 1,
+    send(data) { sent.push(JSON.parse(data)); },
+  };
+}
+
+function run(win, doc) {
+  const input = doc.getElementById('termInput');
+  if (!input || typeof win.sendText !== 'function' || typeof win.handleMessage !== 'function') {
+    record('sendText / handleMessage / termInput 存在', '缺失', '齐全', false);
+    return;
+  }
+  record('sendText / handleMessage / termInput 存在', '齐全', '齐全', true);
+
+  // ── 成功路径：先发 text，ack 后再 Enter，再 ack 才清空 ──
+  let sent = [];
+  mockLiveWs(win, sent);
+  input.value = 'hello 你好';
+  win.sendText();
+  record('点发送后仍保留原文', input.value, 'hello 你好', input.value === 'hello 你好');
+  record('首包只发 send_text',
+         sent.map(m => m.type).join(','),
+         'send_text',
+         sent.length === 1 && sent[0].type === 'send_text' && sent[0].text === 'hello 你好' && !!sent[0].id);
+
+  const id = sent[0] && sent[0].id;
+  win.handleMessage({ type: 'command_result', command: 'send_text', ok: true, id });
+  record('send_text ack 后才发 Enter',
+         sent.map(m => m.type).join(','),
+         'send_text,send_keys',
+         sent.length === 2 && sent[1].type === 'send_keys' && sent[1].keys && sent[1].keys[0] === 'Enter' && sent[1].id === id);
+  record('Enter 发出后仍保留原文', input.value, 'hello 你好', input.value === 'hello 你好');
+
+  win.handleMessage({ type: 'command_result', command: 'send_keys', ok: true, id });
+  record('Enter ack 后才清空', JSON.stringify(input.value), '""', input.value === '');
+
+  // ── 断线：不发、不清空 ──
+  sent = [];
+  win.connState = 'disconnected';
+  win.ws = { readyState: 3, send() { sent.push('nope'); } };
+  win.activePane = 'w1:p1';
+  input.value = 'keep me';
+  win.sendText();
+  record('断线不发送', String(sent.length), '0', sent.length === 0);
+  record('断线保留原文', input.value, 'keep me', input.value === 'keep me');
+
+  // ── 半开/过期连接：pong 过期则视为不可发 ──
+  sent = [];
+  mockLiveWs(win, sent);
+  win.lastPongAt = Date.now() - 20000;
+  win.connLiveAt = Date.now() - 20000;
+  input.value = 'stale keep';
+  win.sendText();
+  record('过期连接不发送', String(sent.length), '0', sent.length === 0);
+  record('过期连接保留原文', input.value, 'stale keep', input.value === 'stale keep');
+
+  // ── relay 报错：保留原文 ──
+  sent = [];
+  mockLiveWs(win, sent);
+  input.value = 'fail keep';
+  win.sendText();
+  const failId = sent[0] && sent[0].id;
+  win.handleMessage({ type: 'error', message: 'send_text command failed', id: failId });
+  record('失败后保留原文', input.value, 'fail keep', input.value === 'fail keep');
+  record('失败后不再发 Enter',
+         sent.map(m => m.type).join(','),
+         'send_text',
+         sent.length === 1 && sent[0].type === 'send_text');
+
+  // ── 在途时忽略二次发送 ──
+  sent = [];
+  mockLiveWs(win, sent);
+  input.value = 'once';
+  win.sendText();
+  win.sendText();
+  record('在途忽略二次发送', String(sent.length), '1', sent.length === 1);
+  win.handleMessage({ type: 'error', message: 'send_text command failed', id: sent[0].id });
+
+  // ── 一键清空 ──
+  record('clearTermInput 存在', typeof win.clearTermInput, 'function',
+         typeof win.clearTermInput === 'function');
+  const clearBtn = doc.getElementById('clearTermBtn');
+  record('清空按钮存在', clearBtn ? '有' : '无', '有', !!clearBtn);
+  input.value = 'discard me';
+  if (typeof win.syncClearTermBtn === 'function') win.syncClearTermBtn();
+  record('有字时显示清空按钮', clearBtn && !clearBtn.hidden ? 'show' : 'hide', 'show',
+         !!(clearBtn && !clearBtn.hidden));
+  win.clearTermInput();
+  record('一键清空后输入为空', JSON.stringify(input.value), '""', input.value === '');
+  record('清空后隐藏按钮', clearBtn && clearBtn.hidden ? 'hide' : 'show', 'hide',
+         !!(clearBtn && clearBtn.hidden));
+
+  sent.length = 0;
+  mockLiveWs(win, sent);
+  input.value = 'pending';
+  win.sendText();
+  win.clearTermInput();
+  record('在途清空后输入为空', JSON.stringify(input.value), '""', input.value === '');
+  sent.length = 0;
+  input.value = 'next';
+  win.sendText();
+  record('清空后可再发送', sent[0] ? sent[0].text : String(sent.length), 'next',
+         sent.length === 1 && sent[0].text === 'next');
+  if (sent[0]) win.handleMessage({ type: 'error', message: 'send_text command failed', id: sent[0].id });
+}
+
+function finish() {
+  const tbl = ['<table><tr><th>检查项</th><th style="text-align:right">实测</th>' +
+               '<th style="text-align:right">期望</th><th>结论</th></tr>'];
+  for (const r of rows) {
+    tbl.push(`<tr><td>${r.name}</td><td class="num">${r.actual}</td>` +
+             `<td class="num">${r.expected}</td>` +
+             `<td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td></tr>`);
+  }
+  tbl.push('</table>');
+  document.getElementById('results').innerHTML = tbl.join('');
+
+  const s = document.getElementById('summary');
+  s.className = allPass && !fatal ? 'ok' : 'bad';
+  const failed = rows.filter(r => !r.ok).length;
+  s.textContent = fatal ? `✗ 测试无法完成：${fatal}`
+    : allPass ? `✓ 全部 ${rows.length} 项通过`
+              : `✗ ${failed}/${rows.length} 项未达标`;
+
+  window.__SEND_ACK_RESULT__ = { allPass, fatal, rows };
+  window.__SEND_ACK_DONE__ = true;
+}
+
+const frame = document.getElementById('frame');
+frame.addEventListener('load', () => {
+  try { run(frame.contentWindow, frame.contentDocument); }
+  catch (e) { fatal = e.message || String(e); allPass = false; }
+  finish();
+});
+</script>
+</body>
+</html>

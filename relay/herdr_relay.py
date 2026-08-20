@@ -105,6 +105,14 @@ def normalize_key(key: str) -> str:
     return KEY_ALIASES.get(key, key)
 
 
+def attach_request_id(payload, msg):
+    """把客户端请求 id 原样带回，方便 web 把 ack 对上一次发送。"""
+    req_id = msg.get("id") if isinstance(msg, dict) else None
+    if isinstance(req_id, str) and 0 < len(req_id) <= 64:
+        payload["id"] = req_id
+    return payload
+
+
 
 # Cursor Agent 的跟进输入框对「paste 后立刻 Enter」特别敏感：PTY 已写入、
 # TUI 还在消化 bracketed paste 时若收到 Enter，会把 prompt 提交出去，但原文
@@ -1292,11 +1300,11 @@ async def handle_client(ws):
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "unknown pane_id"}, msg))
                     continue
                 raw_keys = msg.get("keys", [])
                 if not all(isinstance(k, str) and k in SAFE_KEYS for k in raw_keys):
-                    await send_to_client(ws, {"type": "error", "message": "keys contain disallowed values"})
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "keys contain disallowed values"}, msg))
                     continue
                 keys = [normalize_key(k) for k in raw_keys]
                 remote = pane_remote_map.get(pane_id)
@@ -1306,30 +1314,40 @@ async def handle_client(ws):
                     returncode, _ = await run_herdr_rc_async("pane", "send-keys", pane_id, *keys, remote=remote)
                 except Exception as e:
                     log.warning("send_keys command failed for pane %s: %s", pane_id, e)
-                    await send_to_client(ws, {"type": "error", "message": "send_keys command failed"})
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "send_keys command failed"}, msg))
                     continue
                 if returncode != 0:
                     log.warning("send_keys command failed for pane %s with exit %s", pane_id, returncode)
-                    await send_to_client(ws, {"type": "error", "message": "send_keys command failed"})
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "send_keys command failed"}, msg))
                     continue
-                await send_to_client(ws, {"type": "command_result", "command": "send_keys", "ok": True})
+                await send_to_client(ws, attach_request_id({"type": "command_result", "command": "send_keys", "ok": True}, msg))
             elif msg_type == "send_text":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
-                    await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "unknown pane_id"}, msg))
                     continue
                 text = msg.get("text", "")
                 if not text or len(text) > 1000:
-                    await send_to_client(ws, {"type": "error", "message": "text empty or too long"})
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "text empty or too long"}, msg))
                     continue
                 remote = pane_remote_map.get(pane_id)
                 log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("send_text", ip, device, pane_id, f"text={text!r}")
-                await run_herdr_async("pane", "send-text", pane_id, text, remote=remote)
-                # Web/Telegram 都是 send_text 后紧跟 send_keys Enter；对 Cursor
-                # 必须在两条命令之间留出 paste settle，否则跟进框会残留原文。
+                try:
+                    returncode, _ = await run_herdr_rc_async("pane", "send-text", pane_id, text, remote=remote)
+                except Exception as e:
+                    log.warning("send_text command failed for pane %s: %s", pane_id, e)
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "send_text command failed"}, msg))
+                    continue
+                if returncode != 0:
+                    log.warning("send_text command failed for pane %s with exit %s", pane_id, returncode)
+                    await send_to_client(ws, attach_request_id({"type": "error", "message": "send_text command failed"}, msg))
+                    continue
+                # Web 等 send_text ack 后再发 Enter；对 Cursor 必须在 paste 与
+                # ack 之间留出 settle，否则跟进框会残留原文。
                 agent_name = (agent_cache.get(pane_id) or {}).get("agent")
                 await settle_after_paste(agent_name)
+                await send_to_client(ws, attach_request_id({"type": "command_result", "command": "send_text", "ok": True}, msg))
             elif msg_type == "pane_zoom":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
