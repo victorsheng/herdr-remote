@@ -247,6 +247,11 @@ body.term-open .term-header { padding-top: calc(3px + env(safe-area-inset-top, 0
    - font-size:0 去掉自身 strut，否则会按继承字号把行框重新顶回整行；
    - height 必须用绝对单位，em/% 都按 font-size:0 折算成 0，空行会被彻底吃掉。 */
 .term-content .blank { display: block; font-size: 0; height: 7px; }
+/* 纯边框行画成一条 1px 细线，上下各留 3px：原样渲染的话一条 60 字符的横线
+   在窄屏会被 overflow-wrap 折成两行，6 行框线要吃掉近 100px。
+   与 .blank 同样需要 font-size:0 与绝对高度（理由见上）。 */
+.term-content .rule { display: block; font-size: 0; height: 1px; margin: 3px 0;
+  background: color-mix(in srgb, var(--term-text) 22%, transparent); }
 .term-content .cjk { display: inline-block; width: 1.2041em; height: calc(var(--term-lh) * 1em); line-height: calc(var(--term-lh) * 1em); text-align: center; overflow: hidden; vertical-align: top; }
 .quick-actions { padding: 6px 10px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
 /* 这是全 App 后果最重的点击（批准 / 拒绝 agent 操作），此前仅 31.5px 高。
@@ -978,6 +983,14 @@ function tryDemo() {
 
 // 空行哨兵：私有区码点，正常 pane 输出里不会出现，也不落在 CJK 宽字符区间。
 const BLANK_MARK = '\uE000BLANK\uE000';
+// 边框行哨兵：同上，另用一个码点区分。
+const RULE_MARK = '\uE001RULE\uE001';
+
+// 纯边框行：只由制表符（box drawing）、粗细横线与空白组成，不含任何文字。
+// agent TUI 的输入框上下边框、状态栏分隔线都是这种行；在真实终端里它们围成
+// 一个框，但 web 端一折行就被拆成一堆孤立线段，信息量为零却占满行高。
+// 注意必须要求至少有一个制表符，否则空行也会命中（空行有自己的哨兵）。
+const RULE_LINE_RE = /^[\s\u2500-\u257f\u2015\u2014\u2013_=-]*[\u2500-\u257f\u2015][\s\u2500-\u257f\u2015\u2014\u2013_=-]*$/;
 
 // East Asian Wide / Fullwidth 区间：终端按 2 个字符格计算这些字符的宽度。
 // 与 .term-content .cjk 的 1.2041em 配合，修正含中文时的列错位。
@@ -989,7 +1002,17 @@ function renderTermContent(text) {
   const lines = text.split('\n');
   const out = [];
   let blankRun = 0;
+  let ruleRun = 0;
   for (const line of lines) {
+    // 纯边框行压成一条 1px 细线，且连续多条只保留一条：截图里
+    // 「Update installed」下面那 6 行横线 + ❯ 其实只是输入框的框线。
+    if (RULE_LINE_RE.test(line)) {
+      blankRun = 0;
+      if (++ruleRun > 1) continue;
+      out.push(RULE_MARK);
+      continue;
+    }
+    ruleRun = 0;
     // 连续空行合并为 1 行：pane 底部常有大段空白，手机上白占屏幕。
     // 这不影响列对齐——空行本来就不参与栅格。
     // 保留下来的那一行再压成半高：段落分组的视觉节奏还在，但手机上一屏
@@ -1001,14 +1024,18 @@ function renderTermContent(text) {
       continue;
     }
     blankRun = 0;
+    ruleRun = 0;
     out.push(line);
   }
   const esc = out.join('\n').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   // 转义实体（&amp; 等）本身只含 ASCII，不会被 CJK 正则误伤。
   const wide = esc.replace(CJK_WIDE_RE, m => `<span class="cjk">${[...m].join('</span><span class="cjk">')}</span>`);
   // 哨兵只含 ASCII 与私有区码点，既不被转义也不落在 CJK 区间，到这里仍是原样。
-  // .blank 是 block，自己就断行，所以把它后面那个 \n 一起吃掉，否则会多空一行。
-  return wide.replace(new RegExp(BLANK_MARK + '\\n?', 'g'), '<span class="blank"></span>');
+  // .blank / .rule 都是 block，自己就断行，所以把它后面那个 \n 一起吃掉，
+  // 否则会多空一行。
+  return wide
+    .replace(new RegExp(BLANK_MARK + '\\n?', 'g'), '<span class="blank"></span>')
+    .replace(new RegExp(RULE_MARK + '\\n?', 'g'), '<span class="rule"></span>');
 }
 
 function handleMessage(msg) {
