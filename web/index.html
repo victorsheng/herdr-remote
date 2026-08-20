@@ -176,13 +176,20 @@ body { line-height: 1.2; }
    此处必须一起加，否则终端视图会盖住 header 或错位。 */
 .terminal-view { display: none; flex-direction: column; position: fixed; inset: 0; top: calc(var(--header-h) + env(safe-area-inset-top, 0px)); bottom: var(--kb-inset, 0px); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); background: var(--bg); z-index: 50; }
 .terminal-view.active { display: flex; }
-.term-header { padding: 6px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-.term-header .back { position: relative; background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 8px; min-width: 40px; min-height: 40px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 8px; }
+/* 窄屏进终端后全局 header 是纯重复信息（连接态与 agent 数已收进终端顶栏），
+   却要吃掉 47px + 刘海安全区。这里整条隐藏，终端上移到安全区顶部。
+   桌面端不适用——那里终端与列表并存，header 是唯一的返回/设置入口。 */
+body.term-open > .header { display: none; }
+body.term-open .terminal-view.active { top: 0; }
+body.term-open .term-header { padding-top: calc(3px + env(safe-area-inset-top, 0px)); }
+.term-header { padding: 3px 6px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.term-header .back { position: relative; background: none; border: none; color: var(--blue); font-size: 1.4rem; cursor: pointer; padding: 6px; min-width: 34px; min-height: 34px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 8px; }
+.term-header .dot { width: 7px; height: 7px; flex-shrink: 0; margin-right: 2px; }
 .term-header .title { flex: 1; min-width: 0; font-size: 0.85rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 右侧动作：用真实 40×40 触控区 + 间距，禁止再用重叠的 ::after 外扩（4 个 44px
    热区叠在一起正是 git/窄屏/缩放 容易误点的原因）。 */
 .term-header-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; position: relative; }
-.term-header .refresh-btn { position: relative; background: none; border: none; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px; padding: 8px; border-radius: 8px; flex-shrink: 0; -webkit-tap-highlight-color: transparent; }
+.term-header .refresh-btn { position: relative; background: none; border: none; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; min-width: 34px; min-height: 34px; padding: 6px; border-radius: 8px; flex-shrink: 0; -webkit-tap-highlight-color: transparent; }
 .term-header .refresh-btn:active { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
 .term-header .refresh-btn.active-layout { color: var(--blue); }
 /* 缩放/窄屏收进菜单，避免顶栏四个图标挤在一起误触把 pane 挤成一条 */
@@ -225,7 +232,7 @@ body { line-height: 1.2; }
    故回退为折行。宽表格的列对齐在窄屏下暂无两全解法。 */
 /* 等宽终端内容行距取 1.25：终端本身是逐行栅格，行距过大反而割裂上下文。
    低于 1.2 时中文的 ascender 会与上一行 descender 相撞。 */
-.term-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 6px 8px; background: var(--term-bg); font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.8rem; line-height: var(--term-lh); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+.term-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 4px; background: var(--term-bg); font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.8rem; line-height: var(--term-lh); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 /* 终端列对齐修正：终端（tmux/herdr）按 East Asian Width 把每个汉字算作 2 个字符格，
    但浏览器里汉字前进宽度是 1em，而 Menlo 拉丁前进宽度仅 0.60205em，比值恒为 1.661。
    换任何中文字体都无法改变（苹方/黑体/宋体的汉字都是 1em），结果含中文的行里
@@ -234,6 +241,12 @@ body { line-height: 1.2; }
    inline-block 让 width 生效；用 width 而非 font-size 缩放，避免字号被放大得比周围文字突兀。 */
 /* height/line-height 继承行框，避免 inline-block 的默认基线行为把行撑高（18.5px vs 15px 行框），
    否则中英混排时行距会忽宽忽窄。 */
+/* 空行压到约半高（7px vs 整行 15.4px）：pane 段落之间空行很多，
+   手机上每个都吃满行高太浪费。三个声明都是必需的：
+   - display:block 自己就断行，故渲染时要把紧随的 \n 一起吃掉，否则多空一行；
+   - font-size:0 去掉自身 strut，否则会按继承字号把行框重新顶回整行；
+   - height 必须用绝对单位，em/% 都按 font-size:0 折算成 0，空行会被彻底吃掉。 */
+.term-content .blank { display: block; font-size: 0; height: 7px; }
 .term-content .cjk { display: inline-block; width: 1.2041em; height: calc(var(--term-lh) * 1em); line-height: calc(var(--term-lh) * 1em); text-align: center; overflow: hidden; vertical-align: top; }
 .quick-actions { padding: 6px 10px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
 /* 这是全 App 后果最重的点击（批准 / 拒绝 agent 操作），此前仅 31.5px 高。
@@ -332,6 +345,11 @@ body { line-height: 1.2; }
   body { max-width: 960px; margin: 0 auto; padding: 0 16px; }
   .terminal-view { position: static; display: none; }
   .terminal-view.active { display: flex; height: calc(100dvh - var(--header-h)); }
+  /* 桌面端终端与列表并存，header 是唯一的返回/设置入口，必须撤销窄屏的收起规则 */
+  body.term-open > .header { display: flex; }
+  body.term-open .terminal-view.active { top: auto; }
+  body.term-open .term-header { padding-top: 3px; }
+  .term-header .dot { display: none; }
   .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
   .section-header { grid-column: 1 / -1; }
   .chip-strip { grid-column: 1 / -1; }
@@ -403,6 +421,8 @@ body { line-height: 1.2; }
 <div class="terminal-view" id="terminalView">
   <div class="term-header">
     <button class="back" onclick="closeTerminal()" aria-label="Back to agent list"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
+    <!-- 全局 header 在窄屏被隐藏，连接态靠这个小圆点保留；颜色由 refreshConnLabel 统一写入 -->
+    <span class="dot" id="termStatusDot" title="连接状态"></span>
     <span class="title" id="termTitle"></span>
     <div class="term-header-actions">
       <button class="refresh-btn" id="layoutMenuBtn" onclick="toggleLayoutMenu(event)" aria-label="Layout" aria-haspopup="true" aria-expanded="false" title="布局（缩放 / 窄屏）"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="18" rx="1"/></svg></button>
@@ -784,11 +804,18 @@ function dataAgeSuffix() {
   return `<span style="color:${dataAgeColor(age)}"> │ ${fmtAge(age)}</span>`;
 }
 
+/** 把 header 圆点的颜色同步到终端顶栏的镜像圆点上。 */
+function mirrorStatusDot(color) {
+  const d = document.getElementById('termStatusDot');
+  if (d) d.style.background = color;
+}
+
 function refreshConnLabel() {
   const dot = document.getElementById('statusDot');
   const label = document.getElementById('connLabel');
   if (connState === 'connecting') {
     dot.style.background = 'var(--orange)';
+    mirrorStatusDot('var(--orange)');
     label.textContent = 'connecting…';
     label.style.color = 'var(--orange)';
     scheduleDataAgeTick();
@@ -796,6 +823,7 @@ function refreshConnLabel() {
   }
   if (connState !== 'connected') {
     dot.style.background = 'var(--red)';
+    mirrorStatusDot('var(--red)');
     label.textContent = 'offline';
     label.style.color = 'var(--red)';
     scheduleDataAgeTick();
@@ -822,6 +850,7 @@ function refreshConnLabel() {
   const age = dataAgeMs();
   dot.style.background = (age != null && age >= DATA_FRESH_MS && !isStale)
     ? dataAgeColor(age) : rttColorVal;
+  mirrorStatusDot(dot.style.background);
   scheduleDataAgeTick();
 }
 
@@ -947,6 +976,9 @@ function tryDemo() {
   connect();
 }
 
+// 空行哨兵：私有区码点，正常 pane 输出里不会出现，也不落在 CJK 宽字符区间。
+const BLANK_MARK = '\uE000BLANK\uE000';
+
 // East Asian Wide / Fullwidth 区间：终端按 2 个字符格计算这些字符的宽度。
 // 与 .term-content .cjk 的 1.2041em 配合，修正含中文时的列错位。
 const CJK_WIDE_RE = /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]+/g;
@@ -960,9 +992,12 @@ function renderTermContent(text) {
   for (const line of lines) {
     // 连续空行合并为 1 行：pane 底部常有大段空白，手机上白占屏幕。
     // 这不影响列对齐——空行本来就不参与栅格。
+    // 保留下来的那一行再压成半高：段落分组的视觉节奏还在，但手机上一屏
+    // 十来个空行不再白吃十来个整行行高。这里只放哨兵字符串，实际标签由
+    // 下面统一转义之后再替换，否则拼进去的 HTML 会被转义成字面量。
     if (line.trim() === '') {
       if (++blankRun > 1) continue;
-      out.push('');
+      out.push(BLANK_MARK);
       continue;
     }
     blankRun = 0;
@@ -970,7 +1005,10 @@ function renderTermContent(text) {
   }
   const esc = out.join('\n').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   // 转义实体（&amp; 等）本身只含 ASCII，不会被 CJK 正则误伤。
-  return esc.replace(CJK_WIDE_RE, m => `<span class="cjk">${[...m].join('</span><span class="cjk">')}</span>`);
+  const wide = esc.replace(CJK_WIDE_RE, m => `<span class="cjk">${[...m].join('</span><span class="cjk">')}</span>`);
+  // 哨兵只含 ASCII 与私有区码点，既不被转义也不落在 CJK 区间，到这里仍是原样。
+  // .blank 是 block，自己就断行，所以把它后面那个 \n 一起吃掉，否则会多空一行。
+  return wide.replace(new RegExp(BLANK_MARK + '\\n?', 'g'), '<span class="blank"></span>');
 }
 
 function handleMessage(msg) {
@@ -1695,6 +1733,9 @@ function openTerminal(paneId) {
   document.getElementById('termTitle').textContent = a?`${a.label||a.project} · ${a.agent}`:paneId;
   document.getElementById('agentListView').style.display = 'none';
   document.getElementById('terminalView').classList.add('active');
+  // 窄屏下收起全局 header，把那 47px 还给终端内容（见 body.term-open 规则）
+  document.body.classList.add('term-open');
+  refreshConnLabel();
   updateNarrowBtn();
   const qa = document.getElementById('quickActions');
   const ak = document.getElementById('actionKeys');
@@ -1725,6 +1766,7 @@ function closeTerminal() {
   paneLineCache = [];
   activePane = null; clearInterval(refreshInterval);
   document.getElementById('terminalView').classList.remove('active');
+  document.body.classList.remove('term-open');
   document.getElementById('agentListView').style.display = '';
 }
 
