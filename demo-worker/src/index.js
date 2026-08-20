@@ -28,7 +28,7 @@ export default {
 
     const blockedPrompt = `Do you want to allow this tool call?\n\nTool: write_file\nPath: src/components/Graph.tsx\n\n> yes, single permission\n> trust, always allow\n> no (tab to edit)`;
 
-    server.send(JSON.stringify({ type: 'agents', agents }));
+    server.send(JSON.stringify({ type: 'agents', agents, ts: Date.now() }));
     server.send(JSON.stringify({
       type: 'blocked', pane_id: 'demo:3', agent: 'kiro', project: 'orbit-ui',
       prompt: blockedPrompt, host: 'local',
@@ -40,7 +40,7 @@ export default {
       const statuses = ['working', 'idle', 'blocked'];
       agents[idx].status = statuses[Math.floor(Math.random() * statuses.length)];
       try {
-        server.send(JSON.stringify({ type: 'agents', agents }));
+        server.send(JSON.stringify({ type: 'agents', agents, ts: Date.now() }));
         if (agents[idx].status === 'blocked') {
           server.send(JSON.stringify({
             type: 'blocked', pane_id: agents[idx].pane_id, agent: agents[idx].agent,
@@ -61,13 +61,13 @@ export default {
           server.send(JSON.stringify({ type: 'pong', t }));
         } else if (msg.type === 'read_pane') {
           server.send(JSON.stringify({
-            type: 'pane_content', pane_id: msg.pane_id,
+            type: 'pane_content', pane_id: msg.pane_id, ts: Date.now(),
             content: `$ herdr agent session\n\n[demo mode -- read-only preview]\n\nAgent: ${msg.pane_id.split(':')[1]}\nProject: ${agents.find(a => a.pane_id === msg.pane_id)?.project || 'unknown'}\n\n  Compiled successfully\n  Running tests...\n\n  PASS src/index.test.ts\n  PASS src/utils.test.ts\n\nAll tests passed.`
           }));
         } else if (msg.type === 'respond') {
           const a = agents.find(x => x.pane_id === msg.pane_id);
           if (a) a.status = 'working';
-          server.send(JSON.stringify({ type: 'agents', agents }));
+          server.send(JSON.stringify({ type: 'agents', agents, ts: Date.now() }));
         }
       } catch {}
     });

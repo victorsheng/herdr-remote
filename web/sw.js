@@ -2,7 +2,7 @@
 
 // 版本号必须随资源改动递增：缓存键换名后旧缓存会在 activate 阶段被清掉，
 // 否则改版后用户会一直吃到旧的 index.html。
-const CACHE = 'herdr-shell-v2';
+const CACHE = 'herdr-shell-v3';
 
 // 应用外壳：index.html 是单文件应用，装上它 + 图标就能离线打开。
 // 不预缓存 esm.sh 的第三方模块——它只提供音效，且跨域请求失败会让

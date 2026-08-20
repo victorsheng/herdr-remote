@@ -45,6 +45,9 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 HERDR = os.environ.get("HERDR_BIN") or shutil.which("herdr") or "/opt/homebrew/bin/herdr"
 WS_PORT = int(os.environ.get("HERDR_RELAY_PORT", "8375"))
 POLL_INTERVAL = 2
+# pane 推送两轮之间的让路间隔。read 本身约 7s（herdr 侧固有开销），
+# 所以这里不需要大，只是别把事件循环占满。
+PANE_PUSH_GAP = 0.5
 AUTH_TOKEN = os.environ.get("HERDR_RELAY_TOKEN", "")  # Optional: shared secret for relay auth
 
 # VAPID Web Push
@@ -69,13 +72,26 @@ CHROME_RE = re.compile(
 
 clients = set()
 BIN_GZIP_CAP = "bin-gzip-v1"
-BIN_GZIP_TYPES = frozenset({"agents", "pane_content", "git_diff", "git_show"})
+BIN_GZIP_TYPES = frozenset({"agents", "pane_content", "pane_delta", "git_diff", "git_show"})
+# 服务端主动推 pane 变化 + 只发增量行。客户端声明后才启用，
+# 老客户端继续走 read_pane 全量拉取那条路。
+PANE_PUSH_CAP = "pane-push-v1"
 client_caps = {}  # ws -> set[str]
+# ws -> {"pane_id": str, "lines": int}：客户端当前打开哪个 pane。
+# 只有被订阅的 pane 才在 poll 里读内容，避免为没人看的 pane 白跑 herdr。
+pane_subs = {}
+# (ws, pane_id) -> (lines, [行文本])：上次推给「这个客户端」的内容，用来算增量。
+# 按 ws 分开存：两个客户端看同一 pane 时基线可能不同，共用一份会发错增量。
+# 按 lines 存是因为 loadMore 会改窗口大小，窗口一变就得重发全量。
+pane_last_sent = {}
 last_statuses = {}
 event_queue = asyncio.Queue()
 pane_remote_map = {}
 known_panes = set()
 agent_cache = {}
+# agent_cache 最后一次被轮询填充的墙钟毫秒。客户端用它算"内容年龄"：
+# WS 心跳只能证明管子通，证明不了 relay→herdr 这一段还活着。
+agent_cache_ts = 0
 # workspace_id -> display label from `herdr workspace list` / rename.
 # Pane list only has cwd basename as "project"; Space chips need this label.
 workspace_label_cache = {}
@@ -952,9 +968,95 @@ def encode_for_client(msg: dict, caps) -> str | bytes:
     return frame
 
 
+def build_pane_delta(prev_state, pane_id, lines, content):
+    """把整屏内容压成增量消息。返回 (msg, new_state)。
+
+    终端画面有两种典型变化，都要覆盖：
+
+    1. 屏没满，尾部追加 → 公共前缀不变，发 keep + tail 即可。
+    2. 屏已满，每来一行新输出顶部就滚掉一行 → 首行就变了，纯前缀比对
+       会误判成「整屏皆变」而退回全量。这是最常见的形态，所以额外找一次
+       滚动偏移：若 prev 去掉前 k 行等于 cur 的前若干行，就只发尾部，
+       并带上 drop=k 告诉客户端「先扔掉自己头上 k 行」。
+
+    lines 变了（loadMore）直接全量，省得处理窗口错位。
+    """
+    cur = content.split("\n")
+    prev_lines, prev = prev_state if prev_state else (None, None)
+    new_state = (lines, cur)
+
+    if prev is None or prev_lines != lines:
+        return None, new_state  # 无基线或窗口变了 → 调用方发全量
+
+    if prev == cur:
+        return {"type": "pane_delta", "pane_id": pane_id, "unchanged": True}, new_state
+
+    def _msg(drop, keep, tail):
+        m = {"type": "pane_delta", "pane_id": pane_id,
+             "keep": keep, "tail": tail, "total": len(cur)}
+        if drop:
+            m["drop"] = drop
+        return m
+
+    # 情况 1：公共前缀（屏未满的纯追加，或末行原地改写）
+    keep = 0
+    for a, b in zip(prev, cur):
+        if a != b:
+            break
+        keep += 1
+    if keep > 0:
+        return _msg(0, keep, cur[keep:]), new_state
+
+    # 情况 2：头部滚动。找最小的 drop，使 prev[drop:] 是 cur 的前缀。
+    # 限制搜索范围：滚动超过半屏就不如直接发全量了。
+    limit = min(len(prev), max(1, len(cur) // 2))
+    for drop in range(1, limit + 1):
+        kept = prev[drop:]
+        if not kept:
+            break
+        if cur[:len(kept)] == kept:
+            tail = cur[len(kept):]
+            # 只有真的省了才用增量，否则全量更省事。
+            if len(tail) + 1 < len(cur):
+                return _msg(drop, len(kept), tail), new_state
+            break
+
+    # 整屏都变了（clear / 切 TUI 视图），增量不划算，退回全量。
+    return None, new_state
+
+
+async def send_pane_update(ws, pane_id, lines, content, *, force_full=False):
+    """给单个客户端发 pane 内容，能增量就增量。"""
+    caps = client_caps.get(ws, set())
+    ts = int(time.time() * 1000)
+    if PANE_PUSH_CAP in caps:
+        key = (ws, pane_id)
+        prev_state = None if force_full else pane_last_sent.get(key)
+        msg, new_state = build_pane_delta(prev_state, pane_id, lines, content)
+        pane_last_sent[key] = new_state
+        if msg is not None:
+            msg["ts"] = ts
+            await send_to_client(ws, msg)
+            return
+    await send_to_client(ws, {
+        "type": "pane_content", "pane_id": pane_id, "content": content, "ts": ts,
+    })
+
+
 async def send_to_client(ws, msg: dict):
     data = encode_for_client(msg, client_caps.get(ws, set()))
     await ws.send(data)
+
+
+def forget_client(ws):
+    """连接没了就把它的所有 per-client 状态一起丢掉。
+
+    pane_last_sent 是按 (ws, pane_id) 存的，不清理会随重连次数无限涨。
+    """
+    client_caps.pop(ws, None)
+    pane_subs.pop(ws, None)
+    for key in [k for k in pane_last_sent if k[0] is ws]:
+        pane_last_sent.pop(key, None)
 
 
 async def broadcast(msg):
@@ -970,7 +1072,68 @@ async def broadcast(msg):
         log.debug("Removed %d dead client(s)", len(dead))
     clients.difference_update(dead)
     for ws in dead:
-        client_caps.pop(ws, None)
+        forget_client(ws)
+
+
+async def push_subscribed_panes():
+    """把被订阅 pane 的变化主动推给客户端。
+
+    这是替掉前端 setInterval(refreshPane) 的那一半：以前每个客户端
+    每 3 秒（slash 模式 0.4 秒）拉一次全屏，跨国链路上光 RTT 就吃掉大半；
+    现在由 relay 侧读一次、比对、只在有变化时发增量。
+
+    同一个 pane 被多个客户端订阅时只读一次 herdr，读的结果各自算增量。
+    """
+    if not pane_subs:
+        return
+    # 先按 (pane_id, lines) 归组，避免同一 pane 读多遍。
+    wanted = {}
+    for ws, sub in list(pane_subs.items()):
+        if ws not in clients:
+            pane_subs.pop(ws, None)
+            continue
+        wanted.setdefault((sub["pane_id"], sub["lines"]), []).append(ws)
+
+    for (pane_id, lines), subscribers in wanted.items():
+        if pane_id not in known_panes:
+            continue
+        remote = pane_remote_map.get(pane_id)
+        try:
+            content = await run_herdr_async(
+                "pane", "read", pane_id, "--lines", str(lines),
+                "--source", "recent", remote=remote,
+            )
+        except Exception:
+            log.debug("pane push read failed for %s", pane_id, exc_info=True)
+            continue
+        for ws in subscribers:
+            try:
+                await send_pane_update(ws, pane_id, lines, content)
+            except (ConnectionClosedError, ConnectionClosedOK):
+                pane_subs.pop(ws, None)
+            except Exception:
+                log.debug("pane push send failed", exc_info=True)
+
+
+async def pane_push_loop():
+    """独立于 agent 轮询的 pane 推送循环。
+
+    刻意不放在 poll_loop 里：实测 `herdr pane read` 单次要 ~7s（纯等待，
+    不是计算），而 _poll_once 只要 ~0.04s。串在一起会把 agent 列表的刷新
+    也拖到 7s 一轮，比改造前更糟。分开跑，两者各自按自己的节奏。
+
+    没人订阅时空转，代价只是一次字典判空。
+    """
+    while True:
+        if pane_subs:
+            try:
+                await push_subscribed_panes()
+            except Exception:
+                log.exception("pane push cycle failed; retrying")
+            # read 本身就是主要耗时，这里只留一个很短的让路间隔。
+            await asyncio.sleep(PANE_PUSH_GAP)
+        else:
+            await asyncio.sleep(POLL_INTERVAL)
 
 
 async def poll_loop():
@@ -1004,13 +1167,16 @@ async def announce_blocked(pane_id, *, agent, project, host, remote):
 
 
 async def _poll_once():
+        global agent_cache_ts
         agents = await get_all_agents_async()
         # Always broadcast (even empty list) so clients stay in sync
         for a in agents:
             pane_remote_map[a["pane_id"]] = a.get("remote")
             known_panes.add(a["pane_id"])
             agent_cache[a["pane_id"]] = a
-        await broadcast({"type": "agents", "agents": agents})
+        # 采集完成的时刻，而不是发送时刻：客户端要的是数据本身有多老。
+        agent_cache_ts = int(time.time() * 1000)
+        await broadcast({"type": "agents", "agents": agents, "ts": agent_cache_ts})
         for a in agents:
             pid, status = a["pane_id"], a["status"]
             if status == "blocked" and last_statuses.get(pid) != "blocked":
@@ -1034,6 +1200,7 @@ async def _poll_once():
 
 
 async def event_push():
+    global agent_cache_ts
     while True:
         event = await event_queue.get()
         pane_id = event.get("pane_id", "")
@@ -1095,7 +1262,10 @@ async def event_push():
             known_panes.add(pane_id)
             pane_remote_map.setdefault(pane_id, None)
             agent_cache[pane_id] = {**agent_cache.get(pane_id, {}), **update["agent"]}
-            await broadcast(update)
+            # 事件路径的数据比轮询更新鲜，同样刷新新鲜度时钟，
+            # 否则 hook 一直在推、UI 却因为轮询卡住而报"内容陈旧"。
+            agent_cache_ts = int(time.time() * 1000)
+            await broadcast({**update, "ts": agent_cache_ts})
 
 
 async def process_request(connection, request):
@@ -1236,7 +1406,13 @@ async def handle_client(ws):
     # 此时 hello 通常尚未到达，首包多半是明文 JSON；后续白名单消息在
     # hello(bin-gzip-v1) 之后走 HGZ1。传输层 permessage-deflate 仍覆盖首包。
     try:
-        await send_to_client(ws, {"type": "agents", "agents": list(agent_cache.values())})
+        # ts 用缓存的采集时刻，不用当下：刚连上就显示"0s 前"是假的，
+        # 这份快照可能已经躺了将近一个 POLL_INTERVAL。
+        await send_to_client(ws, {
+            "type": "agents",
+            "agents": list(agent_cache.values()),
+            "ts": agent_cache_ts or int(time.time() * 1000),
+        })
     except Exception as e:
         log.debug("Initial snapshot not delivered to %s: %s", ip, e)
 
@@ -1260,6 +1436,10 @@ async def handle_client(ws):
                     client_caps[ws] = {str(c) for c in caps if isinstance(c, str)}
                 else:
                     client_caps[ws] = set()
+                # 回一份「双方都认」的能力集。客户端据此决定是否关掉定时轮询——
+                # 光看自己声明过不够，得确认这版 relay 真的会推。
+                agreed = sorted(client_caps[ws] & {BIN_GZIP_CAP, PANE_PUSH_CAP})
+                await send_to_client(ws, {"type": "hello_ack", "caps": agreed})
                 continue
             elif msg_type == "respond":
                 pane_id = msg["pane_id"]
@@ -1293,10 +1473,24 @@ async def handle_client(ws):
                 if pane_id not in known_panes:
                     await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
-                lines = msg.get("lines", "30")
+                try:
+                    lines = max(1, min(int(msg.get("lines", 30)), 5000))
+                except (TypeError, ValueError):
+                    lines = 30
                 remote = pane_remote_map.get(pane_id)
                 content = await run_herdr_async("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
-                await send_to_client(ws, {"type": "pane_content", "pane_id": pane_id, "content": content})
+                # 登记订阅：之后 poll_loop 发现这个 pane 有变化就主动推，
+                # 客户端不必再定时全量拉。显式 read_pane 一律发全量，
+                # 因为客户端可能是刚打开视图、手里没有基线。
+                if PANE_PUSH_CAP in client_caps.get(ws, set()):
+                    pane_subs[ws] = {"pane_id": pane_id, "lines": lines}
+                await send_pane_update(ws, pane_id, lines, content, force_full=True)
+            elif msg_type == "unwatch_pane":
+                # 客户端关掉终端视图。不退订的话 relay 会一直为没人看的
+                # pane 跑 herdr read，白烧 CPU 和 SSH 往返。
+                pane_subs.pop(ws, None)
+                for key in [k for k in pane_last_sent if k[0] is ws]:
+                    pane_last_sent.pop(key, None)
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
@@ -1701,7 +1895,7 @@ async def handle_client(ws):
         duration = int(time.monotonic() - connected_at)
         log.info("Client disconnected: ip=%s device=%s duration=%ds", ip, device, duration)
         clients.discard(ws)
-        client_caps.pop(ws, None)
+        forget_client(ws)
 
 
 class UDPPlugin(asyncio.DatagramProtocol):
@@ -1744,6 +1938,7 @@ async def main():
     except OSError:
         log.warning("UDP 8376 in use, plugin push disabled")
     asyncio.create_task(poll_loop())
+    asyncio.create_task(pane_push_loop())
     asyncio.create_task(event_push())
     # permessage-deflate: browsers negotiate automatically when offered
     server = await serve(

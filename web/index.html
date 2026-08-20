@@ -562,6 +562,16 @@ const PING_INTERVAL_MS = 5000;
 const STALE_MS = 15000;
 const RTT_GOOD_MS = 150;
 const RTT_OK_MS = 400;
+/**
+ * 内容新鲜度：relay 打在 agents / agent_update / pane_content 上的采集时刻。
+ * 与 RTT 是两件事——WS 心跳只证明管子通，relay→herdr 那段断了心跳照样绿。
+ */
+let lastDataTs = 0;
+/** 内容年龄阈值。轮询本身就 2s（relay 的 POLL_INTERVAL），所以放得比 RTT 宽得多。 */
+const DATA_FRESH_MS = 4000;
+const DATA_STALE_MS = 10000;
+/** 年龄读数只在超过 DATA_FRESH_MS 时才追加显示，正常态保持现在的干净样子。 */
+let dataAgeTimer = null;
 /** workspace_id → label；含尚无 agent 的空 Space，避免 + 后芯片消失 */
 let workspaceLabels = {};
 /** workspace_id → true/false；最近一次 git status 是否 dirty，用于芯片提示 */
@@ -628,8 +638,12 @@ function toggleSettings() {
   if (show) {
     if (ws && ws.readyState === 1) {
       const rtt = lastRttMs != null ? ` · ${lastRttMs}ms` : '';
+      // 设置面板里年龄常显（空间不紧张），方便排查"绿灯但内容不动"。
+      const age = dataAgeMs();
+      const ageTxt = age != null
+        ? ` · <span style="color:${dataAgeColor(age)}">data ${fmtAge(age)}</span>` : '';
       document.getElementById('settingsStatus').innerHTML =
-        `<span style="color:${rttColor(lastRttMs)}">● Connected${rtt}</span> · ${agents.length} agents`;
+        `<span style="color:${rttColor(lastRttMs)}">● Connected${rtt}</span>${ageTxt} · ${agents.length} agents`;
     } else {
       document.getElementById('settingsStatus').innerHTML =
         `<span style="color:var(--red)">● Disconnected</span>`;
@@ -680,6 +694,66 @@ function rttColor(ms) {
   return 'var(--red)';
 }
 
+/** 内容年龄毫秒；没收到过带 ts 的数据则返回 null（不显示，不猜）。 */
+function dataAgeMs() {
+  if (!lastDataTs) return null;
+  return Math.max(0, Date.now() - lastDataTs);
+}
+
+function dataAgeColor(ms) {
+  if (ms == null || ms < DATA_FRESH_MS) return 'var(--green)';
+  if (ms < DATA_STALE_MS) return 'var(--orange)';
+  return 'var(--red)';
+}
+
+/** 3.2s / 47s / 4m —— 越老越粗粒度，避免长数字挤爆窄屏。 */
+function fmtAge(ms) {
+  // 9.95s~10s 用 toFixed(1) 会进位成 "10.0s"，和下一档的 "10s" 撞脸，
+  // 看着像颜色跳了字没变；这一段直接归到整秒档。
+  if (ms < 9950) return (ms / 1000).toFixed(1) + 's';
+  if (ms < 60000) return Math.round(ms / 1000) + 's';
+  if (ms < 3600000) return Math.round(ms / 60000) + 'm';
+  return Math.round(ms / 3600000) + 'h';
+}
+
+/**
+ * 记录 relay 的采集时刻。宽进严出：没有 ts 或非法就不动 lastDataTs，
+ * 宁可不显示，也不要拿收包时间冒充采集时间。
+ */
+function noteDataTs(msg) {
+  const t = Number(msg && msg.ts);
+  if (!Number.isFinite(t) || t <= 0) return;
+  // 时钟偏移可能让 relay 的 ts 略超前本地时间，钳到现在避免出现负龄。
+  lastDataTs = Math.min(t, Date.now());
+  refreshConnLabel();
+}
+
+/**
+ * 内容陈旧时才需要按秒自走的读数；新鲜时停掉定时器，
+ * 省掉后台标签页里每秒一次的无用重绘。
+ */
+function clearDataAgeTimer() {
+  if (!dataAgeTimer) return;
+  // setTimeout / setInterval 在浏览器里共用同一 ID 空间，两个都清一遍最省心。
+  clearTimeout(dataAgeTimer);
+  clearInterval(dataAgeTimer);
+  dataAgeTimer = null;
+}
+
+function scheduleDataAgeTick() {
+  clearDataAgeTimer();
+  if (connState !== 'connected' || !lastDataTs) return;
+  const age = dataAgeMs();
+  if (age == null) return;
+  if (age < DATA_FRESH_MS) {
+    // 还没超阈值：只在刚好跨过阈值的那一刻醒一次，不做每秒轮转。
+    dataAgeTimer = setTimeout(() => { dataAgeTimer = null; refreshConnLabel(); },
+      Math.max(250, DATA_FRESH_MS - age));
+    return;
+  }
+  dataAgeTimer = setInterval(() => { refreshConnLabel(); }, 1000);
+}
+
 function sendPing() {
   if (!ws || ws.readyState !== 1 || document.hidden) return;
   try { ws.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch (_) {}
@@ -700,6 +774,16 @@ function startPingLoop() {
   resetStaleTimer();
 }
 
+/**
+ * 内容陈旧时追加的那一段（含前导分隔符），新鲜时返回空串。
+ * 这是 B 方案的核心：正常态维持"live · 87ms"不变，出问题才占位。
+ */
+function dataAgeSuffix() {
+  const age = dataAgeMs();
+  if (age == null || age < DATA_FRESH_MS) return '';
+  return `<span style="color:${dataAgeColor(age)}"> │ ${fmtAge(age)}</span>`;
+}
+
 function refreshConnLabel() {
   const dot = document.getElementById('statusDot');
   const label = document.getElementById('connLabel');
@@ -707,35 +791,47 @@ function refreshConnLabel() {
     dot.style.background = 'var(--orange)';
     label.textContent = 'connecting…';
     label.style.color = 'var(--orange)';
+    scheduleDataAgeTick();
     return;
   }
   if (connState !== 'connected') {
     dot.style.background = 'var(--red)';
     label.textContent = 'offline';
     label.style.color = 'var(--red)';
+    scheduleDataAgeTick();
     return;
   }
   const ref = lastPongAt || connLiveAt;
   const isStale = ref > 0 && (Date.now() - ref >= STALE_MS);
+  // RTT 段的文字与颜色照旧；内容年龄段独立着色后追加，互不干扰。
+  const suffix = dataAgeSuffix();
+  let rttText, rttColorVal;
   if (isStale) {
-    dot.style.background = 'var(--red)';
-    label.textContent = lastRttMs != null ? `live · ${lastRttMs}ms` : 'live · —';
-    label.style.color = 'var(--red)';
-    return;
-  }
-  if (lastRttMs != null) {
-    const color = rttColor(lastRttMs);
-    dot.style.background = color;
-    label.textContent = `live · ${lastRttMs}ms`;
-    label.style.color = color;
+    rttText = lastRttMs != null ? `live · ${lastRttMs}ms` : 'live · —';
+    rttColorVal = 'var(--red)';
+  } else if (lastRttMs != null) {
+    rttText = `live · ${lastRttMs}ms`;
+    rttColorVal = rttColor(lastRttMs);
   } else {
-    dot.style.background = 'var(--green)';
-    label.textContent = 'live';
-    label.style.color = 'var(--green)';
+    rttText = 'live';
+    rttColorVal = 'var(--green)';
   }
+  label.innerHTML = `<span style="color:${rttColorVal}">${rttText}</span>${suffix}`;
+  label.style.color = rttColorVal;
+  // 圆点取两者里更糟的那个：内容冻住时不该还亮着绿灯。
+  const age = dataAgeMs();
+  dot.style.background = (age != null && age >= DATA_FRESH_MS && !isStale)
+    ? dataAgeColor(age) : rttColorVal;
+  scheduleDataAgeTick();
 }
 
 const BIN_GZIP_CAP = 'bin-gzip-v1';
+// 服务端主动推 pane 变化 + 只发增量行。声明后前端就不再定时全量拉屏。
+const PANE_PUSH_CAP = 'pane-push-v1';
+// relay 确认会主动推之后置 true；老版本 relay 不回 hello_ack，保持 false 走老路。
+let panePushActive = false;
+// 推送模式下的兜底轮询间隔：正常情况用不上，纯粹防推送链路静默中断。
+const PANE_PUSH_FALLBACK_MS = 15000;
 
 async function gunzipU8(data) {
   if (typeof DecompressionStream === 'undefined') {
@@ -779,7 +875,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     setStatus('connected');
-    try { ws.send(JSON.stringify({ type: 'hello', caps: [BIN_GZIP_CAP] })); } catch (_) {}
+    try { ws.send(JSON.stringify({ type: 'hello', caps: [BIN_GZIP_CAP, PANE_PUSH_CAP] })); } catch (_) {}
     startPingLoop();
     if (window.cue) cue('ready');
   };
@@ -805,17 +901,30 @@ function setStatus(s) {
   connState = s;
   if (s !== 'connected') {
     clearPingTimers();
+    clearDataAgeTimer();
     if (s === 'disconnected') {
       lastRttMs = null;
       lastPongAt = 0;
       connLiveAt = 0;
+      // 重连后 relay 侧的增量基线已经没了（按 ws 存的），必须重新协商，
+      // 否则会拿旧缓存去拼新增量，拼出错行。
+      panePushActive = false;
+      paneLineCache = [];
+      // 断开时年龄读数没有意义（offline 已经说明一切），清掉避免
+      // 重连后拿旧 ts 闪一下巨大的年龄。
+      lastDataTs = 0;
     }
   }
   refreshConnLabel();
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && connState === 'connected') sendPing();
+  if (!document.hidden && connState === 'connected') {
+    sendPing();
+    // 后台期间 relay 仍在推，但定时器被节流，年龄读数可能已经落后；
+    // 回前台立刻重算一次，别等下一个 tick。
+    refreshConnLabel();
+  }
 });
 
 function showSetup() {
@@ -875,6 +984,7 @@ function handleMessage(msg) {
     return;
   }
   if (msg.type === 'agents') {
+    noteDataTs(msg);
     // Track timeline on status changes
     for (const a of msg.agents) {
       const prev = prevStatuses[a.pane_id];
@@ -893,6 +1003,7 @@ function handleMessage(msg) {
   else if (msg.type === 'agent_update') {
     const update = msg.agent;
     if (!update || !update.pane_id) return;
+    noteDataTs(msg);
     const existing = agents.find(a => a.pane_id === update.pane_id);
     const previousStatus = existing?.status || prevStatuses[update.pane_id];
     if (existing) Object.assign(existing, update);
@@ -915,21 +1026,34 @@ function handleMessage(msg) {
     timeline.unshift({project: msg.project, agent: msg.agent, status: 'blocked', time: new Date()});
     if (timeline.length > 100) timeline.pop();
     render();
+  } else if (msg.type === 'hello_ack') {
+    const caps = Array.isArray(msg.caps) ? msg.caps : [];
+    panePushActive = caps.includes(PANE_PUSH_CAP);
+    // 能力是在连接建立后才确认的，此时可能已经按老策略起了定时器，
+    // 所以确认后重设一次，让它切到推送模式的兜底间隔。
+    if (activePane) setPaneRefreshInterval(BUFFERED_REFRESH_MS);
   } else if (msg.type === 'pane_content' && msg.pane_id === activePane) {
-    const el = document.getElementById('termContent');
-    const prevHeight = el.scrollHeight;
-    const prevScroll = el.scrollTop;
-    el.innerHTML = renderTermContent(msg.content || '(empty)');
-    if (userScrolledUp) {
-      // Keep scroll position relative to bottom (content may have grown at top)
-      const growth = el.scrollHeight - prevHeight;
-      el.scrollTop = prevScroll + growth;
+    noteDataTs(msg);
+    paneLineCache = (msg.content || '').split('\n');
+    applyPaneContent(msg.content || '(empty)');
+  } else if (msg.type === 'pane_delta' && msg.pane_id === activePane) {
+    noteDataTs(msg);
+    if (msg.unchanged) {
+      // 内容没变，什么都不用做——这一条就是省下来的那次全屏重传。
+    } else if (typeof msg.keep === 'number' && Array.isArray(msg.tail)) {
+      // drop：屏满后头部滚出的行数，先从头上扔掉再拼尾部。
+      const base = msg.drop ? paneLineCache.slice(msg.drop) : paneLineCache;
+      const next = base.slice(0, msg.keep).concat(msg.tail);
+      // total 是服务端看到的行数，对不上说明基线歪了，拉一次全量纠偏。
+      if (typeof msg.total === 'number' && next.length !== msg.total) {
+        refreshPane();
+      } else {
+        paneLineCache = next;
+        applyPaneContent(paneLineCache.join('\n') || '(empty)');
+      }
     } else {
-      el.scrollTop = el.scrollHeight;
-    }
-    if (inputMode === 'slash-live' && !slashMenuSeen && looksLikeSlashMenu(msg.content || '')) {
-      slashMenuSeen = true;
-      clearSlashLiveTimer();
+      // 增量格式不认识（版本错配），退回主动拉一次全量。
+      refreshPane();
     }
   } else if (msg.type === 'command_result') {
     onSubmitAck(msg);
@@ -944,13 +1068,13 @@ function handleMessage(msg) {
       }
       if (msg.ok) {
         showTermToast(msg.note || (msg.narrow ? '已切到窄屏模式' : '已退出窄屏模式'));
-        setTimeout(refreshPane, 500);
+        scheduleRefresh(500);
       } else if (msg.note) {
         showTermToast(msg.note);
       }
       updateNarrowBtn();
     } else if (msg.command === 'pane_zoom') {
-      if (msg.ok) setTimeout(refreshPane, 300);
+      if (msg.ok) scheduleRefresh(300);
       else if (msg.note) showTermToast(msg.note);
     }
   } else if (msg.type === 'git_status') {
@@ -1594,13 +1718,65 @@ function openTerminal(paneId) {
 
 function closeTerminal() {
   exitSlashLive({ submitted: false, scrub: true });
+  // 告诉 relay 别再为这个 pane 跑 herdr read 了。
+  if (ws && activePane && panePushActive) {
+    try { ws.send(JSON.stringify({ type: 'unwatch_pane', pane_id: activePane })); } catch (_) {}
+  }
+  paneLineCache = [];
   activePane = null; clearInterval(refreshInterval);
   document.getElementById('terminalView').classList.remove('active');
   document.getElementById('agentListView').style.display = '';
 }
 
 let paneLines = 200;
+// 服务端增量推送时，客户端要自己留一份行缓存来拼 keep + tail。
+let paneLineCache = [];
+
+/** 把整屏文本渲染进终端区，并保持滚动位置。全量与增量两条路径共用。 */
+function applyPaneContent(text) {
+  const el = document.getElementById('termContent');
+  if (!el) return;
+  const prevHeight = el.scrollHeight;
+  const prevScroll = el.scrollTop;
+  el.innerHTML = renderTermContent(text);
+  if (userScrolledUp) {
+    // Keep scroll position relative to bottom (content may have grown at top)
+    const growth = el.scrollHeight - prevHeight;
+    el.scrollTop = prevScroll + growth;
+  } else {
+    el.scrollTop = el.scrollHeight;
+  }
+  if (inputMode === 'slash-live' && !slashMenuSeen && looksLikeSlashMenu(text)) {
+    slashMenuSeen = true;
+    clearSlashLiveTimer();
+  }
+}
+
 function refreshPane() { if(ws&&activePane) ws.send(JSON.stringify({type:'read_pane',pane_id:activePane,lines:paneLines})); }
+
+/**
+ * 发完按键后隔多久去取结果。
+ *
+ * 原来这里是硬编码的 300 / 500ms，隐含假设「链路很快、读屏很快」。两个
+ * 假设都不成立：跨国链路 RTT 200ms+（Funnel 走东京 ingress 绕新加坡），
+ * 而 relay 侧 `herdr pane read` 单次实测约 7s。按键刚发出去 300ms 就去
+ * 取结果，几乎必然拿到旧屏——这就是「按了没反应，过一会儿才跳出来」。
+ *
+ * 改成按实测 RTT 缩放。注意这里只补偿网络那一段：读屏那 7s 由服务端
+ * 主动推送兜住（有变化才推），不该让客户端傻等。
+ */
+function afterKeyDelay(base) {
+  const b = base || 300;
+  // 服务端会主动推变化，按键后不必再自己拉——留一次兜底就够。
+  if (panePushActive) return Math.max(b, 600);
+  if (lastRttMs == null) return b;
+  return Math.min(Math.max(b, Math.round(lastRttMs * 1.5)), 2000);
+}
+
+/** 延后刷新一次 pane，延时按当前 RTT 自适应。 */
+function scheduleRefresh(base) {
+  setTimeout(refreshPane, afterKeyDelay(base));
+}
 function loadMore() { paneLines = Math.min(paneLines + 500, 5000); refreshPane(); }
 function wsCanSend() {
   if (!ws) return false;
@@ -1653,7 +1829,7 @@ function completePendingSubmit() {
   const i = document.getElementById('termInput');
   if (i && i.value === kept) i.value = '';
   syncClearTermBtn();
-  setTimeout(refreshPane, 500);
+  scheduleRefresh(500);
 }
 
 function syncClearTermBtn() {
@@ -1760,8 +1936,8 @@ function sendText() {
   beginPendingSubmit({ text, paneId: activePane, id, phase: 'text' });
   syncClearTermBtn();
 }
-function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(refreshPane,300);}
-function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(refreshPane,300);}
+function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));scheduleRefresh(300);}
+function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));scheduleRefresh(300);}
 
 // --- 分屏布局控制 ---
 // herdr 的 zoom 把某个 pane 临时全屏，是窄屏上最有用的布局操作：手机一屏
@@ -1864,7 +2040,7 @@ function fireKey(k) {
       return;
     }
     exitSlashLive({ submitted: false, scrub: true });
-    setTimeout(refreshPane, 300);
+    scheduleRefresh(300);
     return;
   }
   const composed = armedMod ? `${armedMod}+${k}` : k;
@@ -2058,7 +2234,7 @@ function quickSend(text) {
   ws.send(JSON.stringify({type:'send_text', pane_id: activePane, text: text}));
   ws.send(JSON.stringify({type:'send_keys', pane_id: activePane, keys:['Enter']}));
   document.getElementById('quickDock').style.display = 'none';
-  setTimeout(refreshPane, 500);
+  scheduleRefresh(500);
 }
 
 (function wireSnippetButtons() {
@@ -2161,7 +2337,7 @@ function pressCtrl(label) {
 
 function toggleArrows(){}
 function hideArrows(){}
-function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.send(JSON.stringify({type:'respond',pane_id:activePane,text:t}));document.getElementById('quickActions').innerHTML='';setTimeout(refreshPane,500);}
+function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.send(JSON.stringify({type:'respond',pane_id:activePane,text:t}));document.getElementById('quickActions').innerHTML='';scheduleRefresh(500);}
 (function wireTermInput() {
   const input = document.getElementById('termInput');
   if (!input) return;
@@ -2207,7 +2383,7 @@ function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.s
     if (e.key === 'Escape' && inputMode === 'slash-live') {
       e.preventDefault();
       exitSlashLive({ submitted: false, scrub: true });
-      setTimeout(refreshPane, 300);
+      scheduleRefresh(300);
     }
   });
 })();
@@ -2257,7 +2433,15 @@ function clearSlashLiveTimer() {
 
 function setPaneRefreshInterval(ms) {
   if (refreshInterval) clearInterval(refreshInterval);
-  if (activePane) refreshInterval = setInterval(refreshPane, ms);
+  if (!activePane) return;
+  // 服务端支持主动推 pane 变化时，就不必再定时全量拉了：relay 每轮
+  // 自己读一次、比对、只在有变化时发增量。这是省掉跨国 RTT 的关键。
+  // 仍留一个很稀的兜底轮询，防止推送链路悄悄断了而界面一直不刷。
+  if (panePushActive) {
+    refreshInterval = setInterval(refreshPane, PANE_PUSH_FALLBACK_MS);
+    return;
+  }
+  refreshInterval = setInterval(refreshPane, ms);
 }
 
 function cleanupSlashRemote({ scrub }) {
@@ -2404,7 +2588,7 @@ function runCommand(cmd) {
   if (!ws || !activePane) return;
   ws.send(JSON.stringify({type:'send_text', pane_id: activePane, text: cmd}));
   ws.send(JSON.stringify({type:'send_keys', pane_id: activePane, keys:['Enter']}));
-  setTimeout(refreshPane, 500);
+  scheduleRefresh(500);
 }
 
 // --- Web Push ---
