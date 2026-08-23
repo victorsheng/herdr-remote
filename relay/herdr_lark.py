@@ -523,17 +523,17 @@ async def read_pane(pane_id: str, lines: int = READ_LINES) -> str:
 # 与 relay 的 TOOL_OPTIONS / SUBAGENT_OPTIONS 对应（见 herdr_relay.py:63）。
 TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edit)"]
 
-TOOL_BUTTONS = [
-    ("Yes (once)", "primary"),
-    ("Trust (always)", "default"),
-    ("No", "danger"),
-]
+# 选项卡片的统一样式：两种来源共用，改一处就到处生效。
+OPTION_CARD_TEMPLATE = "turquoise"
+# 按钮文字上限——手机上太长会折行，把一排按钮挤变形。
+OPTION_LABEL_LIMIT = 40
 
-SUBAGENT_BUTTONS = [
-    ("Approve all", "primary"),
-    ("Configure", "default"),
-    ("Cancel", "danger"),
-]
+TOOL_BUTTON_LABELS = ["Yes (once)", "Trust (always)", "No"]
+SUBAGENT_BUTTON_LABELS = ["Approve all", "Configure", "Cancel"]
+
+# 兼容旧引用：配色现在由 _option_styles 统一算，这里只留标签。
+TOOL_BUTTONS = [(label, "default") for label in TOOL_BUTTON_LABELS]
+SUBAGENT_BUTTONS = [(label, "default") for label in SUBAGENT_BUTTON_LABELS]
 
 
 def truncate_prompt(text: str, limit: int = 400) -> str:
@@ -549,15 +549,21 @@ def truncate_prompt(text: str, limit: int = 400) -> str:
     return f"{text[:keep]}\n⋯ 省略 {elided} 字 ⋯\n{text[-keep:]}"
 
 
-def _approval_buttons(options: list[str] | None) -> list[tuple[str, str]]:
+def _approval_labels(options: list[str] | None) -> list[str]:
+    """把 relay 给的选项换成按钮文字。
+
+    只管文字，不管配色——配色由 _option_styles 按语义统一决定，两处各判一次
+    就会出现同一个选项在两张卡片上颜色不同。
+
+    relay 的选项文本偏长（"yes, single permission"），认得出的两种常见提示
+    换成短标签；认不出就取逗号前那截。
+    """
     joined = " ".join(options or []).lower()
-    if options and "trust" in joined:
-        return TOOL_BUTTONS
-    if options and "approve all" in joined:
-        return SUBAGENT_BUTTONS
-    if not options:
-        return TOOL_BUTTONS
-    return [(opt.split(",")[0], "default") for opt in options]
+    if not options or "trust" in joined:
+        return TOOL_BUTTON_LABELS
+    if "approve all" in joined:
+        return SUBAGENT_BUTTON_LABELS
+    return [opt.split(",")[0] for opt in options]
 
 
 def _button(label: str, value: dict, button_type: str = "default") -> dict:
@@ -569,6 +575,94 @@ def _button(label: str, value: dict, button_type: str = "default") -> dict:
     }
 
 
+# 选项按钮的配色：按语义给，不按位置给。
+# 只匹配开头的词——「No」「取消」是拒绝，但「不错的方案」不是。子串匹配会把
+# 正常选项误染成红色。
+_DANGER_RE = re.compile(
+    r"^\s*(no\b|nope\b|cancel|reject|deny|abort|skip\b|拒绝|取消|不要|别)")
+# 放权项：让它别抢 primary，否则手机上最显眼的按钮是「总是允许」。
+_CAUTION_RE = re.compile(r"(trust|always|approve\s+all|总是|全部允许)", re.I)
+
+
+def _option_styles(options: list[str]) -> list[str]:
+    """整组选项的按钮配色。
+
+    语义优先于位置：danger 给会拒绝掉的那项；放权项（trust / approve all）
+    不抢 primary，否则手机上最显眼的按钮恰好是风险最大的那个。
+    primary 只给一个——第一个既不拒绝也不放权的选项；一组里两个高亮按钮
+    等于没有高亮。整组都是放权/拒绝时就不给 primary。
+    """
+    styles = []
+    primary_used = False
+    for label in options:
+        if _DANGER_RE.match(label.strip().lower()):
+            styles.append("danger")
+        elif _CAUTION_RE.search(label):
+            styles.append("default")
+        elif not primary_used:
+            styles.append("primary")
+            primary_used = True
+        else:
+            styles.append("default")
+    return styles
+
+
+def build_option_card(
+    pane_id: str,
+    project: str,
+    options: list[str],
+    generation: str,
+    *,
+    question: str = "",
+    prompt: str = "",
+    agent: str = "",
+) -> dict:
+    """「正等你选」的唯一一张卡片。
+
+    两种来源同一个样子：relay 推的 blocked（带 prompt 和 agent 名），和读
+    pane 时顺手发现的下一组（带 question）。以前是两个 build 函数各带一份
+    配色，同一次选择的前后两张卡片看着像两个功能。
+
+    按钮带的是选项的 1-based 序号，点击后按对应数字键。发选项文本是不行的：
+    relay 用 send-text 粘贴，Claude 的 TUI 把粘贴里的换行当正文而非回车，
+    提示永远确认不了。
+    """
+    shown = options[:_MAX_OPTIONS]
+    styles = _option_styles(shown)
+    actions = [
+        _button(f"{i + 1}. {opt[:OPTION_LABEL_LIMIT]}", action_value(
+            "approval", pane_id, g=generation, k=str(i + 1)), styles[i])
+        for i, opt in enumerate(shown)
+    ]
+
+    elements: list[dict] = []
+    if prompt:
+        elements.append({"tag": "div", "text": {
+            "tag": "lark_md",
+            "content": f"```\n{truncate_prompt(prompt)}\n```",
+        }})
+    if question:
+        elements.append({"tag": "div", "text": {
+            "tag": "lark_md", "content": f"**{question}**"}})
+    elements.append({"tag": "action", "actions": actions})
+    # blocked 是被动推来的，人还没看过输出，给个直达入口。
+    if prompt:
+        elements.append({"tag": "action", "actions": [
+            _button("Open output & reply", action_value("select_reply", pane_id)),
+        ]})
+
+    title = (f"🐑 {agent} blocked in {project}" if agent
+             else f"⌨︎ {project} 正在等你选")
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": OPTION_CARD_TEMPLATE,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": elements,
+    }
+
+
 def build_blocked_card(
     pane_id: str,
     agent: str,
@@ -577,62 +671,16 @@ def build_blocked_card(
     options: list[str] | None,
     generation: str,
 ) -> dict:
-    """agent 卡住时推的审批卡片。
-
-    按钮带的是选项的 1-based 序号，点击后按对应数字键；发选项文本是不行的
-    （见 build 出的 value 与 send_keys_to_relay 的注释）。
-    """
-    buttons = _approval_buttons(options)
-    actions = [
-        _button(f"{i + 1}. {label}", action_value(
-            "approval", pane_id, g=generation, k=str(i + 1)), style)
-        for i, (label, style) in enumerate(buttons)
-    ]
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "orange",
-            "title": {"tag": "plain_text", "content": f"🐑 {agent} blocked in {project}"},
-        },
-        "elements": [
-            {"tag": "div", "text": {
-                "tag": "lark_md",
-                "content": f"```\n{truncate_prompt(prompt)}\n```",
-            }},
-            {"tag": "action", "actions": actions},
-            {"tag": "action", "actions": [
-                _button("Open output & reply", action_value("select_reply", pane_id)),
-            ]},
-        ],
-    }
+    """agent 卡住时推的审批卡片。relay 监听那条路径在调。"""
+    return build_option_card(pane_id, project, _approval_labels(options), generation,
+                             prompt=prompt or " ", agent=agent or "agent")
 
 
 def build_options_card(pane_id: str, project: str, options: list[str],
                        generation: str, question: str = "") -> dict:
-    """读到一个正等着你选的 agent 时，把选项渲染成可点的按钮。
-
-    与 blocked 卡片同构（按钮发的都是选项序号），区别只在于这是
-    「读的时候顺手发现的」，而不是 relay 主动推的。
-    """
-    actions = [
-        _button(f"{i + 1}. {opt[:40]}", action_value(
-            "approval", pane_id, g=generation, k=str(i + 1)),
-            "primary" if i == 0 else "default")
-        for i, opt in enumerate(options)
-    ]
-    elements = []
-    if question:
-        elements.append({"tag": "div", "text": {
-            "tag": "lark_md", "content": f"**{question}**"}})
-    elements.append({"tag": "action", "actions": actions})
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "turquoise",
-            "title": {"tag": "plain_text", "content": f"⌨︎ {project} 正在等你选"},
-        },
-        "elements": elements,
-    }
+    """读 pane 时发现正等着选，或答完一组后补推下一组。"""
+    return build_option_card(pane_id, project, options, generation,
+                             question=question)
 
 
 def current_option_group(groups: list[dict]) -> dict | None:
@@ -768,9 +816,62 @@ def parse_card_action(event: dict) -> MessageContext | None:
 
 
 
+def chat_inventory(rows) -> list[dict]:
+    """把列群结果整成清单，一群一条。
+
+    不能按群名归并：群名可能重复（改名逻辑出过 bug，16 个群同名），
+    用名字当 key 会让它们互相覆盖，群就凭空「消失」了。
+    """
+    return [{"name": name or "", "chat_id": chat_id}
+            for name, chat_id in rows if chat_id]
+
+
+def duplicate_named_chats(inventory: list[dict]) -> list[str]:
+    """名字重复的群的 chat_id。同名本身就是出问题的信号。"""
+    seen: dict[str, list[str]] = {}
+    for item in inventory:
+        name = item.get("name") or ""
+        if name:
+            seen.setdefault(name, []).append(item["chat_id"])
+    out = []
+    for ids in seen.values():
+        if len(ids) > 1:
+            out.extend(ids)
+    return sorted(out)
+
+
+def chat_name_index(inventory: list[dict]) -> dict[str, str]:
+    """{群名: chat_id}，供 /spaces 按名字复用现成的群。
+
+    同名时保留其中一个——复用哪个都对；要完整清单请用 chat_inventory。
+    """
+    index: dict[str, str] = {}
+    for item in inventory:
+        name = item.get("name") or ""
+        if name:
+            index.setdefault(name, item["chat_id"])
+    return index
+
+
 def parse_chat_ids(value: str) -> set[str]:
     """解析 HERDR_LARK_CHAT_ID：逗号分隔的多个群。"""
-    return {c.strip() for c in (value or "").split(",") if c.strip()}
+    return set(parse_chat_list(value))
+
+
+def parse_chat_list(value) -> list[str]:
+    """同上，但保留配置里的顺序并去重。
+
+    顺序有意义：第一个是主群，未绑定的通知回落到它。用 set 的话主群就成了
+    字典序偶然排在前面的那个，通知会落到一个你没预期的群里。
+    """
+    if not isinstance(value, str):
+        value = ",".join(value or [])
+    out: list[str] = []
+    for chat in value.split(","):
+        chat = chat.strip()
+        if chat and chat not in out:
+            out.append(chat)
+    return out
 
 
 def is_authorized_chat(chat_id: str, allowed) -> bool:
@@ -1806,10 +1907,13 @@ class LarkAPI:
             raise RuntimeError(f"飞书发送失败 ({msg_type}): {response.msg}")
         return getattr(response.data, "message_id", "") or ""
 
-    def list_chats(self) -> dict[str, str]:
-        """机器人所在的全部群：{群名: chat_id}。"""
+    def chat_inventory(self) -> list[dict]:
+        """机器人所在的全部群，一群一条 {name, chat_id}。
+
+        按 chat_id 保留而不是按群名归并：同名群会互相覆盖，凭空「消失」。
+        """
         from lark_oapi.api.im.v1 import ListChatRequest
-        out: dict[str, str] = {}
+        rows: list[tuple[str, str]] = []
         page_token = None
         for _ in range(10):  # 上限保护，别翻页翻到天荒地老
             builder = ListChatRequest.builder().page_size(100)
@@ -1819,13 +1923,25 @@ class LarkAPI:
             if not response.success():
                 raise RuntimeError(f"列群失败: {response.msg}")
             for item in (getattr(response.data, "items", None) or []):
-                name = getattr(item, "name", "") or ""
-                if name:
-                    out[name] = getattr(item, "chat_id", "")
+                rows.append((getattr(item, "name", "") or "",
+                             getattr(item, "chat_id", "") or ""))
             page_token = getattr(response.data, "page_token", None)
             if not getattr(response.data, "has_more", False):
                 break
-        return out
+        inventory = chat_inventory(rows)
+        dupes = duplicate_named_chats(inventory)
+        if dupes:
+            # 同名群通常是改名逻辑出问题的残留，值得留一行日志。
+            log.warning("发现 %d 个同名群，可能是重复建群的残留: %s",
+                        len(dupes), dupes[:20])
+        return inventory
+
+    def list_chats(self) -> dict[str, str]:
+        """{群名: chat_id}，供按名字复用现成的群。
+
+        同名群只留一个——要完整清单用 chat_inventory()。
+        """
+        return chat_name_index(self.chat_inventory())
 
     def delete_chat(self, chat_id: str) -> None:
         from lark_oapi.api.im.v1 import DeleteChatRequest
@@ -1950,12 +2066,18 @@ class LarkBot:
         self.api = api
         # 支持多群：每个群绑一个 agent，互不干扰。
         # 环境变量是种子，/spaces 建的群会落盘，重启后不丢。
-        env_chats = parse_chat_ids(chat_id) if isinstance(chat_id, str) else set(chat_id)
+        env_order = parse_chat_list(chat_id)
+        env_chats = set(env_order)
         self.chat_store = ChatIdStore()
         self.chat_store.seed(env_chats)
         self.chat_ids = self.chat_store.all() or env_chats
+        # 主群 = 配置里的第一个。未绑定的通知回落到它，而不是广播给全部群：
+        # /spaces 建过十几个群后，广播意味着一条通知响十几次。
+        self.primary_chat = next(
+            (c for c in env_order if c in self.chat_ids),
+            next(iter(sorted(self.chat_ids)), ""))
         # 单值形式仍保留，供只需要「默认群」的地方用。
-        self.chat_id = next(iter(sorted(self.chat_ids)), "")
+        self.chat_id = self.primary_chat
         self.loop = loop
         self.agents: list[dict] = []
         self.relay_connected = False
@@ -2796,14 +2918,37 @@ def chat_title_for(project: str, marker: str = "") -> str:
 def chats_watching(bot: "LarkBot", pane_id: str) -> list[str]:
     """哪些群该收到这个 pane 的通知。
 
-    绑定了就发给绑定的群；一个都没绑时回落到默认会话，
+    绑定了就发给绑定的群；一个都没绑时回落到全部授权群，
     否则通知会悄无声息地丢掉。
     """
-    bound = [chat for chat, pane in bot._active.items() if pane == pane_id]
+    bound = bound_chats(bot, pane_id)
     if bound:
-        return sorted(bound)
-    # 一个群都没绑它：发给所有授权群，否则通知会悄无声息地丢掉。
-    return sorted(bot.chat_ids) if bot.chat_ids else []
+        return bound
+    return fallback_chats(bot)
+
+
+def fallback_chats(bot: "LarkBot") -> list[str]:
+    """没有任何群绑这个 pane 时，通知该落在哪。
+
+    只落主群，不广播：/spaces 建过十几个群后，广播意味着一条通知在十几个
+    群里同时响。通知不能丢，但也没必要人人都收到。
+
+    主群不在授权列表里（被 /unbind drop 掉了）就退回授权列表的第一个；
+    一个群都没有就返回空——没有可发的地方，硬发只会报错。
+    """
+    primary = getattr(bot, "primary_chat", "") or ""
+    if primary in bot.chat_ids:
+        return [primary]
+    return sorted(bot.chat_ids)[:1]
+
+
+def bound_chats(bot: "LarkBot", pane_id: str) -> list[str]:
+    """显式绑到这个 pane 的群。空列表意味着接下来只能靠回落广播。
+
+    单独一个函数，是为了让「这次是广播还是定向」在调用处能判出来：
+    广播时绝不能顺手写绑定（见 _notify_finished）。
+    """
+    return sorted(chat for chat, pane in bot._active.items() if pane == pane_id)
 
 
 # --- relay 监听 ---
@@ -2873,7 +3018,10 @@ async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
     if generation:
         bot.approval_tokens[pane_id] = generation
 
-    # 只发给绑定了这个 agent 的群；一个都没绑才回落到默认会话。
+    # 广播（没有任何群绑它）时绝不能写绑定：一次回落会把全部授权群都绑到
+    # 同一个 pane，此后它每次完成都在每个群各刷一遍，且绑定已落盘，重启
+    # 也不会自愈。只有用户主动 /read /send 建立的绑定才该被刷新。
+    targeted = bool(bound_chats(bot, pane_id))
     for chat_id in chats_watching(bot, pane_id):
         if bot.render_mode == "card":
             # 完成时状态已是 idle/done，用 done 让头部显示为绿色。
@@ -2883,7 +3031,8 @@ async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
             message_id = bot.reply_text(
                 chat_id, format_finish_message(project, agent.get("agent", ""), content))
         bot.remember(chat_id, message_id, pane_id)
-        bot.set_active(chat_id, pane_id, project)
+        if targeted:
+            bot.set_active(chat_id, pane_id, project)
         bot._send_images_in(chat_id, content)
         if groups:
             current = current_option_group(groups)

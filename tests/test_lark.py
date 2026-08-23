@@ -1162,6 +1162,125 @@ class BroadcastScopeTests(unittest.TestCase):
         self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
 
 
+class ChatInventoryTests(unittest.TestCase):
+    """列群不能因为群名重复就把群丢掉。
+
+    线上事故：绑定 bug 把 16 个群逐个改成同一个名字，而 list_chats 用群名当
+    字典 key，16 个群塌缩成 1 条。据此判断「bot 已不在这些群」，差点漏删，
+    也会让 /spaces 误以为已有群可复用。
+    """
+
+    def test_same_name_chats_are_all_counted(self):
+        rows = [("herdr · [w2B] x", f"oc_{i}") for i in range(5)]
+        self.assertEqual(len(lk.chat_inventory(rows)), 5)
+
+    def test_inventory_keeps_every_chat_id(self):
+        rows = [("同名", "oc_a"), ("同名", "oc_b")]
+        self.assertEqual({c["chat_id"] for c in lk.chat_inventory(rows)},
+                         {"oc_a", "oc_b"})
+
+    def test_unnamed_chat_not_dropped(self):
+        """没名字的群也得列出来，否则删不掉也看不见。"""
+        rows = [("", "oc_x")]
+        self.assertEqual(len(lk.chat_inventory(rows)), 1)
+
+    def test_duplicate_names_are_reported(self):
+        """同名群要能被识别出来——那本身就是 bug 的信号。"""
+        rows = [("同名", "oc_a"), ("同名", "oc_b"), ("独一份", "oc_c")]
+        dupes = lk.duplicate_named_chats(lk.chat_inventory(rows))
+        self.assertEqual(sorted(dupes), ["oc_a", "oc_b"])
+
+    def test_no_duplicates_yields_empty(self):
+        rows = [("a", "oc_a"), ("b", "oc_b")]
+        self.assertEqual(lk.duplicate_named_chats(lk.chat_inventory(rows)), [])
+
+    def test_name_index_still_available_for_reuse(self):
+        """/spaces 靠群名找现成群，这个映射要保留；同名时取一个即可。"""
+        rows = [("同名", "oc_a"), ("同名", "oc_b")]
+        index = lk.chat_name_index(lk.chat_inventory(rows))
+        self.assertIn(index["同名"], ("oc_a", "oc_b"))
+
+
+class FallbackScopeTests(unittest.TestCase):
+    """没有任何群绑定这个 pane 时，通知只落一个群，不广播。
+
+    线上事故：/spaces 建了 16 个群，全部进了授权列表。一个未绑定的 pane
+    完成时，回落逻辑把通知发给全部 16 个群，一条通知响 16 次。
+    通知不能丢，但也不该群发——落到默认群即可。
+    """
+
+    def test_unbound_pane_goes_to_one_chat_only(self):
+        bot = make_bot("oc_main,oc_b,oc_c")
+        self.assertEqual(len(lk.chats_watching(bot, "w9:p1")), 1)
+
+    def test_fallback_uses_configured_primary_chat(self):
+        """回落落在配置的第一个群，而不是字典序偶然排在前面的那个。"""
+        bot = make_bot("oc_zzz,oc_aaa")
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), ["oc_zzz"])
+
+    def test_bound_pane_unaffected(self):
+        """显式绑定优先，且绑几个就发几个。"""
+        bot = make_bot("oc_main,oc_b,oc_c")
+        bot.set_active("oc_b", "w1:p1")
+        bot.set_active("oc_c", "w1:p1")
+        self.assertEqual(lk.chats_watching(bot, "w1:p1"), ["oc_b", "oc_c"])
+
+    def test_no_chats_at_all_yields_nothing(self):
+        api = unittest.mock.MagicMock()
+        api.bot_open_id = "ou_bot"
+        bot = lk.LarkBot(api, "", loop=None)
+        bot.chat_ids = set()
+        bot._active = {}
+        bot.primary_chat = ""
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
+
+
+class BroadcastDoesNotBindTests(unittest.IsolatedAsyncioTestCase):
+    """回落广播不能把群永久绑到 pane 上。
+
+    线上事故：某个 pane 完成时还没有群绑它，chats_watching 回落成「发给全部
+    授权群」，而 _notify_finished 在循环里对每个群都调了 set_active。一次
+    广播就把 16 个群全部持久化绑到同一个 pane，此后它每次完成都在 16 个群
+    各刷一遍，重启也不会好——绑定已经落盘。
+    """
+
+    async def _finish(self, bot, pane_id="w9:p1"):
+        """跑一次完成推送，read_pane 打桩成没有选择器的普通输出。"""
+        with unittest.mock.patch.object(
+                lk, "read_pane", new=unittest.mock.AsyncMock(return_value="done\n")):
+            await lk._notify_finished(bot, {
+                "pane_id": pane_id, "agent": "claude", "project": "proj"})
+
+    async def test_broadcast_leaves_no_bindings(self):
+        """没绑定时广播出去，事后仍然没有绑定。"""
+        bot = make_bot("oc_1,oc_2,oc_3")
+        await self._finish(bot)
+        self.assertEqual(bot._active, {})
+
+    async def test_broadcast_is_not_sticky(self):
+        """广播两次，第二次的收件群不该比第一次多——也不该被固化。"""
+        bot = make_bot("oc_1,oc_2,oc_3")
+        first = lk.chats_watching(bot, "w9:p1")
+        await self._finish(bot)
+        second = lk.chats_watching(bot, "w9:p1")
+        self.assertEqual(first, second)
+
+    async def test_explicit_binding_still_kept(self):
+        """用户主动绑过的群，完成推送不能把它解绑。"""
+        bot = make_bot("oc_1,oc_2,oc_3")
+        bot.set_active("oc_2", "w9:p1")
+        await self._finish(bot)
+        self.assertEqual(bot._active.get("oc_2"), "w9:p1")
+
+    async def test_bound_pane_does_not_broadcast(self):
+        """已经有群绑它时，只发那个群,不碰其它群的绑定。"""
+        bot = make_bot("oc_1,oc_2,oc_3")
+        bot.set_active("oc_2", "w9:p1")
+        await self._finish(bot)
+        self.assertNotIn("oc_1", bot._active)
+        self.assertNotIn("oc_3", bot._active)
+
+
 PANE_SAMPLE = """⏺ 实测清理效果与耗时
   ⎿  $ pkill -f herdr_lark.py
      export HERDR_RELAY="ws://127.0.0.1:8375"
@@ -1771,6 +1890,221 @@ class CurrentGroupTests(unittest.TestCase):
     def test_card_without_question_still_valid(self):
         card = lk.build_options_card("w1:p1", "p", ["A", "B"], "abcde")
         self.assertIn("elements", card)
+
+
+class UnifiedOptionCardTests(unittest.TestCase):
+    """blocked 卡片和「读到时补的」选项卡片必须长一个样。
+
+    以前是两个 build 函数各带一份头部配色和按钮样式：relay 推的 blocked 走
+    orange + primary/default/danger，答完第一组后补推的下一组走 turquoise +
+    只有首项 primary。同一次选择的前后两张卡片看着像两个功能。
+
+    现在合并成 build_option_card 一条渲染路径，两个旧名字保留为薄包装。
+    """
+
+    def _keys(self, card):
+        return [b["value"]["k"] for b in buttons_in(card)
+                if b["value"].get("a") == lk.ACTION_CODES["approval"]]
+
+    def _styles(self, card):
+        return [b["type"] for b in buttons_in(card)
+                if b["value"].get("a") == lk.ACTION_CODES["approval"]]
+
+    def test_same_header_template(self):
+        blocked = lk.build_option_card(
+            "w1:p1", "herdr", ["A", "B"], "abcde",
+            prompt="may I?", agent="opencode")
+        follow_up = lk.build_option_card("w1:p1", "herdr", ["A", "B"], "abcde")
+        self.assertEqual(blocked["header"]["template"],
+                         follow_up["header"]["template"])
+
+    def test_same_button_styles(self):
+        blocked = lk.build_option_card(
+            "w1:p1", "herdr", ["A", "B"], "abcde", prompt="q", agent="a")
+        follow_up = lk.build_option_card("w1:p1", "herdr", ["A", "B"], "abcde")
+        self.assertEqual(self._styles(blocked), self._styles(follow_up))
+
+    def test_blocked_variant_shows_prompt(self):
+        card = lk.build_option_card(
+            "w1:p1", "herdr", ["A", "B"], "abcde",
+            prompt="rm -rf /tmp/x", agent="opencode")
+        self.assertIn("rm -rf /tmp/x", json.dumps(card, ensure_ascii=False))
+
+    def test_follow_up_variant_shows_question(self):
+        card = lk.build_option_card(
+            "w1:p1", "herdr", ["A", "B"], "abcde", question="选哪个？")
+        self.assertIn("选哪个？", json.dumps(card, ensure_ascii=False))
+
+    def test_keys_are_indexes_in_both_variants(self):
+        """两种形态都必须发选项序号，不能发选项文本。"""
+        for kwargs in ({"prompt": "q", "agent": "a"}, {"question": "选哪个？"}):
+            card = lk.build_option_card(
+                "w1:p1", "herdr", ["A", "B", "C"], "abcde", **kwargs)
+            self.assertEqual(self._keys(card), ["1", "2", "3"])
+
+    def test_all_options_get_a_button(self):
+        """检出几个选项就要有几个按钮，不能少。"""
+        options = [f"选项 {i}" for i in range(1, 8)]
+        card = lk.build_option_card("w1:p1", "herdr", options, "abcde")
+        self.assertEqual(len(self._keys(card)), 7)
+
+    def test_exactly_one_primary(self):
+        """一组里只能有一个高亮按钮——两个等于没有。"""
+        for opts in (["直接改现有函数", "新增一层抽象", "先写测试"],
+                     ["approve all pending", "configure", "cancel"],
+                     lk.TOOL_OPTIONS):
+            card = lk.build_option_card("w1:p1", "p", opts, "g")
+            primaries = [b for b in buttons_in(card) if b["type"] == "primary"]
+            self.assertEqual(len(primaries), 1, opts)
+
+    def test_reject_option_is_danger(self):
+        """拒绝项要红：点错了代价最大。"""
+        card = lk.build_option_card("w1:p1", "p", ["Yes", "No (tab to edit)"], "g")
+        styles = {b["text"]["content"]: b["type"] for b in buttons_in(card)}
+        self.assertEqual(styles["2. No (tab to edit)"], "danger")
+
+    def test_trust_does_not_steal_primary(self):
+        """「总是允许」不该是最显眼的按钮——它风险最大。"""
+        card = lk.build_option_card(
+            "w1:p1", "p", ["trust, always allow", "yes once"], "g")
+        styles = {b["text"]["content"][:2]: b["type"] for b in buttons_in(card)}
+        self.assertEqual(styles["1."], "default")
+        self.assertEqual(styles["2."], "primary")
+
+    def test_plain_chinese_option_not_reddened(self):
+        """「不错的方案」不是拒绝项，别染红。"""
+        card = lk.build_option_card("w1:p1", "p", ["不错的方案", "重构但不动接口"], "g")
+        self.assertNotIn("danger", [b["type"] for b in buttons_in(card)])
+
+    def test_caps_at_max_options(self):
+        """按钮数封顶，飞书一张卡片放不下太多。"""
+        card = lk.build_option_card(
+            "w1:p1", "p", [f"opt{i}" for i in range(20)], "g")
+        keys = [b["value"]["k"] for b in buttons_in(card)
+                if b["value"].get("a") == lk.ACTION_CODES["approval"]]
+        self.assertEqual(len(keys), lk._MAX_OPTIONS)
+
+    def test_legacy_builders_still_work(self):
+        """旧名字保留：relay 监听和读 pane 两条路径都还在调。"""
+        self.assertIn("elements", lk.build_blocked_card(
+            "w1:p1", "a", "p", "q", lk.TOOL_OPTIONS, "abcde"))
+        self.assertIn("elements", lk.build_options_card(
+            "w1:p1", "p", ["A", "B"], "abcde"))
+
+    def test_legacy_builders_agree_on_style(self):
+        """两个旧入口渲染出来的样式必须一致——这正是原来的毛病。"""
+        blocked = lk.build_blocked_card(
+            "w1:p1", "a", "p", "q", ["yes", "no"], "abcde")
+        options = lk.build_options_card("w1:p1", "p", ["yes", "no"], "abcde")
+        self.assertEqual(blocked["header"]["template"],
+                         options["header"]["template"])
+        self.assertEqual(self._styles(blocked), self._styles(options))
+
+
+class LongSelectorTests(unittest.TestCase):
+    """选项多、正文长、每项自带说明时，选择器不能被漏掉或缺项。
+
+    e7934c3 把 detect_option_groups 拆成小函数时改掉了两个真实缺陷，但没带
+    测试。这些用例把缺陷钉住：
+    - 原先按固定 42 行截窗口，长选择器靠前的组编号不从 1 起，被整组丢弃；
+    - 原先「最后一个选项之后还有内容」就判定选择器已翻过去，而
+      AskUserQuestion 每个选项都带一行缩进说明，于是一组都认不出来。
+    """
+
+    def _long_tail(self, groups=2, options=4, preamble=60):
+        lines = [f"日志第 {i} 行：跑测试、读文件、写补丁" for i in range(preamble)]
+        for g in range(groups):
+            lines.append("")
+            lines.append(f"第 {g + 1} 个问题要怎么定？")
+            for o in range(options):
+                lines.append(f"  {o + 1}. 第 {g + 1} 组的第 {o + 1} 个候选方案")
+        return "\n".join(lines)
+
+    def test_keeps_all_options_in_each_group(self):
+        groups = lk.detect_option_groups(self._long_tail())
+        self.assertEqual(len(groups), 2)
+        for group in groups:
+            self.assertEqual(len(group["options"]), 4)
+
+    def test_survives_long_preamble(self):
+        """选择器前面压 200 行日志，照样要认出来。"""
+        groups = lk.detect_option_groups(self._long_tail(preamble=200))
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len(groups[-1]["options"]), 4)
+
+    def test_long_selector_keeps_early_groups(self):
+        """选择器本身超过旧的 42 行窗口时，靠前的组不能丢。"""
+        groups = lk.detect_option_groups(self._long_tail(groups=5, options=7))
+        self.assertEqual(len(groups), 5)
+        for group in groups:
+            self.assertEqual(len(group["options"]), 7)
+
+    def test_last_group_is_complete(self):
+        """当前在等的那一组尤其不能缺项——缺了就点不到。"""
+        current = lk.current_option_group(
+            lk.detect_option_groups(self._long_tail(options=5)))
+        self.assertEqual(len(current["options"]), 5)
+        self.assertIn("第 5 个候选", current["options"][4])
+
+    def test_options_with_description_lines(self):
+        """AskUserQuestion 每个选项自带一行缩进说明。
+
+        把说明当成「选择器后面的正文」的话整组被丢掉——线上表现是卡片一个
+        按钮都没有，只能手打数字。
+        """
+        text = """要用哪种方案实现？
+  1. 直接改现有函数
+     在原地扩展，改动最小
+  2. 新增一层抽象
+     多一个间接层，但更好测
+  3. 先写测试
+     TDD，慢但稳"""
+        groups = lk.detect_option_groups(text)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["options"]), 3)
+
+    def test_survives_tui_input_box(self):
+        """选择器下面就是 TUI 的圆角输入框，不能算正文。
+
+        框线字符漏一个（比如 ╮），输入框就被当成正文，整个选择器被判定为
+        「已翻过去」，卡片一个按钮都不剩。
+        """
+        text = """选哪个？
+  1. A
+     说明 A
+  2. B
+     说明 B
+
+╭──────────────────────╮
+│ >                    │
+╰──────────────────────╯"""
+        groups = lk.detect_option_groups(text)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["options"], ["A", "B"])
+
+    def test_two_groups_with_descriptions(self):
+        """两组都带说明行时，两组都要在，且都不缺项。"""
+        text = """要用哪种方案？
+  1. 改现有函数
+     改动最小
+  2. 新增抽象
+     更好测
+
+新 agent 用哪个？
+  1. 默认 claude
+     跟现在一致
+  2. 只起 codex
+     换个模型"""
+        groups = lk.detect_option_groups(text)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len(groups[0]["options"]), 2)
+        self.assertEqual(len(groups[1]["options"]), 2)
+        self.assertIn("agent", groups[1]["question"])
+
+    def test_prose_after_options_still_rejected(self):
+        """放宽判定不能把散文里的编号列表也认成选择器。"""
+        text = self._long_tail() + "\n\n然后我跑了测试，全部通过。"
+        self.assertEqual(lk.detect_option_groups(text), [])
 
 
 class AutoWatchTests(unittest.TestCase):
