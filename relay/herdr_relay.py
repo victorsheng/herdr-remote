@@ -155,8 +155,22 @@ async def settle_after_paste(agent: str | None) -> None:
 # 这里做的是最小充分校验：类型、必需键、状态枚举、字段长度上限。
 AGENT_STATUSES = {"blocked", "working", "idle", "done", "error"}
 # prompt 是唯一可能较长的字段（blocked 时的提示原文），其余都是标识符量级。
-# 上限取 4000：足够容纳 relay 自己截断到 500 的 prompt，又不至于撑爆推送体积。
+# 上限取 4000：足够容纳 relay 自己截断到 BLOCKED_PROMPT_LIMIT 的 prompt，
+# 又不至于撑爆推送体积。
 _EVENT_FIELD_LIMIT = 4000
+
+# blocked 推送里 prompt 的截断长度。
+#
+# 原来是硬编码的 500，实测会把选择器腰斩：一屏 AskUserQuestion（含每项的
+# 描述行）轻松超过 500 字符，最后那行
+#     Enter to select · ↑/↓ to navigate · Esc to cancel
+# 被截成 `↑/↓ to nav`，客户端的 is_selector_hint 认不出，就判定「选择器
+# 已经翻过去了」，整组选项丢弃，卡片回落成 Yes/Trust/No——按钮和屏幕上
+# 问的对不上，点了等于替 agent 乱答。
+#
+# 2000 装得下实测抓屏（read_pane_async 只留 20 行），又在 _EVENT_FIELD_LIMIT
+# 之内。中文一个字符顶一个额度，别按英文的直觉估。
+BLOCKED_PROMPT_LIMIT = 2000
 _EVENT_MAX_KEYS = 32
 
 
@@ -1156,7 +1170,7 @@ async def announce_blocked(pane_id, *, agent, project, host, remote):
     await broadcast({
         "type": "blocked", "pane_id": pane_id,
         "agent": agent, "project": project, "host": host,
-        "prompt": content[:500],
+        "prompt": content[:BLOCKED_PROMPT_LIMIT],
         "options": options or TOOL_OPTIONS,
     })
     await send_web_push(
@@ -1243,7 +1257,7 @@ async def event_push():
                         "agent": agent_data.get("agent", ""),
                         "project": agent_data.get("project", ""),
                         "host": host,
-                        "prompt": content[:500],
+                        "prompt": content[:BLOCKED_PROMPT_LIMIT],
                         "options": options or TOOL_OPTIONS,
                     })
                     await send_web_push(
