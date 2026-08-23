@@ -3146,6 +3146,137 @@ class MultiSelectFormTests(unittest.TestCase):
         self.assertFalse(lk.is_tui_tail_option("修 [bug] 再发版"))
 
 
+class MultiSelectToggleTests(unittest.TestCase):
+    """多选框的真实按键语义（实测，见 detect_multiselect 的注释）。
+
+    数字键是「切换勾选」而非「选中并提交」，Enter 也不提交——它只切换光标
+    所在项。真正提交要 Tab 进 Review 页再按 1。
+    """
+
+    def test_detects_multiselect(self):
+        self.assertTrue(
+            lk.detect_multiselect(lk.clean_pane(REAL_MULTISELECT_PANE)))
+
+    def test_single_select_is_not_multiselect(self):
+        """单选框没有 [ ] 标记，别误判——否则单选也要求你按 Submit。"""
+        self.assertFalse(
+            lk.detect_multiselect(lk.clean_pane(REAL_MULTI_TAB_PANE)))
+
+    def test_checked_state_is_read(self):
+        """卡片要能显示哪些已勾上，否则你不知道自己点到哪了。"""
+        pane = ("选哪些？\n❯ 1. [✔] 甲\n  2. [ ] 乙\n  3. [✔] 丙\n"
+                "\nEnter to select · ↑/↓ to navigate · Esc to cancel")
+        self.assertEqual(lk.checked_flags(lk.clean_pane(pane)),
+                         [True, False, True])
+
+    def test_unchecked_when_single_select(self):
+        """单选框没有勾选态，返回空表示「不适用」。"""
+        self.assertEqual(lk.checked_flags(lk.clean_pane(REAL_MULTI_TAB_PANE)), [])
+
+
+class MultiSelectCardTests(unittest.TestCase):
+    """多选卡片：勾多个再 Submit。"""
+
+    def _card(self, checked=None):
+        return lk.build_option_card(
+            "w1:p1", "proj", ["单测", "静态扫描", "安全审计"], "abcde",
+            question="要跑哪些检查？", multiselect=True,
+            checked=checked or [False, False, False])
+
+    def _buttons(self, card):
+        out = []
+        for el in card["elements"]:
+            if el.get("tag") == "action":
+                out.extend(el["actions"])
+        return out
+
+    def test_has_submit_button(self):
+        labels = [b["text"]["content"] for b in self._buttons(self._card())]
+        self.assertTrue(any("Submit" in x for x in labels), labels)
+
+    def test_submit_uses_its_own_action(self):
+        """Submit 不能复用 approval：它发的是 Tab+1，不是一个数字。"""
+        submit = [b for b in self._buttons(self._card())
+                  if "Submit" in b["text"]["content"]][0]
+        self.assertEqual(submit["value"]["a"], lk.ACTION_CODES["submit"])
+
+    def test_checked_options_marked(self):
+        """已勾选的项要在按钮上看得出来。"""
+        labels = [b["text"]["content"]
+                  for b in self._buttons(self._card([True, False, True]))]
+        self.assertIn("✔", labels[0])
+        self.assertNotIn("✔", labels[1])
+        self.assertIn("✔", labels[2])
+
+    def test_single_select_has_no_submit(self):
+        """单选框点一下就定了，多一个 Submit 只会让人误以为还要再点。"""
+        card = lk.build_option_card("w1:p1", "proj", ["甲", "乙"], "abcde",
+                                    question="选哪个？")
+        labels = [b["text"]["content"] for b in self._buttons(card)]
+        self.assertFalse(any("Submit" in x for x in labels), labels)
+
+    def test_toggle_buttons_keep_numeric_keys(self):
+        """勾选仍靠数字键，与屏幕编号一一对应。"""
+        keys = [b["value"].get("k") for b in self._buttons(self._card())
+                if b["value"].get("a") == lk.ACTION_CODES["approval"]]
+        self.assertEqual(keys, ["1", "2", "3"])
+
+    def test_generation_carried_on_submit(self):
+        """Submit 也要带 generation，否则旧卡片上的它仍能提交。"""
+        submit = [b for b in self._buttons(self._card())
+                  if "Submit" in b["text"]["content"]][0]
+        self.assertEqual(submit["value"]["g"], "abcde")
+
+
+class OptionsCardFromPaneTests(unittest.TestCase):
+    """从真实 pane 文本推卡片时，多选/单选要各自渲染对。
+
+    三个推卡片的调用点都走 build_options_card，所以在这一层验就够了。
+    """
+
+    def _labels(self, card):
+        out = []
+        for el in card["elements"]:
+            if el.get("tag") == "action":
+                out.extend(b["text"]["content"] for b in el["actions"])
+        return out
+
+    def test_multiselect_pane_gets_submit(self):
+        content = lk.clean_pane(REAL_MULTISELECT_PANE)
+        group = lk.current_option_group(lk.detect_option_groups(content))
+        card = lk.build_options_card("w1:p1", "proj", group["options"],
+                                     "abcde", question=group["question"],
+                                     content=content)
+        self.assertTrue(any("Submit" in x for x in self._labels(card)))
+
+    def test_single_select_pane_has_no_submit(self):
+        content = lk.clean_pane(REAL_MULTI_TAB_PANE)
+        group = lk.current_option_group(lk.detect_option_groups(content))
+        card = lk.build_options_card("w1:p1", "proj", group["options"],
+                                     "abcde", question=group["question"],
+                                     content=content)
+        self.assertFalse(any("Submit" in x for x in self._labels(card)))
+
+    def test_without_content_stays_single_select(self):
+        """旧调用方不传 content，行为不变。"""
+        card = lk.build_options_card("w1:p1", "proj", ["甲", "乙"], "abcde")
+        self.assertFalse(any("Submit" in x for x in self._labels(card)))
+
+
+class SubmitKeySequenceTests(unittest.TestCase):
+    """提交的按键序列。实测：Enter 不提交，Tab 才进 Review 页。"""
+
+    def test_sequence_is_tab_then_one(self):
+        self.assertEqual(lk.multiselect_submit_keys(), ["Tab", "1"])
+
+    def test_keys_are_relay_safe(self):
+        """relay 的 SAFE_KEYS 白名单只认这些名字，发别名会被整条拒绝。"""
+        for key in lk.multiselect_submit_keys():
+            with self.subTest(key=key):
+                self.assertIn(key, {"Tab", "Enter", "Escape"} |
+                              {str(n) for n in range(10)})
+
+
 class TuiTailItemTests(unittest.TestCase):
     """TUI 固定尾项的识别。它们跟着每一个 AskUserQuestion 选择器走。"""
 

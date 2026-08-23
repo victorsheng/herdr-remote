@@ -74,6 +74,7 @@ ACTION_CODES = {
     "select_reply": "q",
     "trust": "t",
     "approval": "k",
+    "submit": "u",
     "page": "g",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
@@ -616,6 +617,8 @@ def build_option_card(
     question: str = "",
     prompt: str = "",
     agent: str = "",
+    multiselect: bool = False,
+    checked: list[bool] | None = None,
 ) -> dict:
     """「正等你选」的唯一一张卡片。
 
@@ -628,9 +631,18 @@ def build_option_card(
     提示永远确认不了。
     """
     shown = options[:_MAX_OPTIONS]
-    styles = _option_styles(shown)
+    flags = list(checked or [])
+    if multiselect:
+        # 多选按数字是「切换勾选」，不是选中并前进，所以整排都不给 primary
+        # ——高亮某一项会让人以为点它就定了。
+        styles = ["default"] * len(shown)
+        marks = ["✔ " if i < len(flags) and flags[i] else "☐ "
+                 for i in range(len(shown))]
+    else:
+        styles = _option_styles(shown)
+        marks = [""] * len(shown)
     actions = [
-        _button(f"{i + 1}. {opt[:OPTION_LABEL_LIMIT]}", action_value(
+        _button(f"{i + 1}. {marks[i]}{opt[:OPTION_LABEL_LIMIT]}", action_value(
             "approval", pane_id, g=generation, k=str(i + 1)), styles[i])
         for i, opt in enumerate(shown)
     ]
@@ -645,6 +657,16 @@ def build_option_card(
         elements.append({"tag": "div", "text": {
             "tag": "lark_md", "content": f"**{question}**"}})
     elements.append({"tag": "action", "actions": actions})
+    if multiselect:
+        # 多选要显式提交：勾完点 Submit，卡片才把答案交上去。
+        # 单选不给这个按钮——点一下就定了，多一个 Submit 只会让人以为还要再点。
+        elements.append({"tag": "div", "text": {
+            "tag": "lark_md",
+            "content": "_可多选：点选项切换勾选，选完点 Submit_"}})
+        elements.append({"tag": "action", "actions": [
+            _button("✔ Submit", action_value(
+                "submit", pane_id, g=generation), "primary"),
+        ]})
     # blocked 是被动推来的，人还没看过输出，给个直达入口。
     if prompt:
         elements.append({"tag": "action", "actions": [
@@ -677,10 +699,17 @@ def build_blocked_card(
 
 
 def build_options_card(pane_id: str, project: str, options: list[str],
-                       generation: str, question: str = "") -> dict:
-    """读 pane 时发现正等着选，或答完一组后补推下一组。"""
+                       generation: str, question: str = "",
+                       content: str = "") -> dict:
+    """读 pane 时发现正等着选，或答完一组后补推下一组。
+
+    给了 content 就从中判断这是不是多选框——多选按数字只是切换勾选，得配一个
+    Submit 按钮，语义与单选完全不同。不给则按单选渲染（旧调用方）。
+    """
+    multiselect = detect_multiselect(content) if content else False
     return build_option_card(pane_id, project, options, generation,
-                             question=question)
+                             question=question, multiselect=multiselect,
+                             checked=checked_flags(content) if multiselect else None)
 
 
 def current_option_group(groups: list[dict]) -> dict | None:
@@ -1576,7 +1605,51 @@ def strip_checkbox(text: str) -> str:
     return _CHECKBOX_RE.sub("", (text or "").strip())
 
 
-def detect_option_groups(text: str) -> list[dict]:
+# 勾选态：`[✔] 单测` 里方括号内非空即已勾。
+_CHECKED_RE = re.compile(r"^\[\s*[xX✓✔·*]\s*\]")
+
+
+def checked_flags(text: str) -> list[bool]:
+    """多选框各项当前是否已勾选，按屏幕顺序。
+
+    单选框没有 `[ ]` 标记，返回空列表表示「不适用」——调用处据此区分
+    「一个都没勾」和「这压根不是多选框」。
+    """
+    flags = []
+    for group in detect_option_groups(text, keep_markers=True):
+        flags = [bool(_CHECKED_RE.match(opt)) for opt in group["options"]]
+    if not any(_CHECKBOX_RE.match(o)
+               for g in detect_option_groups(text, keep_markers=True)
+               for o in g["options"]):
+        return []
+    return flags
+
+
+def detect_multiselect(text: str) -> bool:
+    """这屏是多选框吗。
+
+    多选框每项前带 `[ ]`；单选框没有。两者按键语义完全不同——多选按数字是
+    切换勾选，单选按数字是选中并前进，卡片不能一视同仁。
+    """
+    return bool(checked_flags(text)) or any(
+        _CHECKBOX_RE.match(o)
+        for g in detect_option_groups(text, keep_markers=True)
+        for o in g["options"])
+
+
+def multiselect_submit_keys() -> list[str]:
+    """提交多选的按键序列。
+
+    实测（Claude Code v2.1.239）：数字键切换勾选，Enter **不提交**——它只
+    切换光标所在项。Tab 才会进 Review 页（`1. Submit answers / 2. Cancel`），
+    在那儿按 1 才真正提交。所以是 Tab + 1，不是 Enter。
+
+    两个键都在 relay 的 SAFE_KEYS 白名单里；发别名会被整条拒绝。
+    """
+    return ["Tab", "1"]
+
+
+def detect_option_groups(text: str, keep_markers: bool = False) -> list[dict]:
     """认出所有「正在等你选」的组。
 
     AskUserQuestion 一次能问好几组，每组都从 1 重新编号；屏幕上通常只渲染
@@ -1603,7 +1676,7 @@ def detect_option_groups(text: str) -> list[dict]:
         return []
 
     start = _selector_start(tail, last_option_at)
-    return _parse_groups(tail, start, last_option_at)
+    return _parse_groups(tail, start, last_option_at, keep_markers)
 
 
 def _last_option_line(lines: list[str]) -> int:
@@ -1689,7 +1762,8 @@ def _selector_start(lines: list[str], last_option_at: int) -> int:
     return start
 
 
-def _parse_groups(lines: list[str], start: int, end: int) -> list[dict]:
+def _parse_groups(lines: list[str], start: int, end: int,
+                  keep_markers: bool = False) -> list[dict]:
     """把选择器区间切成组。编号回到 1 就是新的一组。"""
     groups: list[dict] = []
     current: list[tuple[int, str]] = []
@@ -1705,8 +1779,8 @@ def _parse_groups(lines: list[str], start: int, end: int) -> list[dict]:
                 # 先按屏幕编号校验连续性，再摘掉固定尾项：尾项也占编号，
                 # 提前摘掉会让 4/5 缺位，整组被连续性校验丢掉。
                 # 尾项恒在末尾，摘掉后剩下的仍是 1..n，按钮发的数字依旧对得上屏幕。
-                kept = [strip_checkbox(t) for _, t in current
-                        if not is_tui_tail_option(t)]
+                kept = [t if keep_markers else strip_checkbox(t)
+                        for _, t in current if not is_tui_tail_option(t)]
                 if len(kept) >= 2:
                     groups.append({
                         "question": question.strip(),
@@ -2808,6 +2882,8 @@ class LarkBot:
             await self._interrupt(ctx.chat_id, agent)
         elif action == "approval":
             await self._approve(ctx, data, pane_id)
+        elif action == "submit":
+            await self._submit_multiselect(ctx, data, pane_id)
         else:
             self.reply_text(ctx.chat_id, "That action is no longer valid. Use /agents.")
 
@@ -2828,10 +2904,62 @@ class LarkBot:
         self.audit(ctx.chat_id, "approve",
                    find_agent(self.agents, pane_id) or {"pane_id": pane_id},
                    f"选项 {key}")
+        await asyncio.sleep(1.2)
+
+        # 多选框里数字键只是「切换勾选」，人还要继续勾。此时不能把
+        # approval_token 清掉——清了下一次点击就会被当成过期审批拒掉，
+        # 于是只能勾中一项。改推一张刷新过勾选态的卡片，让人接着勾。
+        if await self._refresh_multiselect(ctx.chat_id, pane_id):
+            return
+
         self.approval_tokens.pop(pane_id, None)
         self.reply_text(ctx.chat_id, f"已选 {key}")
         # 多组问题是逐组问的：答完这组，下一组才会显示出来。
-        # 等 TUI 刷新后再看一眼，有新的就接着推。
+        await self._push_next_group(ctx.chat_id, pane_id)
+
+    async def _refresh_multiselect(self, chat_id: str, pane_id: str) -> bool:
+        """还停在多选框上就重推一张带最新勾选态的卡片，返回是否推了。
+
+        读 pane 失败时返回 False，退回单选那条路径：宁可把它当已答完，
+        也别把人卡在一张永远不刷新的卡片上。
+        """
+        try:
+            content = clean_pane(await read_pane(pane_id))
+        except Exception as exc:
+            log.warning("multiselect refresh failed: %s", scrub(exc))
+            return False
+        if not detect_multiselect(content):
+            return False
+        current = current_option_group(detect_option_groups(content))
+        if not current:
+            return False
+        agent = find_agent(self.agents, pane_id) or {}
+        generation = new_generation()
+        self.approval_tokens[pane_id] = generation
+        card_id = self.reply_card(chat_id, build_option_card(
+            pane_id, agent.get("project") or "agent", current["options"],
+            generation, question=current["question"],
+            multiselect=True, checked=checked_flags(content)))
+        self.remember(chat_id, card_id, pane_id)
+        return True
+
+    async def _submit_multiselect(self, ctx: MessageContext, data: dict,
+                                  pane_id: str) -> None:
+        """提交多选：Tab 进 Review 页，再按 1 确认。
+
+        Enter 是不行的——实测它只切换光标所在项，不提交。
+        """
+        if not approval_is_current(self.approval_tokens, pane_id, data.get("g")):
+            self.reply_text(
+                ctx.chat_id,
+                "那条审批属于更早的提示，请用最新一条 blocked 通知上的按钮。")
+            return
+        await send_keys_to_relay(pane_id, multiselect_submit_keys())
+        self.audit(ctx.chat_id, "approve",
+                   find_agent(self.agents, pane_id) or {"pane_id": pane_id},
+                   "提交多选")
+        self.approval_tokens.pop(pane_id, None)
+        self.reply_text(ctx.chat_id, "已提交")
         await asyncio.sleep(1.2)
         await self._push_next_group(ctx.chat_id, pane_id)
 
@@ -2852,7 +2980,7 @@ class LarkBot:
         self.approval_tokens[pane_id] = generation
         card_id = self.reply_card(chat_id, build_options_card(
             pane_id, project, current["options"], generation,
-            question=current["question"]))
+            question=current["question"], content=content))
         self.remember(chat_id, card_id, pane_id)
 
     # --- 辅助 ---
@@ -2926,7 +3054,7 @@ class LarkBot:
             current = current_option_group(groups)
             card_id = self.reply_card(chat_id, build_options_card(
                 pane_id, project, current["options"], generation,
-                question=current["question"]))
+                question=current["question"], content=content))
             self.remember(chat_id, card_id, pane_id)
 
     async def _interrupt(self, chat_id: str, agent: dict) -> None:
@@ -3113,7 +3241,7 @@ async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
             current = current_option_group(groups)
             card_id = bot.reply_card(chat_id, build_options_card(
                 pane_id, project, current["options"], generation,
-                question=current["question"]))
+                question=current["question"], content=content))
             bot.remember(chat_id, card_id, pane_id)
 
 
