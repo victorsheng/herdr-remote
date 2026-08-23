@@ -100,6 +100,14 @@ else
   PASS=$((PASS+1)); echo "  skip: relay not running"
 fi
 
+echo "L8. usage stats"
+uv run "$DIR/tests/test_usage.py" >/dev/null 2>&1
+assert_eq "$?" "0" "usage stats tests"
+
+echo "L9. /usage wired into lark bot"
+grep -q 'command == "usage"' "$DIR/relay/herdr_lark.py"
+assert_eq "$?" "0" "/usage dispatched"
+
 # --- TUI ---
 echo ""
 echo "=== TUI ==="

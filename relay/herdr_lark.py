@@ -1366,6 +1366,27 @@ def format_health(*, relay_connected: bool, relay_url: str, agents: int,
     return "\n".join(lines)
 
 
+# --- Claude 用量 ---
+
+def usage_report() -> str:
+    """跑 herdr_usage 的统计，拿来当 /usage 的回复。
+
+    单独一个模块而不是内联：命令行也要能直接跑，两边同一套口径。
+    同目录导入，import 失败就说清楚，别让用户对着空回复猜。
+    """
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herdr_usage.py")
+    try:
+        spec = importlib.util.spec_from_file_location("herdr_usage", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.format_report(mod.collect())
+    except FileNotFoundError:
+        return f"找不到 {path}"
+    except Exception as exc:
+        return f"统计用量失败: {scrub(exc)}"
+
+
 # --- 审计 ---
 
 AUDIT_DETAIL_LIMIT = 200
@@ -1569,6 +1590,7 @@ COMMAND_HELP = [
     {"group": "看", "name": "watch", "args": "[序号]", "desc": "跟随输出，stop 停止"},
     {"group": "看", "name": "status", "args": "", "desc": "连接状态"},
     {"group": "看", "name": "digest", "args": "", "desc": "今日活动统计"},
+    {"group": "看", "name": "usage", "args": "", "desc": "Claude 用量（5h 窗 + 本周）"},
 
     {"group": "干", "name": "send", "args": "<序号> <内容>", "desc": "发指令（也可直接打字）"},
     {"group": "干", "name": "trust", "args": "<序号>", "desc": "批准并总是允许"},
@@ -2116,6 +2138,10 @@ class LarkBot:
             return
         if command == "digest":
             self.reply_text(ctx.chat_id, format_digest(self.daily_stats))
+            return
+        if command == "usage":
+            # 扫 ~/.claude 下的日志要读几十 MB，别卡住事件循环。
+            self.reply_text(ctx.chat_id, await asyncio.to_thread(usage_report))
             return
         if command == "health":
             self.reply_text(ctx.chat_id, format_health(

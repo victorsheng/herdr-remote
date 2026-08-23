@@ -111,6 +111,71 @@ herdr · [w22] yqg-dw-datapilot
 HERDR_LARK_AUDIT=off
 ```
 
+### 查用量
+
+`/usage` 按两个计费周期分别统计 Claude 的 token 消耗：
+
+```
+Claude 用量
+
+5 小时窗   1.1M tokens
+   08/23 10:00 起 · 2小时6分后重置
+   486 条消息 · 3 个会话
+   opus-5 323.7K
+
+本周   71.3M tokens
+   08/17 00:00 起 · 11小时6分后重置
+   18746 条消息 · 212 个会话
+   opus-5 9.3M · haiku-4-5 281.2K · sonnet-5 244.6K
+
+本周项目 Top3
+   datapilot6  2.7M
+   subagents  2.1M
+   tailcale  928.2K
+```
+
+数据源是 Claude Code 自己写的会话日志 `~/.claude/projects/**/*.jsonl`，
+每条助手消息都带 usage 明细。只扫 mtime 在窗口内的文件，1290 个日志
+（约 700MB）跑完不到 1 秒。
+
+**5 小时窗按整点对齐**（0/5/10/15/20 点），不是「从现在往前推 5 小时」——
+滑动窗口的话「还剩多久重置」就没有意义了。
+
+**周起点默认周一**，但 Anthropic 的周额度按订阅日重置，未必是周一：
+
+```bash
+HERDR_USAGE_WEEK_ANCHOR=6    # 改成周日起算
+```
+
+**缓存读取不计入总量**。它按折扣计费，和「烧掉多少额度」不是一个口径 ——
+本周缓存读 2.8B 而实际总量 71M，把它算进来数字虚高几十倍，看不出真实消耗。
+命令行加 `--detail` 能看到完整明细（含缓存读）。
+
+#### 关于百分比
+
+**额度上限拿不到**：它不在本地任何文件里（`stats-cache.json` 只有消息计数，
+`policy-limits.json` 只有功能开关），只有 Anthropic 服务端知道。所以默认
+只显示绝对用量，不假装算得出「用了百分之几」。
+
+想看进度条，自己把上限填进去：
+
+```bash
+HERDR_USAGE_5H_LIMIT=2000000
+HERDR_USAGE_WEEK_LIMIT=100000000
+```
+
+```
+5 小时窗   ●●●●●○○○○○ 55%
+   1.1M / 2.0M
+```
+
+命令行也能直接跑，和飞书里同一套口径：
+
+```bash
+uv run relay/herdr_usage.py           # 同 /usage
+uv run relay/herdr_usage.py --detail  # 加缓存明细与耗时
+```
+
 ### agent 停下来时会主动推
 
 不用一直盯着。agent 从 working/blocked 变回 idle/done 时，自动推送：
@@ -138,6 +203,7 @@ HERDR_LARK_AUDIT=off
 | `/trust <序号>` | 对 blocked 的 agent 发「trust, always allow」 |
 | `/interrupt <序号>` | 发 Ctrl+C |
 | `/digest` | 今日活动统计（工作时长、被阻塞次数） |
+| `/usage` | Claude 用量：5 小时窗 + 本周，两个周期分别统计 |
 | `/render card\|text` | 切换输出样式，见下 |
 | `/watch [序号]` | 持续跟随，卡片自己刷新；`/watch stop` 停止 |
 | `/new <序号> [类型]` | **新开一个 agent**，用该序号 agent 的目录 |
@@ -415,6 +481,9 @@ grep -v "^\[Lark\]\|^INFO:Lark" /tmp/lark_run.log
 | `HERDR_LARK_RENDER` | 输出样式 `card` / `text` | `card` |
 | `HERDR_LARK_AUTOWATCH` | 自动跟随 `off` / 秒数 | 开，120 秒 |
 | `HERDR_LARK_AUDIT` | 审计回执开关 `off` 关闭 | 开 |
+| `HERDR_USAGE_5H_LIMIT` | 5 小时窗 token 上限（配了才显示百分比） | 空 |
+| `HERDR_USAGE_WEEK_LIMIT` | 周 token 上限 | 空 |
+| `HERDR_USAGE_WEEK_ANCHOR` | 周额度从哪天起算，0=周一…6=周日 | 0 |
 | `HERDR_RELAY` | relay 地址（含 token） | `ws://127.0.0.1:8375` |
 
 凭据存 `~/.config/herdr-remote/secrets.env`，权限 0600。
