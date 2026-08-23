@@ -519,6 +519,20 @@ async def read_pane(pane_id: str, lines: int = READ_LINES) -> str:
     return "(no response)"
 
 
+def is_pane_read_error(content: str) -> bool:
+    """read_pane 这次是失败了吗。
+
+    read_pane 失败不抛异常，而是返回 `(error reading pane: …)` / `(no response)`
+    这样的字符串——调用方只 try/except 是拦不住的，会把这句话当成正常屏幕
+    内容去解析。解析不出选择器就以为人已经答完，清掉 approval_token，
+    于是下一次点击被当成过期审批拒掉，人卡死在卡片上。
+    """
+    text = (content or "").strip()
+    if not text:  # 空屏判断不了状态，按失败处理，别拿它当「已答完」的依据
+        return True
+    return text.startswith("(error reading pane:") or text == "(no response)"
+
+
 # --- 卡片构造 ---
 
 # 与 relay 的 TOOL_OPTIONS / SUBAGENT_OPTIONS 对应（见 herdr_relay.py:63）。
@@ -641,9 +655,13 @@ def build_option_card(
     else:
         styles = _option_styles(shown)
         marks = [""] * len(shown)
+    # 带上「这是多选」的标记：_approve 得在发键之前决定补不补 Enter
+    # （单选补了才提交，多选补了就把没勾完的答案交出去），而卡片是什么形态
+    # 在这里就已经确定，编进 value 比事后读屏判断可靠。
+    flag = {"m": 1} if multiselect else {}
     actions = [
         _button(f"{i + 1}. {marks[i]}{opt[:OPTION_LABEL_LIMIT]}", action_value(
-            "approval", pane_id, g=generation, k=str(i + 1)), styles[i])
+            "approval", pane_id, g=generation, k=str(i + 1), **flag), styles[i])
         for i, opt in enumerate(shown)
     ]
 
@@ -693,9 +711,26 @@ def build_blocked_card(
     options: list[str] | None,
     generation: str,
 ) -> dict:
-    """agent 卡住时推的审批卡片。relay 监听那条路径在调。"""
-    return build_option_card(pane_id, project, _approval_labels(options), generation,
-                             prompt=prompt or " ", agent=agent or "agent")
+    """agent 卡住时推的审批卡片。relay 监听那条路径在调。
+
+    优先用 prompt 里真正的选择器。relay 的 detect_options 只认两种权限提示
+    （yes, single permission / approve all pending），AskUserQuestion 的选择器
+    认不出，就回落成 TOOL_OPTIONS——卡片显示 Yes/Trust/No，而屏幕上问的却是
+    「1. 先停下 2. 继续建群 3. 先看日志」，按钮和选项对不上，点了等于乱答。
+    我们这边已经能解析选择器，就别再信那个回落值。
+    """
+    group = current_option_group(detect_option_groups(prompt or ""))
+    labels = group["options"] if group else _approval_labels(options)
+    multiselect = detect_multiselect(prompt or "") if group else False
+    # 选项已经是按钮了，正文里再留一份纯属重复，还会挤掉 truncate_prompt
+    # 的额度——正文一长，中间那段省略正好盖住问题和选项。摘掉选择器，
+    # 问题单独成块，剩下的额度留给上文。
+    body = strip_selector(prompt or "") if group else (prompt or "")
+    return build_option_card(pane_id, project, labels, generation,
+                             prompt=body or " ", agent=agent or "agent",
+                             question=group["question"] if group else "",
+                             multiselect=multiselect,
+                             checked=checked_flags(prompt or "") if multiselect else None)
 
 
 def build_options_card(pane_id: str, project: str, options: list[str],
@@ -1555,7 +1590,10 @@ def audit_enabled(value: str | None) -> bool:
 # --- 选择器检测 ---
 
 # 「 ❯ 1. Yes 」「2. trust, always allow」——前面可能有箭头或缩进。
-_OPTION_RE = re.compile(r"^\s*[❯>»\*]?\s*(\d{1,2})[.)．]\s+(\S.*)$")
+# 也可能带 TUI 左边框：relay 推 blocked 时给的是原始抓屏，没走 clean_pane，
+# `│ ❯ 1. 先停下` 这种边框还在。不认它的话整组选项解析不出来，卡片退回
+# Yes/Trust/No，按钮和屏幕上问的对不上。
+_OPTION_RE = re.compile(r"^[\s│┃|]*[❯>»\*]?\s*(\d{1,2})[.)．]\s+(\S.*)$")
 # 从末尾往上找选择器，最多翻这么多行。够深以容纳多组多选项的长选择器，
 # 真正的边界靠「连续正文块」判定，不靠行数。
 _OPTION_SCAN_LINES = 200
@@ -1637,16 +1675,75 @@ def detect_multiselect(text: str) -> bool:
         for o in g["options"])
 
 
-def multiselect_submit_keys() -> list[str]:
-    """提交多选的按键序列。
+# 多选提交后的 Review 页。实测抓屏：
+#   Ready to submit your answers?
+#   ❯ 1. Submit answers
+#     2. Cancel
+# 它自己也是个编号选择器，_push_next_group 读屏时会误当成「下一组问题」
+# 推成卡片——人看到一张莫名其妙的「1. Submit answers / 2. Cancel」，
+# 点下去等于替 agent 乱答。识别出来就别再推。
+_REVIEW_PAGE_RE = re.compile(r"ready to submit your answers", re.I)
+_REVIEW_OPTION_RE = re.compile(r"submit answers", re.I)
+
+
+def is_review_page(text: str) -> bool:
+    """这屏是多选提交后的 Review 确认页吗。"""
+    body = text or ""
+    if _REVIEW_PAGE_RE.search(body):
+        return True
+    # 提示语可能被裁掉，退而认选项本身。
+    group = current_option_group(detect_option_groups(body))
+    return bool(group and any(_REVIEW_OPTION_RE.search(o)
+                              for o in group["options"]))
+
+
+def approval_keys(key: str, *, multiselect: bool) -> list[str]:
+    """点一个选项按钮要发的按键序列。
+
+    单选框按数字只是把光标移过去并高亮，**不提交**——还得 Enter 才算选定。
+    只发数字的话，人在飞书上点了按钮、屏幕上看着也确实选中了，agent 却一直
+    卡在那儿不动（实测：选了 1，没给我打回车）。
+
+    多选框相反：数字键是切换勾选，补 Enter 会把才勾了一项的答案交上去，
+    人还没勾完就被交卷。多选的提交走 multiselect_submit_steps（Tab → 等 → 1）。
+
+    Enter 必须用这个拼写：relay 的 SAFE_KEYS 只认它，发别名会被整条拒绝。
+    """
+    return [str(key)] if multiselect else [str(key), "Enter"]
+
+
+# Tab 切到 Review 页之后，等它渲染出来再按 1。
+# 实测：一次性发 ["Tab","1"] 会停在 `Ready to submit your answers?` 上不动
+# ——1 赶在 Review 页渲染完之前到达，被丢掉。隔开再发就提交成功。
+MULTISELECT_SUBMIT_WAIT_S = 1.2
+
+
+def multiselect_submit_steps() -> list[dict]:
+    """提交多选的分步按键。每步 {"keys": [...], "wait": 发完等几秒}。
 
     实测（Claude Code v2.1.239）：数字键切换勾选，Enter **不提交**——它只
-    切换光标所在项。Tab 才会进 Review 页（`1. Submit answers / 2. Cancel`），
-    在那儿按 1 才真正提交。所以是 Tab + 1，不是 Enter。
+    切换光标所在项。Tab 进 Review 页（`1. Submit answers / 2. Cancel`），
+    在那儿按 1 才真正提交。
 
-    两个键都在 relay 的 SAFE_KEYS 白名单里；发别名会被整条拒绝。
+    但两个键不能一次发完：Tab 切页要时间，紧跟着的 1 会在 Review 页渲染
+    出来之前到达并被丢掉，人就卡在 Review 页上（实测复现）。所以拆两步，
+    中间等一下。
+
+    键名都在 relay 的 SAFE_KEYS 白名单里；发别名会被整条拒绝。
     """
-    return ["Tab", "1"]
+    return [
+        {"keys": ["Tab"], "wait": MULTISELECT_SUBMIT_WAIT_S},
+        {"keys": ["1"], "wait": 0.0},
+    ]
+
+
+def multiselect_submit_keys() -> list[str]:
+    """提交多选的按键，扁平版。
+
+    保留给「一次性发完也无所谓」的调用方（比如只想看键名的测试）。真正
+    提交请用 multiselect_submit_steps——它把 Tab 和 1 分开发，避免 1 丢失。
+    """
+    return [k for step in multiselect_submit_steps() for k in step["keys"]]
 
 
 def detect_option_groups(text: str, keep_markers: bool = False) -> list[dict]:
@@ -1662,21 +1759,65 @@ def detect_option_groups(text: str, keep_markers: bool = False) -> list[dict]:
 
     每组返回 {"question": 提问行, "options": [选项...]}。
     """
+    located = _locate_selector(text)
+    if not located:
+        return []
+    tail, start, last_option_at = located
+    return _parse_groups(tail, start, last_option_at, keep_markers)
+
+
+def _locate_selector(text: str) -> tuple[list[str], int, int] | None:
+    """定位末尾的选择器区间，返回 (tail, 起点, 最后一个选项行)。
+
+    解析选项和把选项从正文里摘掉（strip_selector）用的是同一个区间。分成
+    两处各判一次的话，「什么算选择器」会慢慢长歪：一边认得的变体另一边不
+    认得，卡片上就会出现「按钮有这项、正文里还重复一遍」的错位。
+    """
     lines = (text or "").splitlines()
     if not lines:
-        return []
+        return None
 
     tail = lines[-_OPTION_SCAN_LINES:]
     last_option_at = _last_option_line(tail)
     if last_option_at < 0:
-        return []
+        return None
     # 选项要贴着输出末尾。允许后面跟几行缩进说明（每个选项自带一行描述），
     # 但跟着大段正文的是散文里的编号列表，不是选择器。
     if not _is_selector_tail(tail[last_option_at + 1:]):
-        return []
+        return None
 
-    start = _selector_start(tail, last_option_at)
-    return _parse_groups(tail, start, last_option_at, keep_markers)
+    return tail, _selector_start(tail, last_option_at), last_option_at
+
+
+def strip_selector(text: str) -> str:
+    """把末尾的选择器整段摘掉，只留它上面的正文。
+
+    选项已经渲染成按钮了，正文里再留一份就是重复；而 truncate_prompt 只保
+    首尾各约 190 字，正文一长，中间的 `⋯ 省略 N 字 ⋯` 恰好盖住问题和选项
+    ——屏幕上问的是什么反而看不见（见飞书截图）。摘掉选择器，省下的额度
+    留给真正需要人判断的上文。
+    """
+    located = _locate_selector(text)
+    if not located:
+        return text or ""
+    tail, start, _ = located
+    lines = (text or "").splitlines()
+    # start 是 tail 内的下标，换算回原文。
+    cut = len(lines) - len(tail) + start
+    return "\n".join(lines[:cut]).rstrip()
+
+
+def _option_indent(line: str) -> int:
+    """选项行的缩进格数，不含 TUI 左边框和 ❯ 光标。
+
+    边框和光标都不算缩进：`│ \u276f 1. 先停下` 和 `│   2. 继续建群` 在屏幕上
+    是对齐的同级选项，算进去就成了不同层级。
+    """
+    raw = re.sub(r"^[│┃|]+", "", (line or "").replace("\t", "    "))
+    indent = len(raw) - len(raw.lstrip(" "))
+    cursor = re.match(r"^\s*([❯>»\*])\s*", raw)
+    # 光标占的位在别的行是空格，所以按同样宽度折算，保证同级对齐。
+    return cursor.end() if cursor else indent
 
 
 def _last_option_line(lines: list[str]) -> int:
@@ -1717,13 +1858,24 @@ def _is_tui_chrome(stripped: str) -> bool:
     return bool(_TUI_CHROME_RE.match(stripped))
 
 
+# 行首/行尾的 TUI 边框。relay 推 blocked 时给的是原始抓屏，没走 clean_pane，
+# `│ Enter to select · Esc to cancel` 这种边框还在——不剥掉，提示行就认不出，
+# _is_selector_tail 判定选择器已翻篇，整组选项被丢弃。
+_BORDER_RE = re.compile(r"^[\s│┃|]+|[\s│┃|]+$")
+
+
+def strip_border(line: str) -> str:
+    """剥掉一行两端的 TUI 边框字符。"""
+    return _BORDER_RE.sub("", line or "")
+
+
 def is_selector_hint(stripped: str) -> bool:
     """这行是选择器底部的操作提示吗。
 
     提示行属于选择器自己，不是「选择器之后的正文」。把它当正文的话，
     _is_selector_tail 会判定选择器已翻篇，整组选项被丢弃。
     """
-    return bool(_SELECTOR_HINT_RE.match((stripped or "").strip()))
+    return bool(_SELECTOR_HINT_RE.match(strip_border(stripped or "")))
 
 
 def is_tui_tail_option(text: str) -> bool:
@@ -1775,7 +1927,10 @@ def _parse_groups(lines: list[str], start: int, end: int,
         nonlocal current, question
         if len(current) >= 2:
             numbers = [n for n, _ in current]
-            if numbers == list(range(1, len(numbers) + 1)):
+            # 编号连续即可，不强求从 1 起：屏幕滚动时首项会被卷出去，
+            # 只剩 `2. / 3.`。强求从 1 起会把整组丢掉，人一个选项都点不到。
+            # 仍要求连续递增——散文里的编号列表往往跳号，靠这个挡住。
+            if numbers == list(range(numbers[0], numbers[0] + len(numbers))):
                 # 先按屏幕编号校验连续性，再摘掉固定尾项：尾项也占编号，
                 # 提前摘掉会让 4/5 缺位，整组被连续性校验丢掉。
                 # 尾项恒在末尾，摘掉后剩下的仍是 1..n，按钮发的数字依旧对得上屏幕。
@@ -1789,10 +1944,20 @@ def _parse_groups(lines: list[str], start: int, end: int,
         current = []
         question = ""
 
+    # 选项的基准缩进取区间内最浅的那一层。比它更深的编号行是选项自己的描述
+    # 文字（AskUserQuestion 每项带一行说明，说明里可能自带「1. …2. …」），
+    # 混进来会打乱编号序列，连续性校验把整组丢掉——卡片一个按钮都没有。
+    # 用相对值而非绝对值：权限提示的选项本身就缩进 5 格（`⎿` 嵌套渲染），
+    # 卡死一个绝对上限会把它们整组挡掉。
+    base_indent = min(
+        (_option_indent(lines[i]) for i in range(start, end + 1)
+         if _OPTION_RE.match(lines[i])),
+        default=0)
+
     for index in range(start, end + 1):
         line = lines[index]
         match = _OPTION_RE.match(line)
-        if match:
+        if match and _option_indent(line) <= base_indent:
             number = int(match.group(1))
             if number == 1 and current:
                 flush()
@@ -2900,7 +3065,9 @@ class LarkBot:
             return
         # 按选项序号发按键。发选项文本不行：relay 用 send-text 粘贴，
         # Claude 的 TUI 把粘贴里的换行当正文而非回车，提示确认不了。
-        await send_keys_to_relay(pane_id, [str(key)])
+        # 单选还要补 Enter——数字只是移光标高亮，不补就一直卡着不动。
+        multiselect = bool(data.get("m"))
+        await send_keys_to_relay(pane_id, approval_keys(key, multiselect=multiselect))
         self.audit(ctx.chat_id, "approve",
                    find_agent(self.agents, pane_id) or {"pane_id": pane_id},
                    f"选项 {key}")
@@ -2909,7 +3076,9 @@ class LarkBot:
         # 多选框里数字键只是「切换勾选」，人还要继续勾。此时不能把
         # approval_token 清掉——清了下一次点击就会被当成过期审批拒掉，
         # 于是只能勾中一项。改推一张刷新过勾选态的卡片，让人接着勾。
-        if await self._refresh_multiselect(ctx.chat_id, pane_id):
+        # 单选已经补 Enter 提交了，不能走这条：屏幕上若恰好是下一道多选题，
+        # 会被误当成「这一题还在勾」而重推卡片。
+        if multiselect and await self._refresh_multiselect(ctx.chat_id, pane_id):
             return
 
         self.approval_tokens.pop(pane_id, None)
@@ -2924,10 +3093,18 @@ class LarkBot:
         也别把人卡在一张永远不刷新的卡片上。
         """
         try:
-            content = clean_pane(await read_pane(pane_id))
+            raw = await read_pane(pane_id)
         except Exception as exc:
             log.warning("multiselect refresh failed: %s", scrub(exc))
-            return False
+            return True  # 读不到就别动 token：保住卡片，人还能接着勾
+        if is_pane_read_error(raw):
+            # 读失败不代表人答完了。清掉 token 会让下一次点击被当成过期审批
+            # 拒掉，人就卡死在这张卡片上——宁可留着卡片让人继续勾。
+            log.warning("multiselect refresh: pane read failed")
+            return True
+        content = clean_pane(raw)
+        if is_review_page(content):
+            return False  # 已经翻到 Review 页，不是还在勾的多选框
         if not detect_multiselect(content):
             return False
         current = current_option_group(detect_option_groups(content))
@@ -2954,7 +3131,12 @@ class LarkBot:
                 ctx.chat_id,
                 "那条审批属于更早的提示，请用最新一条 blocked 通知上的按钮。")
             return
-        await send_keys_to_relay(pane_id, multiselect_submit_keys())
+        # 分两步发：Tab 切到 Review 页要时间，紧跟着的 1 会在它渲染出来
+        # 之前到达并被丢掉，人就卡在 Review 页上。
+        for step in multiselect_submit_steps():
+            await send_keys_to_relay(pane_id, step["keys"])
+            if step["wait"]:
+                await asyncio.sleep(step["wait"])
         self.audit(ctx.chat_id, "approve",
                    find_agent(self.agents, pane_id) or {"pane_id": pane_id},
                    "提交多选")
@@ -2966,9 +3148,18 @@ class LarkBot:
     async def _push_next_group(self, chat_id: str, pane_id: str) -> None:
         """答完一组后，若还有下一组就接着推。"""
         try:
-            content = clean_pane(await read_pane(pane_id))
+            raw = await read_pane(pane_id)
         except Exception as exc:
             log.warning("next-group read failed: %s", scrub(exc))
+            return
+        if is_pane_read_error(raw):
+            log.warning("next-group read failed: pane unreadable")
+            return
+        content = clean_pane(raw)
+        if is_review_page(content):
+            # Tab 之后停在 Review 页很正常，它不是「下一组问题」。推成卡片
+            # 的话人会看到一张「1. Submit answers / 2. Cancel」，点下去等于
+            # 替 agent 乱答。
             return
         groups = detect_option_groups(content)
         current = current_option_group(groups)

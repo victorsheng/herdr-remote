@@ -3146,6 +3146,387 @@ class MultiSelectFormTests(unittest.TestCase):
         self.assertFalse(lk.is_tui_tail_option("修 [bug] 再发版"))
 
 
+# 真实场景（见飞书截图）：agent 停在 AskUserQuestion 选择器上，relay 却因为
+# 不认得这种提示而不给 options，卡片退化成了通用的 Yes/Trust/No。
+BLOCKED_WITH_REAL_SELECTOR = """\
+当前状态和你以为的不一样：原本 15 个项目群现在只剩 3 个。怎么办？
+
+❯ 1. 先停下，我去确认
+     不动。你先弄清那个并行会话在做什么。
+  2. 继续建群
+     按原计划把缺的群补回来。
+  3. 先看日志
+     把 /unbind drop 那几条日志翻出来。
+  4. Type something.
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel"""
+
+
+# 长正文 + 末尾选择器：truncate_prompt 的额度会被正文吃光，
+# 中间那段 `⋯ 省略 N 字 ⋯` 正好盖住问题和选项（见飞书截图）。
+LONG_PANE_WITH_SELECTOR = (
+    "Ran 1 shell command\n"
+    + "\n".join(f"输出第 {i} 行，这里是一大段无关的正文，用来把额度撑爆。"
+                for i in range(30))
+    + "\n\n当前状态和你以为的不一样，怎么办？\n\n"
+      "\u276f 1. 先停下，我去确认\n"
+      "     不动。你先弄清那个并行会话在做什么。\n"
+      "  2. 继续建群\n"
+      "  3. 先看日志\n\n"
+      "Enter to select \u00b7 Tab/Arrow keys to navigate \u00b7 Esc to cancel"
+)
+
+
+class BlockedCardReadabilityTests(unittest.TestCase):
+    """卡片上要看得清「在问什么」。
+
+    问题出在两处叠加：选项既进了 ``` 代码块又进了按钮，重复一遍；而正文
+    一长，truncate_prompt 只留首尾各约 190 字，中间的问题和选项被
+    `⋯ 省略 N 字 ⋯` 整段吃掉——屏幕上问的是什么反而看不见了。
+    """
+
+    def _text_blocks(self, card):
+        return [el["text"]["content"] for el in card["elements"]
+                if el.get("tag") == "div"]
+
+    def _labels(self, card):
+        out = []
+        for el in card["elements"]:
+            if el.get("tag") == "action":
+                out.extend(b["text"]["content"] for b in el["actions"])
+        return out
+
+    def test_question_rendered_as_its_own_block(self):
+        """问题行要单独成块，而不是只埋在代码块里等着被截断。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", LONG_PANE_WITH_SELECTOR, None, "abcde")
+        blocks = self._text_blocks(card)
+        self.assertTrue(
+            any("当前状态和你以为的不一样" in b and not b.startswith("```")
+                for b in blocks),
+            f"问题行没有单独渲染：{blocks}")
+
+    def test_selector_stripped_from_code_block(self):
+        """选项已经是按钮了，代码块里不该再重复一遍占额度。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", LONG_PANE_WITH_SELECTOR, None, "abcde")
+        code = next(b for b in self._text_blocks(card) if b.startswith("```"))
+        self.assertNotIn("1. 先停下", code)
+        self.assertNotIn("Enter to select", code)
+
+    def test_question_survives_long_output(self):
+        """正文再长，问题也不能被 `省略 N 字` 吃掉。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", LONG_PANE_WITH_SELECTOR, None, "abcde")
+        whole = " ".join(self._text_blocks(card))
+        self.assertIn("当前状态和你以为的不一样", whole)
+
+    def test_options_still_buttons(self):
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", LONG_PANE_WITH_SELECTOR, None, "abcde")
+        labels = " ".join(self._labels(card))
+        self.assertIn("先停下", labels)
+        self.assertIn("继续建群", labels)
+
+    def test_prose_before_selector_kept(self):
+        """选择器之前的正文是判断依据，要留着。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", LONG_PANE_WITH_SELECTOR, None, "abcde")
+        code = next(b for b in self._text_blocks(card) if b.startswith("```"))
+        self.assertIn("Ran 1 shell command", code)
+
+    def test_no_selector_leaves_prompt_alone(self):
+        """没有选择器时，代码块照旧是整段 prompt。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", "Bash(rm -rf build)\nProceed?",
+            lk.TOOL_OPTIONS, "abcde")
+        code = next(b for b in self._text_blocks(card) if b.startswith("```"))
+        self.assertIn("rm -rf build", code)
+
+
+class StripSelectorTests(unittest.TestCase):
+    """strip_selector：把末尾的选择器区间从正文里摘掉。"""
+
+    def test_removes_options_and_hint(self):
+        out = lk.strip_selector(LONG_PANE_WITH_SELECTOR)
+        self.assertNotIn("1. 先停下", out)
+        self.assertNotIn("Enter to select", out)
+
+    def test_keeps_prose(self):
+        out = lk.strip_selector(LONG_PANE_WITH_SELECTOR)
+        self.assertIn("Ran 1 shell command", out)
+
+    def test_no_selector_is_unchanged(self):
+        text = "just some output\nsecond line"
+        self.assertEqual(lk.strip_selector(text), text)
+
+    def test_empty_is_safe(self):
+        self.assertEqual(lk.strip_selector(""), "")
+
+
+# AskUserQuestion 多选提交后的 Review 页（实测抓屏，见 observer 日志）。
+# 它自己也是个编号选择器，不拦住就会被当成「下一组问题」推成一张卡片。
+REVIEW_PAGE = """\
+Ready to submit your answers?
+
+\u276f 1. Submit answers
+  2. Cancel
+
+Enter to select · Esc to cancel"""
+
+
+class SingleSelectSkipsRefreshTests(unittest.TestCase):
+    """单选点完就该收尾，不走多选刷新。
+
+    单选已经补 Enter 提交了，再去读屏找多选框有两个坏处：白等一次读屏；
+    更糟的是屏幕上若恰好出现下一道多选题，会被误当成「这一题还在勾」而
+    重推卡片，人以为刚才那次没生效。
+    """
+
+    def test_refresh_only_for_multiselect(self):
+        import inspect
+        source = inspect.getsource(lk.LarkBot._approve)
+        # 守卫必须在 _refresh_multiselect 调用之前
+        guard = source.index("multiselect and await self._refresh_multiselect")
+        self.assertGreater(guard, 0)
+
+
+class MultiselectFlagOnButtonsTests(unittest.TestCase):
+    """按钮 value 要带上「这是多选」的标记。
+
+    _approve 得在**发键之前**知道该不该补 Enter，不能等发完再读屏判断：
+    单选补 Enter 才提交，多选补了就把没勾完的答案交出去了。卡片是什么形态
+    在渲染时就已经确定，编进 value 最可靠。
+    """
+
+    def _option_values(self, card):
+        out = []
+        for el in card["elements"]:
+            if el.get("tag") == "action":
+                for b in el["actions"]:
+                    if b["value"].get("k"):
+                        out.append(b["value"])
+        return out
+
+    def test_multiselect_buttons_flagged(self):
+        card = lk.build_option_card(
+            "p1", "proj", ["单测", "静态扫描"], "gen",
+            multiselect=True, checked=[False, False])
+        for value in self._option_values(card):
+            self.assertEqual(value.get("m"), 1, f"缺多选标记: {value}")
+
+    def test_single_select_buttons_not_flagged(self):
+        card = lk.build_option_card("p1", "proj", ["是", "否"], "gen")
+        for value in self._option_values(card):
+            self.assertIsNone(value.get("m"), f"单选不该带多选标记: {value}")
+
+
+class ApprovalKeysTests(unittest.TestCase):
+    """单选要补回车，多选不能补。
+
+    实测：单选框按数字只是把光标移到那一项并高亮，**不提交**——还得按
+    Enter 才算选定。只发数字的话，人在飞书上点了按钮、屏幕上看着也选中了，
+    agent 却一直卡在那儿不动（实测：选了 1，没给我打回车）。
+
+    多选框相反：数字键是切换勾选，补 Enter 会把才勾了一项的答案提交出去，
+    人还没勾完就被交卷了。所以两者必须分开。
+    """
+
+    def test_single_select_appends_enter(self):
+        self.assertEqual(lk.approval_keys("1", multiselect=False), ["1", "Enter"])
+
+    def test_multiselect_sends_digit_only(self):
+        self.assertEqual(lk.approval_keys("2", multiselect=True), ["2"])
+
+    def test_keys_are_relay_safe(self):
+        """Enter 得用 relay SAFE_KEYS 认得的名字，发别名会被整条拒绝。"""
+        self.assertIn("Enter", lk.approval_keys("1", multiselect=False))
+
+
+class MultiselectSubmitSplitTests(unittest.TestCase):
+    """Tab 和 1 必须分两次发，中间等 Review 页渲染出来。
+
+    实测（逐键探测 w2A:p1）：一次性 send_keys(["Tab","1"]) 之后屏幕停在
+    `Ready to submit your answers? / ❯ 1. Submit answers`——Tab 切页要时间，
+    紧跟着的 1 在 Review 页渲染出来之前就到了，被丢掉。隔一会儿单独再发
+    一次 1，答案立刻提交成功（`probe 多选 → aa, cc`）。
+    """
+
+    def test_submit_is_two_steps(self):
+        steps = lk.multiselect_submit_steps()
+        self.assertEqual([s["keys"] for s in steps], [["Tab"], ["1"]])
+
+    def test_waits_between_steps(self):
+        """第一步之后必须有等待，否则等于没拆。"""
+        steps = lk.multiselect_submit_steps()
+        self.assertGreater(steps[0]["wait"], 0)
+
+    def test_legacy_helper_still_available(self):
+        """旧的 multiselect_submit_keys 还有调用方，保持可用。"""
+        self.assertEqual(lk.multiselect_submit_keys(), ["Tab", "1"])
+
+
+class ReviewPageTests(unittest.TestCase):
+    """多选提交后的 Review 页不是「下一组问题」。
+
+    实测：Tab 进 Review 页后屏幕是 `Ready to submit your answers? /
+    1. Submit answers / 2. Cancel`。它长得就是个编号选择器，_push_next_group
+    读屏时会误当成新一组问题推成卡片——人看到一张莫名其妙的
+    「1. Submit answers / 2. Cancel」卡片，点下去等于替 agent 乱答。
+    """
+
+    def test_review_page_is_recognised(self):
+        self.assertTrue(lk.is_review_page(REVIEW_PAGE))
+
+    def test_real_question_is_not_review_page(self):
+        pane = ("要跑哪些检查？\n\n"
+                "\u276f 1. [ ] 单测\n  2. [ ] 静态扫描\n\n"
+                "Enter to select · Esc to cancel")
+        self.assertFalse(lk.is_review_page(pane))
+
+    def test_empty_is_not_review_page(self):
+        self.assertFalse(lk.is_review_page(""))
+
+
+class PaneReadErrorTests(unittest.TestCase):
+    """read_pane 失败时返回的是错误**字符串**，不是抛异常。
+
+    只 try/except 的调用方会把这句错误文本当成正常屏幕内容解析：解析不出
+    多选框，就以为人已经答完，清掉 approval_token——于是勾第二项时点击被
+    当成过期审批拒掉，人卡死在那张卡片上（实测：勾上 2 以后就卡住了）。
+    """
+
+    def test_error_text_is_recognised(self):
+        self.assertTrue(lk.is_pane_read_error("(error reading pane: boom)"))
+
+    def test_no_response_is_recognised(self):
+        self.assertTrue(lk.is_pane_read_error("(no response)"))
+
+    def test_normal_content_is_not_error(self):
+        self.assertFalse(lk.is_pane_read_error("1. yes\n2. no"))
+
+    def test_empty_is_error(self):
+        """空屏没法判断状态，按失败处理，别拿它做「已答完」的依据。"""
+        self.assertTrue(lk.is_pane_read_error(""))
+
+    def test_error_text_does_not_look_like_multiselect(self):
+        self.assertFalse(lk.detect_multiselect("(error reading pane: boom)"))
+
+
+class SelectorMissingOptionsTests(unittest.TestCase):
+    """选项不全 / 整组丢失的几种真实形态。
+
+    共同后果都一样：解析不出这一组，blocked 卡片退回 Yes/Trust/No，
+    按钮和屏幕上问的对不上，点了等于乱答。
+    """
+
+    def opts(self, pane):
+        group = lk.current_option_group(lk.detect_option_groups(pane))
+        return group["options"] if group else None
+
+    def test_left_border_pipes(self):
+        """带 TUI 左边框的选择器。
+
+        relay 推 blocked 时给的是原始抓屏，没走 clean_pane，边框还在。
+        """
+        pane = ("│ 怎么办？\n"
+                "│\n"
+                "│ \u276f 1. 先停下，我去确认\n"
+                "│   2. 继续建群\n"
+                "│   3. 先看日志\n"
+                "│\n"
+                "│ Enter to select · Esc to cancel")
+        self.assertEqual(self.opts(pane), ["先停下，我去确认", "继续建群", "先看日志"])
+
+    def test_description_line_starts_with_number(self):
+        """选项的描述文字自带编号，不该打乱选项编号序列。"""
+        pane = ("怎么办？\n\n"
+                "\u276f 1. 先停下，我去确认\n"
+                "     1. 先弄清并行会话在干嘛\n"
+                "     2. 再决定要不要建群\n"
+                "  2. 继续建群\n"
+                "  3. 先看日志\n\n"
+                "Enter to select · Esc to cancel")
+        self.assertEqual(self.opts(pane), ["先停下，我去确认", "继续建群", "先看日志"])
+
+    def test_first_option_scrolled_off(self):
+        """首项被卷出屏幕，编号从 2 起——剩下的仍该能选。"""
+        pane = ("怎么办？\n\n"
+                "  2. 继续建群\n"
+                "  3. 先看日志\n\n"
+                "Enter to select · Esc to cancel")
+        self.assertEqual(self.opts(pane), ["继续建群", "先看日志"])
+
+    @unittest.skip("_MAX_OPTIONS=9 是否放开待定：TUI 数字键只有 1-9，"
+                   "第 10 项本来就按不到，先留着上限")
+    def test_more_than_nine_options(self):
+        """超过 9 项时不能静默砍掉——砍了人就选不到后面那些。"""
+        pane = ("选哪个？\n\n" + "\n".join(f"  {i}. 选项{i}" for i in range(1, 13))
+                + "\n\nEnter to select · Esc to cancel")
+        self.assertEqual(len(self.opts(pane)), 12)
+
+
+class BlockedUsesRealOptionsTests(unittest.TestCase):
+    """blocked 卡片要显示 agent 真正在问的选项。
+
+    relay 的 detect_options 只认两种权限提示（yes, single permission /
+    approve all pending），认不出就回落到 TOOL_OPTIONS。AskUserQuestion 的
+    选择器落进这个回落里，卡片就显示成 Yes/Trust/No——按钮和屏幕上的选项对
+    不上，点了等于乱答。
+    """
+
+    def _labels(self, card):
+        out = []
+        for el in card["elements"]:
+            if el.get("tag") == "action":
+                out.extend(b["text"]["content"] for b in el["actions"])
+        return out
+
+    def test_real_options_win_over_fallback(self):
+        """pane 里有真选择器时，用它，而不是 relay 的回落值。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "herdr-remote", BLOCKED_WITH_REAL_SELECTOR,
+            lk.TOOL_OPTIONS, "abcde")
+        labels = " ".join(self._labels(card))
+        self.assertIn("先停下", labels)
+        self.assertNotIn("Trust (always)", labels)
+
+    def test_tail_items_still_filtered(self):
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "herdr-remote", BLOCKED_WITH_REAL_SELECTOR,
+            None, "abcde")
+        labels = " ".join(self._labels(card))
+        self.assertNotIn("Type something", labels)
+        self.assertNotIn("Chat about this", labels)
+
+    def test_numbers_match_screen(self):
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "herdr-remote", BLOCKED_WITH_REAL_SELECTOR,
+            None, "abcde")
+        keys = [b["value"].get("k")
+                for el in card["elements"] if el.get("tag") == "action"
+                for b in el["actions"] if b["value"].get("k")]
+        self.assertEqual(keys, ["1", "2", "3"])
+
+    def test_permission_prompt_still_uses_short_labels(self):
+        """真正的权限提示没有编号选择器，仍走 Yes/Trust/No 短标签。"""
+        prompt = ("Bash(rm -rf build)\n"
+                  "Do you want to proceed?\n"
+                  "Esc to cancel")
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", prompt, lk.TOOL_OPTIONS, "abcde")
+        labels = " ".join(self._labels(card))
+        self.assertIn("Trust (always)", labels)
+
+    def test_no_selector_falls_back(self):
+        """prompt 里没有选择器时，行为不变。"""
+        card = lk.build_blocked_card(
+            "w2B:p1", "claude", "proj", "just some output", None, "abcde")
+        labels = " ".join(self._labels(card))
+        self.assertIn("Yes (once)", labels)
+
+
 class MultiSelectToggleTests(unittest.TestCase):
     """多选框的真实按键语义（实测，见 detect_multiselect 的注释）。
 
