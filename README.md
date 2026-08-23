@@ -44,6 +44,24 @@ cd herdr-remote/relay && ./start.sh
 
 Open [herdr-demo.pages.dev](https://herdr-demo.pages.dev) on your phone, paste the tunnel URL.
 
+## 飞书 Bot（国内网络）
+
+在飞书里监控和指挥 agent，**无需公网入口** —— 不用 Cloudflare Tunnel、不用 Tailscale Funnel。
+飞书长连接与 relay 连接都是本机主动出站，绕开 NAT 问题。
+
+```bash
+./relay/install-lark-service.sh    # 开机自启 + 崩溃自动重启
+# 或前台调试: uv run relay/herdr_lark.py
+```
+
+```
+/agents          看 agent 列表（带序号）
+/read 1          看进展；若卡在选择器会自动出按钮卡片
+继续改这个函数     直接打字即可继续指挥
+```
+
+完整说明见 **[飞书客户端操作手册](docs/lark-client-manual.md)** —— 含应用配置、命令表、排查步骤。
+
 ## Telegram Bot
 
 For an automatically restarting relay and Telegram bot:

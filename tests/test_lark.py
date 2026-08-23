@@ -1,0 +1,2617 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["websockets>=14.0"]
+# ///
+"""herdr-remote 飞书客户端：纯函数与事件处理测试。
+
+这些测试刻意不依赖 lark-oapi SDK：herdr_lark 只在真正建立长连接时才导入
+SDK，纯逻辑部分保持可独立测试。
+"""
+import asyncio
+import importlib
+import json
+import os
+import string
+import pathlib
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "relay"))
+os.environ.setdefault("HERDR_LARK_APP_ID", "cli_test")
+os.environ.setdefault("HERDR_LARK_APP_SECRET", "secret-test")
+# 测试绝不能写进真实配置：make_bot() 会构造 BindingStore/SeenStore，
+# 用默认路径的话单测的假 chat_id 会污染 ~/.config/herdr-remote/。
+_TEST_STATE = tempfile.mkdtemp(prefix="herdr-lark-test-")
+os.environ["HERDR_LARK_SEEN_PATH"] = os.path.join(_TEST_STATE, "seen.json")
+os.environ["HERDR_LARK_BINDING_PATH"] = os.path.join(_TEST_STATE, "bindings.json")
+os.environ["HERDR_LARK_CHATS_PATH"] = os.path.join(_TEST_STATE, "chats.json")
+
+lk = importlib.import_module("herdr_lark")
+
+
+def make_agents(count, *, status="idle", project="project"):
+    return [
+        {
+            "pane_id": f"w{i}:p1",
+            "agent": "opencode",
+            "status": status,
+            "project": project,
+            "cwd": f"/work/{project}/{i}",
+            "host": "local",
+        }
+        for i in range(count)
+    ]
+
+
+class ScrubTests(unittest.TestCase):
+    """密钥绝不能出现在日志或发回飞书的文本里。"""
+
+    def test_masks_app_secret(self):
+        with unittest.mock.patch.object(lk, "APP_SECRET", "s3cr3t-value"):
+            self.assertNotIn("s3cr3t-value", lk.scrub("boom s3cr3t-value boom"))
+
+    def test_masks_relay_token(self):
+        with unittest.mock.patch.object(lk, "_RELAY_TOKEN", "tok-abc"):
+            out = lk.scrub("ws://127.0.0.1:8375?token=tok-abc failed")
+            self.assertNotIn("tok-abc", out)
+            self.assertIn("<redacted>", out)
+
+    def test_accepts_non_string(self):
+        self.assertIsInstance(lk.scrub(ValueError("nope")), str)
+
+    def test_empty_secret_does_not_mask_everything(self):
+        """空密钥不能把每个字符都替换掉。"""
+        with unittest.mock.patch.object(lk, "APP_SECRET", ""):
+            with unittest.mock.patch.object(lk, "_RELAY_TOKEN", ""):
+                self.assertEqual(lk.scrub("plain text"), "plain text")
+
+
+class PaneTokenTests(unittest.TestCase):
+    def test_token_is_stable_and_short(self):
+        a = lk.pane_callback_token("w1:p1")
+        self.assertEqual(a, lk.pane_callback_token("w1:p1"))
+        self.assertEqual(len(a), 16)
+
+    def test_distinct_panes_differ(self):
+        self.assertNotEqual(lk.pane_callback_token("w1:p1"), lk.pane_callback_token("w1:p2"))
+
+    def test_resolve_unique_match(self):
+        agents = make_agents(3)
+        token = lk.pane_callback_token("w1:p1")
+        self.assertEqual(lk.resolve_pane_token(token, agents, {}), "w1:p1")
+
+    def test_resolve_unknown_returns_none(self):
+        self.assertIsNone(lk.resolve_pane_token("deadbeef", make_agents(2), {}))
+
+    def test_resolve_falls_back_to_pending(self):
+        """agent 已消失但仍有待回复消息时，仍要能解析出 pane。"""
+        pending = {("chat", "msg"): "w9:p1"}
+        token = lk.pane_callback_token("w9:p1")
+        self.assertEqual(lk.resolve_pane_token(token, [], pending), "w9:p1")
+
+    def test_duplicate_pane_id_is_not_ambiguous(self):
+        """同一 pane 在快照里出现两次不算歧义，仍应解析成功。"""
+        agents = [
+            {"pane_id": "w1:p1", "status": "idle"},
+            {"pane_id": "w1:p1", "status": "working"},
+        ]
+        token = lk.pane_callback_token("w1:p1")
+        self.assertEqual(lk.resolve_pane_token(token, agents, {}), "w1:p1")
+
+    def test_resolve_ambiguous_returns_none(self):
+        """不同 pane 撞同一 token 时必须拒绝，不能猜。"""
+        agents = [{"pane_id": "w1:p1"}, {"pane_id": "w2:p2"}]
+        token = lk.pane_callback_token("w1:p1")
+        with unittest.mock.patch.object(lk, "pane_callback_token", lambda _p: token):
+            self.assertIsNone(lk.resolve_pane_token(token, agents, {}))
+
+
+class ActionValueTests(unittest.TestCase):
+    def test_roundtrip(self):
+        value = lk.action_value("trust", "w1:p1")
+        parsed = lk.parse_action_value(value, make_agents(2) + [{"pane_id": "w1:p1"}], {})
+        self.assertEqual(parsed["action"], "trust")
+        self.assertEqual(parsed["pane_id"], "w1:p1")
+
+    def test_value_is_dict_not_json_string(self):
+        """飞书 action.value 原生是对象，不该再套一层 JSON 字符串。"""
+        self.assertIsInstance(lk.action_value("read", "w1:p1"), dict)
+
+    def test_extra_fields_preserved(self):
+        value = lk.action_value("approval", "w1:p1", g="abcde", k="2")
+        self.assertEqual(value["g"], "abcde")
+        self.assertEqual(value["k"], "2")
+
+    def test_unknown_code_yields_invalid(self):
+        parsed = lk.parse_action_value({"a": "zz", "p": "x"}, [], {})
+        self.assertEqual(parsed["action"], "invalid")
+
+    def test_missing_action_key_is_invalid(self):
+        self.assertEqual(lk.parse_action_value({}, [], {})["action"], "invalid")
+
+
+class GenerationTests(unittest.TestCase):
+    """借鉴官方 Claude Code Channels：手机上不该把 l 看成 1。"""
+
+    def test_five_lowercase_letters(self):
+        for _ in range(50):
+            g = lk.new_generation()
+            self.assertEqual(len(g), 5)
+            self.assertTrue(set(g) <= set(string.ascii_lowercase))
+
+    def test_never_contains_letter_l(self):
+        self.assertTrue(all("l" not in lk.new_generation() for _ in range(200)))
+
+    def test_values_vary(self):
+        self.assertGreater(len({lk.new_generation() for _ in range(50)}), 1)
+
+
+class SortingTests(unittest.TestCase):
+    def test_blocked_sorts_first(self):
+        agents = [
+            {"pane_id": "a", "status": "idle", "project": "z", "agent": "x", "host": "local"},
+            {"pane_id": "b", "status": "blocked", "project": "z", "agent": "x", "host": "local"},
+            {"pane_id": "c", "status": "working", "project": "z", "agent": "x", "host": "local"},
+        ]
+        self.assertEqual([a["status"] for a in lk.sorted_agents(agents)],
+                         ["blocked", "working", "idle"])
+
+    def test_agents_for_action_filters_interrupt(self):
+        agents = [
+            {"pane_id": "a", "status": "idle"},
+            {"pane_id": "b", "status": "working"},
+            {"pane_id": "c", "status": "blocked"},
+        ]
+        got = {a["pane_id"] for a in lk.agents_for_action("interrupt", agents)}
+        self.assertEqual(got, {"b", "c"})
+
+    def test_agents_for_action_filters_trust_to_blocked(self):
+        agents = [{"pane_id": "a", "status": "working"}, {"pane_id": "b", "status": "blocked"}]
+        got = [a["pane_id"] for a in lk.agents_for_action("trust", agents)]
+        self.assertEqual(got, ["b"])
+
+
+class LabelTests(unittest.TestCase):
+    def test_labels_are_unique_for_identical_agents(self):
+        agents = make_agents(3, project="same")
+        labels = lk.agent_button_labels(agents)
+        self.assertEqual(len(set(labels)), 3)
+
+    def test_label_includes_status_and_project(self):
+        agents = make_agents(1, status="blocked", project="herdr")
+        label = lk.agent_button_labels(agents)[0]
+        self.assertIn("BLOCKED", label)
+        self.assertIn("herdr", label)
+
+    def test_remote_host_surfaced(self):
+        agents = make_agents(1)
+        agents[0]["host"] = "build-box"
+        self.assertIn("build-box", lk.agent_button_labels(agents)[0])
+
+
+class PendingTests(unittest.TestCase):
+    def test_register_and_lookup(self):
+        pending = {}
+        lk.register_pending(pending, "chat1", "msg1", "w1:p1")
+        self.assertEqual(lk.pending_pane(pending, "chat1", "msg1"), "w1:p1")
+
+    def test_unknown_returns_none(self):
+        self.assertIsNone(lk.pending_pane({}, "chat1", "nope"))
+
+    def test_evicts_oldest_beyond_limit(self):
+        pending = {}
+        for i in range(lk.PENDING_LIMIT + 10):
+            lk.register_pending(pending, "chat", f"msg{i}", f"w{i}:p1")
+        self.assertLessEqual(len(pending), lk.PENDING_LIMIT)
+        self.assertIsNone(lk.pending_pane(pending, "chat", "msg0"))
+        self.assertIsNotNone(
+            lk.pending_pane(pending, "chat", f"msg{lk.PENDING_LIMIT + 9}")
+        )
+
+
+class SeenStoreTests(unittest.TestCase):
+    """飞书长连接会重推消息，去重是必需的（Telegram 的 update_id 天然单调，无此问题）。"""
+
+    def _store(self, path=None, limit=None):
+        with tempfile.TemporaryDirectory() as d:
+            yield lk.SeenStore(path or os.path.join(d, "seen.json"), limit=limit or 5000)
+
+    def test_first_sight_is_new_repeat_is_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = lk.SeenStore(os.path.join(d, "seen.json"))
+            self.assertTrue(store.add("om_1"))
+            self.assertFalse(store.add("om_1"))
+
+    def test_distinct_ids_all_new(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = lk.SeenStore(os.path.join(d, "seen.json"))
+            self.assertTrue(store.add("om_1"))
+            self.assertTrue(store.add("om_2"))
+
+    def test_evicts_oldest_half_over_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = lk.SeenStore(os.path.join(d, "seen.json"), limit=10)
+            for i in range(11):
+                store.add(f"om_{i}")
+            self.assertLessEqual(len(store), 10)
+            # 最旧的被淘汰，会被当成新消息
+            self.assertTrue(store.add("om_0"))
+            # 最新的仍记得
+            self.assertFalse(store.add("om_10"))
+
+    def test_persists_across_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "seen.json")
+            lk.SeenStore(path).add("om_keep")
+            self.assertFalse(lk.SeenStore(path).add("om_keep"))
+
+    def test_missing_file_starts_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = lk.SeenStore(os.path.join(d, "nope", "seen.json"))
+            self.assertEqual(len(store), 0)
+            self.assertTrue(store.add("om_1"))
+
+    def test_corrupt_file_does_not_crash(self):
+        """损坏的缓存文件只该降级成空集合，不能让整个 bot 起不来。"""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "seen.json")
+            with open(path, "w") as fh:
+                fh.write("{not json at all")
+            store = lk.SeenStore(path)
+            self.assertEqual(len(store), 0)
+            self.assertTrue(store.add("om_1"))
+
+    def test_file_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "seen.json")
+            lk.SeenStore(path).add("om_1")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_non_list_payload_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "seen.json")
+            with open(path, "w") as fh:
+                json.dump({"unexpected": "shape"}, fh)
+            self.assertEqual(len(lk.SeenStore(path)), 0)
+
+
+class FakeWS:
+    """假的 relay 连接：录下发出的消息，按脚本回放响应。"""
+
+    def __init__(self, responses=None):
+        self.sent = []
+        self._responses = list(responses or [])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+    async def recv(self):
+        if not self._responses:
+            raise AssertionError("relay 收到了超出预期的 recv")
+        return json.dumps(self._responses.pop(0))
+
+
+def fake_connect(ws):
+    def _connect(*args, **kwargs):
+        return ws
+    return _connect
+
+
+class SendKeysAckTests(unittest.TestCase):
+    """Telegram 版踩过的坑：不读 ack 就报成功，键名被 relay 拒绝了用户也不知道。
+
+    relay 的 SAFE_KEYS 只认 "C-c" 这类名字，发 "Ctrl+C" 会被整条拒绝。
+    """
+
+    def _run(self, ws):
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            return asyncio.run(lk.send_keys_to_relay("w1:p1", ["C-c"]))
+
+    def test_succeeds_on_ok_ack(self):
+        ws = FakeWS([{"type": "command_result", "command": "send_keys", "ok": True}])
+        self._run(ws)
+        self.assertEqual(ws.sent[0]["type"], "send_keys")
+        self.assertEqual(ws.sent[0]["keys"], ["C-c"])
+
+    def test_raises_when_relay_nacks(self):
+        ws = FakeWS([
+            {"type": "command_result", "command": "send_keys", "ok": False, "message": "bad key"}
+        ])
+        with self.assertRaises(RuntimeError):
+            self._run(ws)
+
+    def test_raises_on_error_message(self):
+        ws = FakeWS([{"type": "error", "message": "unauthorized"}])
+        with self.assertRaises(RuntimeError):
+            self._run(ws)
+
+    def test_skips_unrelated_broadcasts_before_ack(self):
+        """relay 可能先广播 agents，ack 在后面几条里。"""
+        ws = FakeWS([
+            {"type": "agents", "agents": []},
+            {"type": "agent_update", "agent": {"pane_id": "w1:p1"}},
+            {"type": "command_result", "command": "send_keys", "ok": True},
+        ])
+        self._run(ws)
+
+    def test_raises_when_ack_never_arrives(self):
+        ws = FakeWS([{"type": "agents", "agents": []} for _ in range(5)])
+        with self.assertRaises(RuntimeError):
+            self._run(ws)
+
+
+class RelayMessageTests(unittest.TestCase):
+    def test_respond_sends_text(self):
+        ws = FakeWS()
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            asyncio.run(lk.send_to_relay("w1:p1", "trust, always allow"))
+        self.assertEqual(ws.sent, [
+            {"type": "respond", "pane_id": "w1:p1", "text": "trust, always allow"}
+        ])
+
+    def test_send_text_appends_enter(self):
+        """relay 的 send_text 不带回车，要再补一次 Enter 才会提交。
+
+        Enter 必须在 ack 之后发——详见 SendTextAckTests。
+        """
+        ws = FakeWS([{"type": "command_result", "command": "send_text", "ok": True}])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            asyncio.run(lk.send_text_to_relay("w1:p1", "hello"))
+        self.assertEqual([m["type"] for m in ws.sent], ["send_text", "send_keys"])
+        self.assertEqual(ws.sent[1]["keys"], ["Enter"])
+
+    def test_send_text_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(lk.send_text_to_relay("w1:p1", ""))
+
+    def test_send_text_rejects_overlong(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(lk.send_text_to_relay("w1:p1", "x" * 1001))
+
+    def test_read_pane_returns_content(self):
+        ws = FakeWS([{"type": "pane_content", "content": "line one\nline two"}])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            out = asyncio.run(lk.read_pane("w1:p1"))
+        self.assertEqual(out, "line one\nline two")
+
+    def test_read_pane_skips_preceding_broadcasts(self):
+        ws = FakeWS([
+            {"type": "agents", "agents": []},
+            {"type": "pane_content", "content": "actual output"},
+        ])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            out = asyncio.run(lk.read_pane("w1:p1"))
+        self.assertEqual(out, "actual output")
+
+    def test_read_pane_scrubs_errors(self):
+        """读失败的提示会发回飞书，绝不能带 token。"""
+        def boom(*a, **k):
+            raise RuntimeError("ws://x?token=tok-abc broke")
+        with unittest.mock.patch.object(lk, "_RELAY_TOKEN", "tok-abc"):
+            with unittest.mock.patch.object(lk, "ws_connect", boom):
+                out = asyncio.run(lk.read_pane("w1:p1"))
+        self.assertNotIn("tok-abc", out)
+
+
+def buttons_in(card):
+    """把卡片里所有按钮抓出来，便于断言。"""
+    out = []
+    for element in card.get("elements", []):
+        if element.get("tag") == "action":
+            out.extend(element.get("actions", []))
+    return out
+
+
+class TruncateTests(unittest.TestCase):
+    """借鉴官方 Channels：命令结尾对审批者最要紧，不能被直接截掉。"""
+
+    def test_short_text_untouched(self):
+        self.assertEqual(lk.truncate_prompt("rm -rf ./build", 400), "rm -rf ./build")
+
+    def test_keeps_head_and_tail(self):
+        text = "START" + ("x" * 500) + "END"
+        out = lk.truncate_prompt(text, 100)
+        self.assertTrue(out.startswith("START"))
+        self.assertTrue(out.endswith("END"))
+
+    def test_marks_elided_amount(self):
+        out = lk.truncate_prompt("y" * 500, 100)
+        self.assertIn("省略", out)
+        self.assertLess(len(out), 500)
+
+
+class BlockedCardTests(unittest.TestCase):
+    def test_encodes_option_index_not_text(self):
+        """必须发选项序号当按键。
+
+        直接把选项文本用 respond 发过去是不行的：relay 走 send-text 粘贴，
+        Claude 的 TUI 把粘贴内容里的换行当正文而不是回车，提示永远确认不了。
+        """
+        card = lk.build_blocked_card(
+            "w1:p1", "opencode", "herdr", "may I?", lk.TOOL_OPTIONS, "abcde",
+        )
+        approvals = [b for b in buttons_in(card) if b["value"].get("a") == "k"]
+        self.assertEqual([b["value"]["k"] for b in approvals], ["1", "2", "3"])
+        for button in approvals:
+            self.assertNotIn("text", button["value"])
+
+    def test_carries_generation(self):
+        card = lk.build_blocked_card("w1:p1", "a", "p", "q", lk.TOOL_OPTIONS, "abcde")
+        for button in buttons_in(card):
+            if button["value"].get("a") == "k":
+                self.assertEqual(button["value"]["g"], "abcde")
+
+    def test_uses_tool_buttons_for_trust_prompt(self):
+        card = lk.build_blocked_card(
+            "w1:p1", "a", "p", "q", ["yes, single permission", "trust, always allow"], "abcde",
+        )
+        labels = [b["text"]["content"] for b in buttons_in(card)]
+        self.assertTrue(any("Trust" in l for l in labels))
+
+    def test_uses_subagent_buttons_for_approve_all(self):
+        card = lk.build_blocked_card(
+            "w1:p1", "a", "p", "q", ["approve all pending", "configure"], "abcde",
+        )
+        labels = [b["text"]["content"] for b in buttons_in(card)]
+        self.assertTrue(any("Approve all" in l for l in labels))
+
+    def test_defaults_to_tool_options_when_none(self):
+        card = lk.build_blocked_card("w1:p1", "a", "p", "q", None, "abcde")
+        approvals = [b for b in buttons_in(card) if b["value"].get("a") == "k"]
+        self.assertEqual(len(approvals), len(lk.TOOL_BUTTONS))
+
+    def test_includes_open_output_button(self):
+        card = lk.build_blocked_card("w1:p1", "a", "p", "q", None, "abcde")
+        actions = {b["value"]["a"] for b in buttons_in(card)}
+        self.assertIn(lk.ACTION_CODES["select_reply"], actions)
+
+    def test_prompt_is_truncated(self):
+        card = lk.build_blocked_card("w1:p1", "a", "p", "z" * 2000, None, "abcde")
+        rendered = json.dumps(card, ensure_ascii=False)
+        self.assertLess(len(rendered), 2000)
+
+
+class AgentPickerCardTests(unittest.TestCase):
+    def test_one_button_per_agent(self):
+        card = lk.build_agent_picker_card("read", make_agents(3))
+        self.assertEqual(len(buttons_in(card)), 3)
+
+    def test_paginates_at_page_size(self):
+        card = lk.build_agent_picker_card("read", make_agents(25))
+        picks = [b for b in buttons_in(card) if b["value"].get("a") != lk.ACTION_CODES["page"]]
+        self.assertEqual(len(picks), lk.AGENT_PAGE_SIZE)
+
+    def test_second_page_holds_remainder(self):
+        card = lk.build_agent_picker_card("read", make_agents(25), page=1)
+        picks = [b for b in buttons_in(card) if b["value"].get("a") != lk.ACTION_CODES["page"]]
+        self.assertEqual(len(picks), 5)
+
+    def test_no_nav_on_single_page(self):
+        card = lk.build_agent_picker_card("read", make_agents(3))
+        nav = [b for b in buttons_in(card) if b["value"].get("a") == lk.ACTION_CODES["page"]]
+        self.assertEqual(nav, [])
+
+    def test_clamps_out_of_range_page(self):
+        card = lk.build_agent_picker_card("read", make_agents(3), page=99)
+        self.assertEqual(len(buttons_in(card)), 3)
+
+    def test_blocked_agent_listed_first(self):
+        agents = make_agents(2) + make_agents(1, status="blocked", project="urgent")
+        card = lk.build_agent_picker_card("read", agents)
+        self.assertIn("BLOCKED", buttons_in(card)[0]["text"]["content"])
+
+
+class MessageGateTests(unittest.TestCase):
+    """决定一条飞书消息该不该处理。"""
+
+    def ctx(self, **kw):
+        base = dict(chat_id="oc_1", message_id="om_1", sender_open_id="ou_user",
+                    chat_type="p2p", mentioned_bot=False, text="hi")
+        base.update(kw)
+        return lk.MessageContext(**base)
+
+    def test_p2p_message_accepted(self):
+        self.assertTrue(lk.should_handle(self.ctx(), bot_open_id="ou_bot", chat_id="oc_1"))
+
+    def test_group_without_mention_ignored(self):
+        ctx = self.ctx(chat_type="group", mentioned_bot=False)
+        self.assertFalse(lk.should_handle(ctx, bot_open_id="ou_bot", chat_id="oc_1"))
+
+    def test_group_with_mention_accepted(self):
+        ctx = self.ctx(chat_type="group", mentioned_bot=True)
+        self.assertTrue(lk.should_handle(ctx, bot_open_id="ou_bot", chat_id="oc_1"))
+
+    def test_solo_group_treated_as_p2p(self):
+        """只有 bot 和自己的群不该逼人每次都 @。"""
+        ctx = self.ctx(chat_type="group", mentioned_bot=False, solo_group=True)
+        self.assertTrue(lk.should_handle(ctx, bot_open_id="ou_bot", chat_id="oc_1"))
+
+    def test_bot_own_message_ignored(self):
+        """不忽略就会自己跟自己聊到天荒地老。"""
+        ctx = self.ctx(sender_open_id="ou_bot")
+        self.assertFalse(lk.should_handle(ctx, bot_open_id="ou_bot", chat_id="oc_1"))
+
+    def test_unauthorized_chat_ignored(self):
+        self.assertFalse(lk.should_handle(self.ctx(), bot_open_id="ou_bot", chat_id="oc_other"))
+
+    def test_discovery_mode_allows_any_chat(self):
+        """未配置 CHAT_ID 时放行，方便第一次拿 chat_id。"""
+        self.assertTrue(lk.should_handle(self.ctx(), bot_open_id="ou_bot", chat_id=""))
+
+
+class StripMentionTests(unittest.TestCase):
+    def test_removes_at_prefix(self):
+        out = lk.strip_bot_mention("@_user_1 /agents", [{"key": "@_user_1", "name": "demo"}])
+        self.assertEqual(out, "/agents")
+
+    def test_removes_by_name(self):
+        out = lk.strip_bot_mention("@demo /read", [{"key": "@_user_1", "name": "demo"}])
+        self.assertEqual(out, "/read")
+
+    def test_no_mentions_untouched(self):
+        self.assertEqual(lk.strip_bot_mention("/status", []), "/status")
+
+
+class ParseMessageTests(unittest.TestCase):
+    def test_extracts_text(self):
+        event = {
+            "message": {"message_id": "om_1", "chat_id": "oc_1", "chat_type": "p2p",
+                        "message_type": "text", "content": json.dumps({"text": "hello"})},
+            "sender": {"sender_id": {"open_id": "ou_user"}},
+        }
+        ctx = lk.parse_message_event(event, bot_open_id="ou_bot")
+        self.assertEqual(ctx.text, "hello")
+        self.assertEqual(ctx.chat_id, "oc_1")
+
+    def test_detects_bot_mention(self):
+        event = {
+            "message": {"message_id": "om_1", "chat_id": "oc_1", "chat_type": "group",
+                        "message_type": "text", "content": json.dumps({"text": "@demo hi"}),
+                        "mentions": [{"key": "@_user_1", "name": "demo",
+                                      "id": {"open_id": "ou_bot"}}]},
+            "sender": {"sender_id": {"open_id": "ou_user"}},
+        }
+        ctx = lk.parse_message_event(event, bot_open_id="ou_bot")
+        self.assertTrue(ctx.mentioned_bot)
+        self.assertEqual(ctx.text, "hi")
+
+    def test_malformed_content_does_not_crash(self):
+        event = {
+            "message": {"message_id": "om_1", "chat_id": "oc_1", "chat_type": "p2p",
+                        "message_type": "text", "content": "not json"},
+            "sender": {"sender_id": {"open_id": "ou_user"}},
+        }
+        self.assertEqual(lk.parse_message_event(event, bot_open_id="ou_bot").text, "")
+
+
+class CardActionNormalizationTests(unittest.TestCase):
+    """点按钮和打字要走同一条下游路径，不维护两份分支。"""
+
+    def test_card_action_becomes_message_context(self):
+        event = {
+            "open_message_id": "om_1",
+            "open_chat_id": "oc_1",
+            "operator": {"open_id": "ou_user"},
+            "action": {"value": {"a": "r", "p": "abc"}},
+        }
+        ctx = lk.parse_card_action(event)
+        self.assertIsInstance(ctx, lk.MessageContext)
+        self.assertEqual(ctx.chat_id, "oc_1")
+        self.assertEqual(ctx.sender_open_id, "ou_user")
+        self.assertEqual(ctx.action, {"a": "r", "p": "abc"})
+
+    def test_card_action_counts_as_explicit_intent(self):
+        """点击本身就是明确意图，不该再要求 @。"""
+        event = {"open_message_id": "om_1", "open_chat_id": "oc_1",
+                 "operator": {"open_id": "ou_user"}, "action": {"value": {"a": "r"}}}
+        self.assertTrue(lk.parse_card_action(event).mentioned_bot)
+
+    def test_real_sdk_shape_puts_ids_under_context(self):
+        """lark-oapi 的 P2CardActionTriggerData 只在 context 下放这两个 id。
+
+        顶层没有 open_chat_id / open_message_id，实测自 SDK 源码。
+        """
+        event = {
+            "operator": {"open_id": "ou_user"},
+            "context": {"open_chat_id": "oc_real", "open_message_id": "om_real"},
+            "action": {"value": {"a": "r", "p": "abc"}},
+        }
+        ctx = lk.parse_card_action(event)
+        self.assertEqual(ctx.chat_id, "oc_real")
+        self.assertEqual(ctx.message_id, "om_real")
+
+    def test_legacy_top_level_ids_still_work(self):
+        event = {"open_message_id": "om_1", "open_chat_id": "oc_1",
+                 "operator": {"open_id": "ou_user"}, "action": {"value": {"a": "r"}}}
+        self.assertEqual(lk.parse_card_action(event).chat_id, "oc_1")
+
+    def test_missing_value_yields_none(self):
+        event = {"open_message_id": "om_1", "open_chat_id": "oc_1",
+                 "operator": {"open_id": "ou_user"}, "action": {}}
+        self.assertIsNone(lk.parse_card_action(event))
+
+
+class ApprovalGenerationTests(unittest.TestCase):
+    """陈旧按钮不能生效——三小时前那条通知不该还能批准。"""
+
+    def test_matching_generation_accepted(self):
+        tokens = {"w1:p1": "abcde"}
+        self.assertTrue(lk.approval_is_current(tokens, "w1:p1", "abcde"))
+
+    def test_stale_generation_rejected(self):
+        tokens = {"w1:p1": "fghij"}
+        self.assertFalse(lk.approval_is_current(tokens, "w1:p1", "abcde"))
+
+    def test_missing_generation_rejected(self):
+        self.assertFalse(lk.approval_is_current({}, "w1:p1", "abcde"))
+
+    def test_none_generation_rejected(self):
+        self.assertFalse(lk.approval_is_current({"w1:p1": "abcde"}, "w1:p1", None))
+
+    def test_cleared_when_pane_leaves_blocked(self):
+        tokens = {"w1:p1": "abcde", "w2:p1": "fghij"}
+        lk.prune_approval_tokens(tokens, [
+            {"pane_id": "w1:p1", "status": "blocked"},
+            {"pane_id": "w2:p1", "status": "working"},
+        ])
+        self.assertIn("w1:p1", tokens)
+        self.assertNotIn("w2:p1", tokens)
+
+
+class CommandParseTests(unittest.TestCase):
+    def test_splits_command_and_args(self):
+        self.assertEqual(lk.parse_command("/read herdr"), ("read", "herdr"))
+
+    def test_bare_command(self):
+        self.assertEqual(lk.parse_command("/agents"), ("agents", ""))
+
+    def test_strips_at_suffix(self):
+        """飞书群里命令可能带 @机器人 后缀。"""
+        self.assertEqual(lk.parse_command("/status@demo"), ("status", ""))
+
+    def test_non_command_is_free_text(self):
+        self.assertEqual(lk.parse_command("just some text"), (None, "just some text"))
+
+    def test_case_insensitive(self):
+        self.assertEqual(lk.parse_command("/READ x")[0], "read")
+
+    def test_multiword_args_preserved(self):
+        self.assertEqual(lk.parse_command("/send proj hello world"), ("send", "proj hello world"))
+
+
+class MatchAgentTests(unittest.TestCase):
+    def test_matches_by_project(self):
+        agents = make_agents(1, project="herdr-remote")
+        self.assertIsNotNone(lk.match_agent(agents, "herdr"))
+
+    def test_matches_by_agent_name(self):
+        self.assertIsNotNone(lk.match_agent(make_agents(1), "opencode"))
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(lk.match_agent(make_agents(1), "nonexistent"))
+
+    def test_case_insensitive(self):
+        agents = make_agents(1, project="HerdR")
+        self.assertIsNotNone(lk.match_agent(agents, "herdr"))
+
+
+class StatusSummaryTests(unittest.TestCase):
+    def test_counts_by_status(self):
+        agents = (make_agents(2, status="blocked") + make_agents(1, status="working")
+                  + make_agents(3, status="idle"))
+        out = lk.status_summary(agents)
+        self.assertIn("2 blocked", out)
+        self.assertIn("1 working", out)
+
+    def test_empty_is_safe(self):
+        self.assertIsInstance(lk.status_summary([]), str)
+
+
+class AgentListTests(unittest.TestCase):
+    def test_status_shown_per_row(self):
+        """状态用行首图标表示（不再分组，那样会让序号乱序）。"""
+        agents = make_agents(1, status="blocked", project="urgent") + make_agents(1, project="calm")
+        out = lk.format_agent_list(agents)
+        self.assertIn("urgent", out)
+        self.assertIn("⏸", out)
+
+    def test_marks_remote_host(self):
+        agents = make_agents(1)
+        agents[0]["host"] = "build-box"
+        self.assertIn("build-box", lk.format_agent_list(agents))
+
+    def test_empty_message(self):
+        self.assertIn("No agents", lk.format_agent_list([]))
+
+
+class DigestTests(unittest.TestCase):
+    def test_reports_working_minutes(self):
+        stats = {"w1:p1": {"agent": "opencode", "project": "herdr",
+                           "blocked_count": 2, "working_mins": 95}}
+        out = lk.format_digest(stats)
+        self.assertIn("herdr", out)
+        self.assertIn("1h35m", out)
+
+    def test_short_duration_in_minutes(self):
+        stats = {"w1:p1": {"agent": "a", "project": "p", "blocked_count": 0, "working_mins": 7}}
+        self.assertIn("7m", lk.format_digest(stats))
+
+    def test_empty_digest(self):
+        self.assertIn("No activity", lk.format_digest({}))
+
+
+class IndexedAgentTests(unittest.TestCase):
+    """15 个 agent 时打项目名太烦，用 /agents 里的序号直接选。"""
+
+    def test_list_is_numbered(self):
+        out = lk.format_agent_list(make_agents(3))
+        self.assertIn("1.", out)
+        self.assertIn("3.", out)
+
+    def test_numbering_follows_sorted_order(self):
+        """序号必须和 sorted_agents 一致，否则 /read 2 会选错人。"""
+        agents = make_agents(2) + make_agents(1, status="blocked", project="urgent")
+        ordered = lk.sorted_agents(agents)
+        self.assertEqual(lk.match_agent(agents, "1")["pane_id"], ordered[0]["pane_id"])
+
+    def test_index_selects_agent(self):
+        agents = make_agents(3)
+        ordered = lk.sorted_agents(agents)
+        self.assertEqual(lk.match_agent(agents, "2")["pane_id"], ordered[1]["pane_id"])
+
+    def test_index_is_one_based(self):
+        agents = make_agents(3)
+        self.assertEqual(lk.match_agent(agents, "1")["pane_id"],
+                         lk.sorted_agents(agents)[0]["pane_id"])
+
+    def test_out_of_range_index_returns_none(self):
+        self.assertIsNone(lk.match_agent(make_agents(3), "9"))
+
+    def test_zero_index_returns_none(self):
+        self.assertIsNone(lk.match_agent(make_agents(3), "0"))
+
+    def test_name_match_still_works(self):
+        """加了序号不能把按名字找的能力弄丢。"""
+        self.assertIsNotNone(lk.match_agent(make_agents(1, project="herdr"), "herdr"))
+
+    def test_numeric_project_name_prefers_index(self):
+        """项目名恰好是数字时，序号优先——用户看到的就是序号。"""
+        agents = make_agents(2, project="2024")
+        picked = lk.match_agent(agents, "1")
+        self.assertEqual(picked["pane_id"], lk.sorted_agents(agents)[0]["pane_id"])
+
+
+class SendWithIndexTests(unittest.TestCase):
+    def test_send_splits_index_from_payload(self):
+        """/send 2 hello world → 选 2 号，发 'hello world'。"""
+        cmd, rest = lk.parse_command("/send 2 hello world")
+        self.assertEqual(cmd, "send")
+        query, _, payload = rest.partition(" ")
+        self.assertEqual(query, "2")
+        self.assertEqual(payload, "hello world")
+
+    def test_read_index_has_no_payload(self):
+        cmd, rest = lk.parse_command("/read 3")
+        self.assertEqual((cmd, rest), ("read", "3"))
+
+
+REAL_PANE = """抓取实际 pane 输出
+  ⎿  $ cd /Users/victor/code-github/herdr-remote && set -a
+     export HERDR_RELAY="ws://127.0.0.1:8375"
+
+✻ Drizzling… (12s · ↓ 304 tokens)
+                                                          ✔ Update installed · Restart to update
+─────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────
+  [Opus 5 (1M context)] │ tailcale
+  Context ███░░░░░░░ 34% │ Usage ░░░░░░░░░░ 3% (resets in 4h 17m)
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent"""
+
+
+class PaneCleanupTests(unittest.TestCase):
+    """手机屏幕小，TUI 状态栏会把真正的输出挤没。"""
+
+    def test_drops_model_and_context_statusline(self):
+        out = lk.clean_pane(REAL_PANE)
+        self.assertNotIn("Context ", out)
+        self.assertNotIn("Opus 5 (1M context)", out)
+
+    def test_drops_permission_mode_line(self):
+        self.assertNotIn("bypass permissions", lk.clean_pane(REAL_PANE))
+
+    def test_drops_update_banner(self):
+        self.assertNotIn("Update installed", lk.clean_pane(REAL_PANE))
+
+    def test_drops_separator_rules(self):
+        self.assertNotIn("─────", lk.clean_pane(REAL_PANE))
+
+    def test_drops_empty_prompt_line(self):
+        self.assertNotIn("\n❯", "\n" + lk.clean_pane(REAL_PANE))
+
+    def test_keeps_actual_output(self):
+        """真正的内容一个字都不能丢。"""
+        out = lk.clean_pane(REAL_PANE)
+        self.assertIn("抓取实际 pane 输出", out)
+        self.assertIn("HERDR_RELAY", out)
+
+    def test_keeps_spinner_progress(self):
+        """还在跑的状态是有用信息，保留。"""
+        self.assertIn("Drizzling", lk.clean_pane(REAL_PANE))
+
+    def test_substantially_shorter(self):
+        self.assertLess(len(lk.clean_pane(REAL_PANE)), len(REAL_PANE) * 0.75)
+
+    def test_prompt_with_text_is_kept(self):
+        """带内容的输入行是用户输入，不能当装饰丢掉。"""
+        self.assertIn("/read 1", lk.clean_pane("❯ /read 1"))
+
+    def test_collapses_blank_runs(self):
+        self.assertNotIn("\n\n\n", lk.clean_pane("a\n\n\n\n\nb"))
+
+    def test_empty_input_safe(self):
+        self.assertEqual(lk.clean_pane(""), "")
+
+
+class ReadDepthTests(unittest.TestCase):
+    """手机上看进展，15 行只能看到尾巴。"""
+
+    def test_requests_generous_line_count(self):
+        ws = FakeWS([{"type": "pane_content", "content": "x"}])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            asyncio.run(lk.read_pane("w1:p1"))
+        self.assertGreaterEqual(ws.sent[0]["lines"], 120)
+
+    def test_explicit_lines_respected(self):
+        ws = FakeWS([{"type": "pane_content", "content": "x"}])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            asyncio.run(lk.read_pane("w1:p1", lines=400))
+        self.assertEqual(ws.sent[0]["lines"], 400)
+
+
+class ActivePaneTests(unittest.TestCase):
+    """读完要能直接接着说话——这是闭环的关键。"""
+
+    def test_active_pane_set_on_read(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        self.assertEqual(bot.active_pane("oc_1"), "w1:p1")
+
+    def test_active_pane_is_per_chat(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w2:p1")
+        self.assertEqual(bot.active_pane("oc_1"), "w1:p1")
+        self.assertEqual(bot.active_pane("oc_2"), "w2:p1")
+
+    def test_latest_read_wins(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_1", "w2:p1")
+        self.assertEqual(bot.active_pane("oc_1"), "w2:p1")
+
+    def test_unknown_chat_has_no_active(self):
+        self.assertIsNone(make_bot().active_pane("oc_none"))
+
+
+class FollowUpFormatTests(unittest.TestCase):
+    def test_footer_names_active_agent(self):
+        """得让人知道现在说话是发给谁。"""
+        out = lk.follow_up_hint("tailcale")
+        self.assertIn("tailcale", out)
+
+
+def make_bot(chat_id="oc_1"):
+    """干净的 bot。
+
+    不清空的话，上一个测试写进共享临时文件的绑定会漏到下一个测试里
+    ——实际发生过：chats_watching 多返回了几个群。
+    """
+    api = unittest.mock.MagicMock()
+    api.bot_open_id = "ou_bot"
+    bot = lk.LarkBot(api, chat_id, loop=None)
+    bot._active = {}
+    bot._staged = {}
+    bot.chat_ids = lk.parse_chat_ids(chat_id)
+    bot.audit_chats = set()
+    return bot
+
+
+TOOL_PROMPT = """⏺ Bash(rm -rf ./build)
+  ⎿  Do you want to proceed?
+     1. yes, single permission
+     2. trust, always allow
+     3. no (tab to edit)"""
+
+ASK_PROMPT = """要用哪种方案实现？
+  1. 直接改现有函数
+  2. 新增一层抽象
+  3. 先写测试再说"""
+
+ARROW_PROMPT = """Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again
+   3. No, and tell Claude what to do differently"""
+
+
+class OptionDetectionTests(unittest.TestCase):
+    """读到一个正卡着的 agent 时，得把选项变成能点的按钮。"""
+
+    def test_detects_tool_permission_options(self):
+        opts = lk.detect_pane_options(TOOL_PROMPT)
+        self.assertEqual(len(opts), 3)
+        self.assertIn("yes", opts[0].lower())
+
+    def test_detects_ask_question_options(self):
+        """AskUserQuestion 的自定义选项，relay 的 detect_options 认不出来。"""
+        opts = lk.detect_pane_options(ASK_PROMPT)
+        self.assertEqual(len(opts), 3)
+        self.assertIn("新增一层抽象", opts[1])
+
+    def test_detects_arrow_marked_options(self):
+        opts = lk.detect_pane_options(ARROW_PROMPT)
+        self.assertEqual(len(opts), 3)
+        self.assertIn("Yes", opts[0])
+
+    def test_plain_output_has_no_options(self):
+        self.assertIsNone(lk.detect_pane_options("just some log output\nsecond line"))
+
+    def test_numbered_list_in_prose_not_treated_as_options(self):
+        """散文里的编号列表不算选择器——不能一看到数字就弹按钮。"""
+        text = "改动如下：\n1. 修了 a\n2. 修了 b\n然后跑了测试，全绿。"
+        self.assertIsNone(lk.detect_pane_options(text))
+
+    def test_requires_at_least_two_options(self):
+        self.assertIsNone(lk.detect_pane_options("Proceed?\n1. yes"))
+
+    def test_options_must_be_near_end(self):
+        """选项要在末尾附近；历史记录里的旧选项不该被当成待办。"""
+        text = "1. old\n2. old2\n" + "\n".join(f"log line {i}" for i in range(40))
+        self.assertIsNone(lk.detect_pane_options(text))
+
+    def test_caps_option_count(self):
+        many = "选一个：\n" + "\n".join(f"{i}. opt{i}" for i in range(1, 15))
+        opts = lk.detect_pane_options(many)
+        self.assertLessEqual(len(opts), 9)
+
+    def test_empty_safe(self):
+        self.assertIsNone(lk.detect_pane_options(""))
+
+
+class DigitInterceptTests(unittest.TestCase):
+    """卡在选择器上时，直接打「2」应当按键，而不是把文本发过去。"""
+
+    def test_bare_digit_is_option_press(self):
+        self.assertTrue(lk.looks_like_option_press("2"))
+
+    def test_padded_digit_ok(self):
+        self.assertTrue(lk.looks_like_option_press("  3 "))
+
+    def test_multi_digit_rejected(self):
+        self.assertFalse(lk.looks_like_option_press("12"))
+
+    def test_zero_rejected(self):
+        self.assertFalse(lk.looks_like_option_press("0"))
+
+    def test_text_rejected(self):
+        self.assertFalse(lk.looks_like_option_press("2 files changed"))
+
+
+class SendTextAckTests(unittest.TestCase):
+    """Enter 必须等 send_text 的 ack 之后再发。
+
+    relay 在 paste 之后会 settle（Cursor 尤其需要），settle 完才回 ack。
+    不等 ack 就发 Enter，回车可能赶在粘贴稳定之前到达，表现为
+    「消息进去了但没有回车」。
+    """
+
+    def test_waits_for_ack_before_enter(self):
+        ws = FakeWS([{"type": "command_result", "command": "send_text", "ok": True}])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            asyncio.run(lk.send_text_to_relay("w1:p1", "hello"))
+        self.assertEqual([m["type"] for m in ws.sent], ["send_text", "send_keys"])
+        self.assertEqual(ws.sent[1]["keys"], ["Enter"])
+
+    def test_raises_when_send_text_nacked(self):
+        ws = FakeWS([
+            {"type": "command_result", "command": "send_text", "ok": False, "message": "nope"}
+        ])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(lk.send_text_to_relay("w1:p1", "hello"))
+
+    def test_no_enter_sent_when_paste_failed(self):
+        """粘贴失败还回车，会把上一条残留内容提交出去。"""
+        ws = FakeWS([{"type": "error", "message": "send_text command failed"}])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(lk.send_text_to_relay("w1:p1", "hello"))
+        self.assertNotIn("send_keys", [m["type"] for m in ws.sent])
+
+    def test_skips_unrelated_broadcasts_before_ack(self):
+        ws = FakeWS([
+            {"type": "agents", "agents": []},
+            {"type": "command_result", "command": "send_text", "ok": True},
+        ])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            asyncio.run(lk.send_text_to_relay("w1:p1", "hello"))
+        self.assertEqual(ws.sent[-1]["keys"], ["Enter"])
+
+    def test_raises_when_ack_never_arrives(self):
+        ws = FakeWS([{"type": "agents", "agents": []} for _ in range(5)])
+        with unittest.mock.patch.object(lk, "ws_connect", fake_connect(ws)):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(lk.send_text_to_relay("w1:p1", "hello"))
+
+
+class FinishTransitionTests(unittest.TestCase):
+    """agent 停下来时要主动推，而且要带上它干了什么。"""
+
+    def test_working_to_idle_is_finish(self):
+        self.assertTrue(lk.is_finish_transition("working", "idle"))
+
+    def test_working_to_done_is_finish(self):
+        self.assertTrue(lk.is_finish_transition("working", "done"))
+
+    def test_blocked_to_idle_is_finish(self):
+        self.assertTrue(lk.is_finish_transition("blocked", "idle"))
+
+    def test_idle_to_idle_is_not(self):
+        self.assertFalse(lk.is_finish_transition("idle", "idle"))
+
+    def test_first_sight_is_not_finish(self):
+        """首次见到就是 idle 的 agent 不该触发通知，否则一启动就刷屏。"""
+        self.assertFalse(lk.is_finish_transition(None, "idle"))
+
+    def test_working_to_blocked_is_not_finish(self):
+        """转 blocked 有专门的审批卡片，不走完成通知。"""
+        self.assertFalse(lk.is_finish_transition("working", "blocked"))
+
+    def test_idle_to_working_is_not(self):
+        self.assertFalse(lk.is_finish_transition("idle", "working"))
+
+
+class FinishNotificationTests(unittest.TestCase):
+    def test_message_includes_output(self):
+        """只说「finished」等于没说——得看到它干了什么。"""
+        out = lk.format_finish_message("tailcale", "claude", "跑完了 152 个测试\n全绿")
+        self.assertIn("tailcale", out)
+        self.assertIn("152 个测试", out)
+
+    def test_handles_empty_output(self):
+        out = lk.format_finish_message("tailcale", "claude", "")
+        self.assertIn("tailcale", out)
+
+    def test_truncates_long_output(self):
+        out = lk.format_finish_message("p", "a", "x" * 5000)
+        self.assertLess(len(out), 3200)
+
+    def test_keeps_tail_when_truncating(self):
+        """结论在末尾，截断要留尾巴。"""
+        out = lk.format_finish_message("p", "a", "x" * 5000 + "CONCLUSION")
+        self.assertIn("CONCLUSION", out)
+
+
+class ChatBindingTests(unittest.TestCase):
+    """一个群绑一个 agent：15 个 agent 挤一个群会分不清谁是谁，
+    完成推送也会互相刷屏。"""
+
+    def test_bind_and_read_back(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        self.assertEqual(bot.active_pane("oc_1"), "w1:p1")
+
+    def test_binding_is_per_chat(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w2:p1")
+        self.assertEqual(bot.active_pane("oc_1"), "w1:p1")
+
+    def test_chat_title_names_the_agent(self):
+        self.assertIn("tailcale", lk.chat_title_for("tailcale"))
+
+    def test_chat_title_has_stable_prefix(self):
+        """统一前缀，一眼看出哪些群是 herdr 的。"""
+        self.assertTrue(lk.chat_title_for("x").startswith(lk.CHAT_TITLE_PREFIX))
+
+    def test_chat_title_truncates_long_project(self):
+        self.assertLessEqual(len(lk.chat_title_for("p" * 200)), 60)
+
+    def test_unbound_chat_returns_none(self):
+        self.assertIsNone(make_bot().active_pane("oc_nope"))
+
+
+class BroadcastScopeTests(unittest.TestCase):
+    """完成推送只发给绑定了这个 agent 的群。"""
+
+    def test_finds_chats_bound_to_pane(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w2:p1")
+        self.assertEqual(lk.chats_watching(bot, "w1:p1"), ["oc_1"])
+
+    def test_multiple_chats_can_watch_same_pane(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w1:p1")
+        self.assertEqual(sorted(lk.chats_watching(bot, "w1:p1")), ["oc_1", "oc_2"])
+
+    def test_falls_back_to_default_chat_when_unbound(self):
+        """没有任何群绑它时，回落到默认会话——否则通知就丢了。"""
+        bot = make_bot()
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), ["oc_1"])
+
+    def test_no_default_and_no_binding_yields_nothing(self):
+        api = unittest.mock.MagicMock()
+        api.bot_open_id = "ou_bot"
+        bot = lk.LarkBot(api, "", loop=None)
+        # 用干净的存储：其它测试可能已经往共享文件里写过群。
+        bot.chat_ids = set()
+        bot._active = {}
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
+
+
+PANE_SAMPLE = """⏺ 实测清理效果与耗时
+  ⎿  $ pkill -f herdr_lark.py
+     export HERDR_RELAY="ws://127.0.0.1:8375"
+
+✻ Drizzling… (1m 13s · ↓ 4.1k tokens)"""
+
+
+class PaneCardTests(unittest.TestCase):
+    """头部状态上色，主体走代码块保持等宽对齐。"""
+
+    def test_returns_card_dict(self):
+        card = lk.build_pane_card("tailcale", "claude", "working", PANE_SAMPLE)
+        self.assertIn("elements", card)
+
+    def test_body_is_code_block(self):
+        """代码块保住缩进和对齐——终端输出全靠这个。"""
+        card = lk.build_pane_card("p", "a", "idle", PANE_SAMPLE)
+        blob = json.dumps(card, ensure_ascii=False)
+        self.assertIn("```", blob)
+
+    def test_status_line_is_colored(self):
+        card = lk.build_pane_card("p", "a", "working", PANE_SAMPLE)
+        blob = json.dumps(card, ensure_ascii=False)
+        self.assertIn("<font color=", blob)
+
+    def test_working_and_idle_differ(self):
+        """在跑和停了要一眼看出区别。"""
+        a = json.dumps(lk.build_pane_card("p", "x", "working", "out"), ensure_ascii=False)
+        b = json.dumps(lk.build_pane_card("p", "x", "idle", "out"), ensure_ascii=False)
+        self.assertNotEqual(a, b)
+
+    def test_blocked_uses_alarming_header(self):
+        card = lk.build_pane_card("p", "a", "blocked", "out")
+        self.assertIn(card["header"]["template"], ("orange", "red"))
+
+    def test_project_in_header(self):
+        card = lk.build_pane_card("tailcale", "claude", "idle", "out")
+        self.assertIn("tailcale", card["header"]["title"]["content"])
+
+    def test_backticks_in_output_escaped(self):
+        """输出里本来就有 ``` 时不能把代码块提前闭合。"""
+        card = lk.build_pane_card("p", "a", "idle", "before\n```\nafter")
+        blob = json.dumps(card, ensure_ascii=False)
+        self.assertIn("after", blob)
+
+    def test_long_output_truncated(self):
+        card = lk.build_pane_card("p", "a", "idle", "x" * 8000)
+        self.assertLess(len(json.dumps(card)), 6000)
+
+    def test_empty_output_safe(self):
+        self.assertIn("elements", lk.build_pane_card("p", "a", "idle", ""))
+
+
+class StatusColorTests(unittest.TestCase):
+    def test_each_status_has_a_color(self):
+        for st in ("blocked", "working", "done", "idle", "unknown"):
+            self.assertTrue(lk.status_color(st))
+
+    def test_working_is_not_idle_color(self):
+        self.assertNotEqual(lk.status_color("working"), lk.status_color("idle"))
+
+
+class RenderModeTests(unittest.TestCase):
+    """卡片好看，但纯文本更省、更不容易被飞书改版坑到——两种都留着。"""
+
+    def test_default_is_card(self):
+        self.assertEqual(lk.normalize_render_mode(""), "card")
+
+    def test_text_mode_recognized(self):
+        self.assertEqual(lk.normalize_render_mode("text"), "text")
+
+    def test_case_and_space_tolerant(self):
+        self.assertEqual(lk.normalize_render_mode("  TEXT "), "text")
+
+    def test_unknown_falls_back_to_card(self):
+        self.assertEqual(lk.normalize_render_mode("rainbow"), "card")
+
+    def test_none_is_card(self):
+        self.assertEqual(lk.normalize_render_mode(None), "card")
+
+
+class RenderCommandTests(unittest.TestCase):
+    def test_render_is_a_command(self):
+        self.assertEqual(lk.parse_command("/render text"), ("render", "text"))
+
+    def test_bare_render_shows_current(self):
+        self.assertEqual(lk.parse_command("/render"), ("render", ""))
+
+
+class PaneTextFallbackTests(unittest.TestCase):
+    """text 模式下必须还是原来那套纯文本，不能悄悄变形。"""
+
+    def test_text_mode_output_is_plain(self):
+        out = lk.format_pane_text("tailcale", PANE_SAMPLE, follow_up="继续")
+        self.assertIn("tailcale", out)
+        self.assertIn("继续", out)
+        self.assertNotIn("<font", out)
+
+    def test_text_mode_truncates(self):
+        out = lk.format_pane_text("p", "x" * 9000, follow_up="")
+        self.assertLess(len(out), 3400)
+
+
+class BlankLineTests(unittest.TestCase):
+    """手机屏幕小，40% 都是空行等于一半内容被挤出屏幕。"""
+
+    def test_collapses_single_blank_between_paragraphs(self):
+        """段落间的单个空行直接去掉——Markdown 的段距在聊天里是浪费。"""
+        out = lk.clean_pane("第一段\n\n第二段\n\n第三段")
+        self.assertEqual(out, "第一段\n第二段\n第三段")
+
+    def test_keeps_content_lines(self):
+        out = lk.clean_pane("a\n\nb")
+        self.assertIn("a", out)
+        self.assertIn("b", out)
+
+    def test_collapses_many_blanks(self):
+        self.assertNotIn("\n\n", lk.clean_pane("a\n\n\n\n\nb"))
+
+    def test_drops_html_comment(self):
+        """AI_DIALOG_SUMMARY 这类注释对手机阅读毫无价值。"""
+        self.assertNotIn("AI_DIALOG_SUMMARY",
+                         lk.clean_pane("正文\n<!-- AI_DIALOG_SUMMARY: xxx -->"))
+
+    def test_drops_br_tag(self):
+        self.assertNotIn("<br>", lk.clean_pane("正文\n<br>\n更多"))
+
+    def test_blank_ratio_drops(self):
+        text = "\n\n".join(f"段落 {i}" for i in range(10))
+        out = lk.clean_pane(text)
+        blanks = sum(1 for l in out.splitlines() if not l.strip())
+        self.assertEqual(blanks, 0)
+
+    def test_real_sample_has_no_blank_lines(self):
+        sample = "标题\n\n  正文一\n\n  正文二\n\n  <br>\n\n  结尾"
+        out = lk.clean_pane(sample)
+        self.assertEqual(sum(1 for l in out.splitlines() if not l.strip()), 0)
+        self.assertIn("结尾", out)
+
+
+class SerialQueueTests(unittest.TestCase):
+    """同一个群的消息必须串行处理。
+
+    并发跑的话，send_text 的「粘贴 + 回车」两步会交错：第二条的粘贴
+    插进第一条的回车之前，结果是两条消息糊成一条。
+    """
+
+    def test_same_chat_runs_in_order(self):
+        order = []
+
+        async def work(tag, delay):
+            await asyncio.sleep(delay)
+            order.append(tag)
+
+        async def main():
+            q = lk.ChatQueue()
+            # 第一个慢、第二个快；串行的话仍应先 a 后 b
+            q.submit("oc_1", lambda: work("a", 0.05))
+            q.submit("oc_1", lambda: work("b", 0.0))
+            await q.drain()
+
+        asyncio.run(main())
+        self.assertEqual(order, ["a", "b"])
+
+    def test_different_chats_run_concurrently(self):
+        """不同群之间不该互相阻塞。"""
+        order = []
+
+        async def work(tag, delay):
+            await asyncio.sleep(delay)
+            order.append(tag)
+
+        async def main():
+            q = lk.ChatQueue()
+            q.submit("oc_slow", lambda: work("slow", 0.08))
+            q.submit("oc_fast", lambda: work("fast", 0.0))
+            await q.drain()
+
+        asyncio.run(main())
+        self.assertEqual(order, ["fast", "slow"])
+
+    def test_failure_does_not_block_queue(self):
+        """一条炸了，后面的还得跑完。"""
+        done = []
+
+        async def boom():
+            raise RuntimeError("nope")
+
+        async def ok():
+            done.append("ok")
+
+        async def main():
+            q = lk.ChatQueue()
+            q.submit("oc_1", boom)
+            q.submit("oc_1", ok)
+            await q.drain()
+
+        asyncio.run(main())
+        self.assertEqual(done, ["ok"])
+
+    def test_queue_cleaned_up_when_empty(self):
+        """队列跑空要销毁，否则群一多就泄漏。"""
+        async def main():
+            q = lk.ChatQueue()
+            q.submit("oc_1", lambda: asyncio.sleep(0))
+            await q.drain()
+            return len(q)
+
+        self.assertEqual(asyncio.run(main()), 0)
+
+    def test_many_items_all_run(self):
+        seen = []
+
+        async def main():
+            q = lk.ChatQueue()
+            for i in range(10):
+                q.submit("oc_1", lambda i=i: _append(seen, i))
+            await q.drain()
+
+        async def _append(bucket, value):
+            bucket.append(value)
+
+        asyncio.run(main())
+        self.assertEqual(seen, list(range(10)))
+
+
+class BindingStoreTests(unittest.TestCase):
+    """群 ↔ agent 的绑定要落盘：服务重启后不该让人重新 /read 一遍。"""
+
+    def test_saves_and_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            lk.BindingStore(path).set("oc_1", "w1:p1")
+            self.assertEqual(lk.BindingStore(path).get("oc_1"), "w1:p1")
+
+    def test_missing_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(lk.BindingStore(os.path.join(d, "none.json")).get("oc_1"))
+
+    def test_corrupt_file_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            with open(path, "w") as fh:
+                fh.write("{broken")
+            self.assertIsNone(lk.BindingStore(path).get("oc_1"))
+
+    def test_non_dict_payload_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            with open(path, "w") as fh:
+                json.dump(["not", "a", "dict"], fh)
+            self.assertIsNone(lk.BindingStore(path).get("oc_1"))
+
+    def test_overwrite_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            store = lk.BindingStore(path)
+            store.set("oc_1", "w1:p1")
+            store.set("oc_1", "w2:p1")
+            self.assertEqual(lk.BindingStore(path).get("oc_1"), "w2:p1")
+
+    def test_file_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            lk.BindingStore(path).set("oc_1", "w1:p1")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_as_dict_round_trips(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            store = lk.BindingStore(path)
+            store.set("oc_1", "w1:p1")
+            store.set("oc_2", "w2:p1")
+            self.assertEqual(store.as_dict(), {"oc_1": "w1:p1", "oc_2": "w2:p1"})
+
+
+class StreamCardTests(unittest.TestCase):
+    """流式卡片：agent 干活时卡片自己刷新，不用反复 /read。"""
+
+    def test_card_json_declares_streaming(self):
+        card = lk.build_stream_card_json("tailcale", "claude")
+        self.assertTrue(card["config"]["streaming_mode"])
+
+    def test_card_has_addressable_element(self):
+        """流式更新要按 element_id 定位，没有它就没法追加。"""
+        card = lk.build_stream_card_json("p", "a")
+        blob = json.dumps(card)
+        self.assertIn(lk.STREAM_ELEMENT_ID, blob)
+
+    def test_schema_is_2_0(self):
+        """streaming_mode 只有 schema 2.0 认。"""
+        self.assertEqual(lk.build_stream_card_json("p", "a")["schema"], "2.0")
+
+    def test_project_in_header(self):
+        card = lk.build_stream_card_json("tailcale", "claude")
+        self.assertIn("tailcale", json.dumps(card, ensure_ascii=False))
+
+
+class StreamThrottleTests(unittest.TestCase):
+    """节流：pane 每秒都在变，全推的话既费配额又刷得人眼晕。"""
+
+    def test_first_update_passes(self):
+        t = lk.StreamThrottle(interval=1.5)
+        self.assertTrue(t.should_send("abc", now=100.0))
+
+    def test_same_content_suppressed(self):
+        t = lk.StreamThrottle(interval=1.5)
+        t.should_send("abc", now=100.0)
+        self.assertFalse(t.should_send("abc", now=200.0))
+
+    def test_too_soon_suppressed(self):
+        t = lk.StreamThrottle(interval=1.5)
+        t.should_send("abc", now=100.0)
+        self.assertFalse(t.should_send("changed", now=100.5))
+
+    def test_after_interval_passes(self):
+        t = lk.StreamThrottle(interval=1.5)
+        t.should_send("abc", now=100.0)
+        self.assertTrue(t.should_send("changed", now=102.0))
+
+    def test_sequence_increases(self):
+        """飞书按 sequence 排序，重复或倒退会丢帧。"""
+        t = lk.StreamThrottle(interval=0)
+        a = t.next_sequence()
+        b = t.next_sequence()
+        self.assertGreater(b, a)
+
+    def test_sequence_starts_above_one(self):
+        """创建卡片本身算 sequence 1，追加得从 2 起。"""
+        self.assertGreaterEqual(lk.StreamThrottle(interval=0).next_sequence(), 2)
+
+
+TABLE_SAMPLE = """三项待办全部完成
+  ┌─────┬────────────┬───────────────┐
+  │  #  │     项     │     状态      │
+  │ 1   │ 串行队列   │ ✅ 修并发隐患 │
+  │ 2   │ 绑定持久化 │ ✅ 重启不丢   │
+  └─────┴────────────┴───────────────┘
+后续正文"""
+
+
+class TableBorderTests(unittest.TestCase):
+    """Markdown 表格在终端里被渲染成 ┌─┬─┐ 边框；手机窄屏本来就会错行，
+    与其留个残缺的框，不如只留内容。"""
+
+    def test_drops_top_border(self):
+        self.assertNotIn("┌", lk.clean_pane(TABLE_SAMPLE))
+
+    def test_drops_bottom_border(self):
+        self.assertNotIn("└", lk.clean_pane(TABLE_SAMPLE))
+
+    def test_drops_mid_border(self):
+        out = lk.clean_pane("a\n  ├────┼────┤\nb")
+        self.assertNotIn("├", out)
+
+    def test_keeps_table_content(self):
+        """边框去掉，行里的数据不能丢。"""
+        out = lk.clean_pane(TABLE_SAMPLE)
+        self.assertIn("串行队列", out)
+        self.assertIn("重启不丢", out)
+
+    def test_keeps_surrounding_text(self):
+        out = lk.clean_pane(TABLE_SAMPLE)
+        self.assertIn("三项待办全部完成", out)
+        self.assertIn("后续正文", out)
+
+    def test_strips_leading_trailing_pipes(self):
+        """行首尾的 │ 在手机上只占地方。"""
+        out = lk.clean_pane("│ 内容 │")
+        self.assertNotIn("│", out)
+        self.assertIn("内容", out)
+
+    def test_inner_separators_become_spaces(self):
+        """列之间要留可读的间隔，不能挤成一坨。"""
+        out = lk.clean_pane("│ a │ b │")
+        self.assertIn("a", out)
+        self.assertIn("b", out)
+        self.assertNotIn("ab", out.replace(" ", "x"))
+
+    def test_markdown_rule_dropped(self):
+        self.assertEqual(lk.clean_pane("正文\n---\n更多"), "正文\n更多")
+
+    def test_dashed_separator_dropped(self):
+        self.assertNotIn("───", lk.clean_pane("a\n────────\nb"))
+
+
+class StableIndexTests(unittest.TestCase):
+    """序号必须与状态无关。
+
+    原来按 sorted_agents（状态优先）编号，agent 一开始干活就跳到队首，
+    其余全部后移——用户看到列表、几秒后打 /read 3，操作到的已经是别人了。
+    """
+
+    def test_index_survives_status_change(self):
+        agents = make_agents(4)
+        before = lk.index_agents(agents)
+        # 3 号开始干活
+        changed = [dict(a) for a in agents]
+        target = before[2]["pane_id"]
+        for a in changed:
+            if a["pane_id"] == target:
+                a["status"] = "working"
+        after = lk.index_agents(changed)
+        self.assertEqual([a["pane_id"] for a in before],
+                         [a["pane_id"] for a in after])
+
+    def test_lookup_stable_across_status_change(self):
+        agents = make_agents(4)
+        picked = lk.match_agent(agents, "3")["pane_id"]
+        changed = [dict(a) for a in agents]
+        for a in changed:
+            if a["pane_id"] == picked:
+                a["status"] = "blocked"
+        self.assertEqual(lk.match_agent(changed, "3")["pane_id"], picked)
+
+    def test_order_is_deterministic(self):
+        """同一批 agent 任意打乱，序号都该一样。"""
+        agents = make_agents(5)
+        import random
+        shuffled = agents[:]
+        random.shuffle(shuffled)
+        self.assertEqual([a["pane_id"] for a in lk.index_agents(agents)],
+                         [a["pane_id"] for a in lk.index_agents(shuffled)])
+
+    def test_new_agent_appended_not_inserted(self):
+        """新 agent 出现不该把已有序号顶掉——除非 pane_id 排序就该在前。"""
+        agents = make_agents(3)
+        first_three = [a["pane_id"] for a in lk.index_agents(agents)]
+        extra = agents + [{"pane_id": "zz99:p1", "agent": "x", "status": "idle",
+                           "project": "zzz", "cwd": "/z", "host": "local"}]
+        self.assertEqual([a["pane_id"] for a in lk.index_agents(extra)][:3], first_three)
+
+    def test_list_is_ordered_by_number(self):
+        """序号必须顺着排。乱序的 8/4/13/2 扫一眼根本找不到目标。"""
+        agents = make_agents(5)
+        import re
+        nums = [int(m.group(1)) for m in
+                (re.match(r"\s*(\d+)\.", l) for l in lk.format_agent_list(agents).splitlines())
+                if m]
+        self.assertEqual(nums, sorted(nums))
+
+    def test_status_still_visible(self):
+        """不分组了，但状态得看得见。"""
+        agents = make_agents(1, status="blocked", project="urgent")
+        self.assertIn("urgent", lk.format_agent_list(agents))
+        out = lk.format_agent_list(agents)
+        self.assertTrue(any(t in out for t in ("BLOCKED", "⏸", "blocked")))
+
+    def test_blocked_marked_distinctly(self):
+        agents = make_agents(1, project="calm") + [
+            {"pane_id": "w9:p1", "agent": "a", "status": "blocked",
+             "project": "urgent", "cwd": "/u", "host": "local"}]
+        out = lk.format_agent_list(agents)
+        calm_line = [l for l in out.splitlines() if "calm" in l][0]
+        urgent_line = [l for l in out.splitlines() if "urgent" in l][0]
+        self.assertNotEqual(calm_line.strip()[:2], urgent_line.strip()[:2])
+
+    def test_list_numbers_match_lookup(self):
+        """列表上写的号，match_agent 必须认——这是全部的意义所在。"""
+        agents = make_agents(3)
+        agents.append({"pane_id": "w9:p1", "agent": "opencode", "status": "blocked",
+                       "project": "urgent", "cwd": "/w/u", "host": "local"})
+        out = lk.format_agent_list(agents)
+        import re
+        for line in out.splitlines():
+            found = re.match(r"\s*(\d+)\.\s+(\S+)", line)
+            if found:
+                number, project = found.group(1), found.group(2)
+                picked = lk.match_agent(agents, number)
+                self.assertIsNotNone(picked, f"列表里的 {number} 号查不到")
+                self.assertEqual(picked.get("project"), project)
+
+
+class NewAgentParseTests(unittest.TestCase):
+    """/new <序号> [agent 类型] —— 在某个 agent 的同目录再开一个。"""
+
+    def test_index_only_defaults_to_claude(self):
+        self.assertEqual(lk.parse_new_args("3"), ("3", "claude"))
+
+    def test_explicit_kind(self):
+        self.assertEqual(lk.parse_new_args("3 codex"), ("3", "codex"))
+
+    def test_kind_is_lowercased(self):
+        self.assertEqual(lk.parse_new_args("3 CODEX")[1], "codex")
+
+    def test_empty_yields_no_target(self):
+        self.assertEqual(lk.parse_new_args(""), (None, "claude"))
+
+    def test_extra_words_ignored(self):
+        """多余的词不当成 agent 类型——避免把任务描述误当类型。"""
+        self.assertEqual(lk.parse_new_args("3 codex 顺便改一下"), ("3", "codex"))
+
+    def test_unknown_kind_rejected(self):
+        self.assertFalse(lk.is_valid_agent_kind("definitely-not-an-agent"))
+
+    def test_known_kinds_accepted(self):
+        for kind in ("claude", "codex", "gemini", "opencode"):
+            self.assertTrue(lk.is_valid_agent_kind(kind))
+
+
+class NewAgentCommandTests(unittest.TestCase):
+    def test_new_is_a_command(self):
+        self.assertEqual(lk.parse_command("/new 3"), ("new", "3"))
+
+    def test_bare_new(self):
+        self.assertEqual(lk.parse_command("/new"), ("new", ""))
+
+
+class StartAgentTests(unittest.TestCase):
+    """新工作区起来是个空 shell，得把启动命令打进去。"""
+
+    def test_launch_line_uses_kind(self):
+        self.assertIn("codex", lk.agent_launch_command("codex", "/w/proj"))
+
+    def test_launch_line_cds_first(self):
+        """relay 建的工作区不带 --cwd，得自己 cd 过去。"""
+        line = lk.agent_launch_command("claude", "/w/proj")
+        self.assertIn("cd ", line)
+        self.assertIn("/w/proj", line)
+
+    def test_no_cwd_skips_cd(self):
+        self.assertNotIn("cd ", lk.agent_launch_command("claude", ""))
+
+    def test_quotes_path_with_spaces(self):
+        line = lk.agent_launch_command("claude", "/w/my proj")
+        self.assertIn("'/w/my proj'", line)
+
+
+MULTI_QUESTION = """要用哪种方案实现？
+  1. 直接改现有函数
+  2. 新增一层抽象
+  3. 先写测试
+
+新 agent 用哪个？
+  1. 默认 claude
+  2. 只起 codex
+  3. 只开空 shell"""
+
+
+class MultiQuestionTests(unittest.TestCase):
+    """AskUserQuestion 一次能问好几组，每组都从 1 开始重新编号。
+
+    只认第一组的话，卡片显示的是第一组选项，而 agent 可能正等第二组的
+    答案——点下去就答错了。
+    """
+
+    def test_detects_multiple_groups(self):
+        groups = lk.detect_option_groups(MULTI_QUESTION)
+        self.assertEqual(len(groups), 2)
+
+    def test_each_group_keeps_own_options(self):
+        groups = lk.detect_option_groups(MULTI_QUESTION)
+        self.assertIn("新增一层抽象", groups[0]["options"][1])
+        self.assertIn("只起 codex", groups[1]["options"][1])
+
+    def test_group_carries_its_question(self):
+        """得让人知道这组按钮在回答哪个问题。"""
+        groups = lk.detect_option_groups(MULTI_QUESTION)
+        self.assertIn("方案", groups[0]["question"])
+        self.assertIn("agent", groups[1]["question"])
+
+    def test_single_group_still_works(self):
+        groups = lk.detect_option_groups("选哪个？\n  1. A\n  2. B")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["options"], ["A", "B"])
+
+    def test_plain_output_yields_nothing(self):
+        self.assertEqual(lk.detect_option_groups("just logs\nsecond line"), [])
+
+    def test_prose_numbering_not_a_group(self):
+        self.assertEqual(
+            lk.detect_option_groups("改动：\n1. 修了 a\n2. 修了 b\n然后跑了测试。"), [])
+
+    def test_legacy_helper_returns_last_group(self):
+        """detect_pane_options 保持兼容，返回最后一组（agent 当前在等的那个）。"""
+        self.assertEqual(lk.detect_pane_options(MULTI_QUESTION)[1], "只起 codex")
+
+
+class CurrentGroupTests(unittest.TestCase):
+    """TUI 是逐组问的：答完第一组才显示第二组。
+
+    所以只推 agent 当前在等的那一组——同时展示两组的话，你点了第二组，
+    那个数字会被当成第一组的答案。
+    """
+
+    def test_uses_last_group(self):
+        """最后一组才是 agent 正在等的。"""
+        groups = lk.detect_option_groups(MULTI_QUESTION)
+        current = lk.current_option_group(groups)
+        self.assertIn("只起 codex", current["options"][1])
+
+    def test_single_group_returned_as_is(self):
+        groups = lk.detect_option_groups("选哪个？\n  1. A\n  2. B")
+        self.assertEqual(lk.current_option_group(groups)["options"], ["A", "B"])
+
+    def test_empty_yields_none(self):
+        self.assertIsNone(lk.current_option_group([]))
+
+    def test_card_shows_the_question(self):
+        """得让人知道这组按钮在回答什么。"""
+        groups = lk.detect_option_groups(MULTI_QUESTION)
+        current = lk.current_option_group(groups)
+        card = lk.build_options_card("w1:p1", "p", current["options"], "abcde",
+                                     question=current["question"])
+        self.assertIn("agent", json.dumps(card, ensure_ascii=False))
+
+    def test_card_without_question_still_valid(self):
+        card = lk.build_options_card("w1:p1", "p", ["A", "B"], "abcde")
+        self.assertIn("elements", card)
+
+
+class AutoWatchTests(unittest.TestCase):
+    """发完指令自动跟随——手工再打一次 /watch 太啰嗦。"""
+
+    def test_default_is_on(self):
+        self.assertTrue(lk.normalize_autowatch("").enabled)
+
+    def test_off_recognized(self):
+        self.assertFalse(lk.normalize_autowatch("off").enabled)
+
+    def test_explicit_on(self):
+        self.assertTrue(lk.normalize_autowatch("on").enabled)
+
+    def test_custom_seconds(self):
+        self.assertEqual(lk.normalize_autowatch("180").limit, 180)
+
+    def test_seconds_clamped_to_ceiling(self):
+        """跟太久白烧配额，给个上限。"""
+        self.assertLessEqual(lk.normalize_autowatch("99999").limit, lk.AUTOWATCH_MAX_S)
+
+    def test_seconds_clamped_to_floor(self):
+        """太短的话卡片刚建好就结束，没意义。"""
+        self.assertGreaterEqual(lk.normalize_autowatch("1").limit, lk.AUTOWATCH_MIN_S)
+
+    def test_garbage_falls_back_to_default(self):
+        self.assertEqual(lk.normalize_autowatch("banana").limit, lk.AUTOWATCH_DEFAULT_S)
+
+    def test_off_keeps_limit_for_later(self):
+        """关掉时也保留时长，重新打开不用再设一遍。"""
+        self.assertGreater(lk.normalize_autowatch("off").limit, 0)
+
+
+class AutowatchCommandTests(unittest.TestCase):
+    def test_is_a_command(self):
+        self.assertEqual(lk.parse_command("/autowatch off"), ("autowatch", "off"))
+
+    def test_bare_shows_current(self):
+        self.assertEqual(lk.parse_command("/autowatch"), ("autowatch", ""))
+
+
+class WatchDeadlineTests(unittest.TestCase):
+    """跟随要有上限：agent 卡住不动时不能一直跟着。"""
+
+    def test_not_expired_within_limit(self):
+        self.assertFalse(lk.watch_expired(started=100.0, now=150.0, limit=120))
+
+    def test_expired_past_limit(self):
+        self.assertTrue(lk.watch_expired(started=100.0, now=260.0, limit=120))
+
+    def test_zero_limit_never_expires(self):
+        """limit=0 表示不限时（手工 /watch 用）。"""
+        self.assertFalse(lk.watch_expired(started=100.0, now=99999.0, limit=0))
+
+
+class MultiChatAuthTests(unittest.TestCase):
+    """多个群各管一个 agent：守门必须放行所有授权群，而不是只放行一个。"""
+
+    def ctx(self, chat_id):
+        return lk.MessageContext(chat_id=chat_id, message_id="om_1",
+                                 sender_open_id="ou_user", chat_type="p2p")
+
+    def test_single_chat_still_works(self):
+        self.assertTrue(lk.is_authorized_chat("oc_1", {"oc_1"}))
+
+    def test_second_chat_allowed_when_listed(self):
+        self.assertTrue(lk.is_authorized_chat("oc_2", {"oc_1", "oc_2"}))
+
+    def test_unlisted_chat_rejected(self):
+        self.assertFalse(lk.is_authorized_chat("oc_evil", {"oc_1", "oc_2"}))
+
+    def test_empty_allowlist_is_discovery_mode(self):
+        """没配任何群时放行，方便第一次拿 chat_id。"""
+        self.assertTrue(lk.is_authorized_chat("oc_any", set()))
+
+    def test_parse_comma_separated(self):
+        self.assertEqual(lk.parse_chat_ids("oc_1,oc_2"), {"oc_1", "oc_2"})
+
+    def test_parse_tolerates_spaces(self):
+        self.assertEqual(lk.parse_chat_ids(" oc_1 , oc_2 "), {"oc_1", "oc_2"})
+
+    def test_parse_empty_yields_empty_set(self):
+        self.assertEqual(lk.parse_chat_ids(""), set())
+
+    def test_gate_allows_multiple_chats(self):
+        allowed = {"oc_1", "oc_2"}
+        for chat in ("oc_1", "oc_2"):
+            self.assertTrue(lk.should_handle(self.ctx(chat), "ou_bot", allowed))
+
+    def test_gate_rejects_outsider(self):
+        self.assertFalse(
+            lk.should_handle(self.ctx("oc_x"), "ou_bot", {"oc_1", "oc_2"}))
+
+    def test_gate_accepts_legacy_string(self):
+        """向后兼容：单个字符串 chat_id 仍能用。"""
+        self.assertTrue(lk.should_handle(self.ctx("oc_1"), "ou_bot", "oc_1"))
+
+
+class MultiChatIsolationTests(unittest.TestCase):
+    """两个群各绑各的 agent，互不串台。"""
+
+    def test_bindings_are_independent(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w2:p1")
+        self.assertEqual(bot.active_pane("oc_1"), "w1:p1")
+        self.assertEqual(bot.active_pane("oc_2"), "w2:p1")
+
+    def test_notification_goes_only_to_bound_chat(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w2:p1")
+        self.assertEqual(lk.chats_watching(bot, "w1:p1"), ["oc_1"])
+        self.assertEqual(lk.chats_watching(bot, "w2:p1"), ["oc_2"])
+
+    def test_rebinding_one_chat_leaves_other(self):
+        bot = make_bot()
+        bot.set_active("oc_1", "w1:p1")
+        bot.set_active("oc_2", "w2:p1")
+        bot.set_active("oc_1", "w9:p1")
+        self.assertEqual(bot.active_pane("oc_2"), "w2:p1")
+
+
+def dup_agents():
+    """两个完全同名同目录的 agent，只有 workspace_id 不同。"""
+    return [
+        {"pane_id": "w1B:p1", "agent": "claude", "status": "idle",
+         "project": "yqg-dw-datapilot", "cwd": "/code/yqg-dw-datapilot",
+         "host": "local", "workspace_id": "w1B"},
+        {"pane_id": "w22:p1", "agent": "claude", "status": "idle",
+         "project": "yqg-dw-datapilot", "cwd": "/code/yqg-dw-datapilot",
+         "host": "local", "workspace_id": "w22"},
+        {"pane_id": "w30:p1", "agent": "claude", "status": "idle",
+         "project": "unique-one", "cwd": "/code/unique", "host": "local",
+         "workspace_id": "w30"},
+    ]
+
+
+class DuplicateNameTests(unittest.TestCase):
+    """同项目同目录开两个 agent 时，列表上两行一模一样，根本分不清。"""
+
+    def test_duplicate_rows_are_distinguishable(self):
+        lines = [l for l in lk.format_agent_list(dup_agents()).splitlines()
+                 if "yqg-dw-datapilot" in l]
+        self.assertEqual(len(lines), 2)
+        self.assertNotEqual(lines[0], lines[1])
+
+    def test_workspace_shown_for_duplicates(self):
+        out = lk.format_agent_list(dup_agents())
+        self.assertIn("w1B", out)
+        self.assertIn("w22", out)
+
+    def test_unique_names_stay_clean(self):
+        """不重名的不该被加上噪音。"""
+        line = [l for l in lk.format_agent_list(dup_agents()).splitlines()
+                if "unique-one" in l][0]
+        self.assertNotIn("w30", line)
+
+    def test_all_same_name_still_distinguishable(self):
+        """三个同名同父目录时，退回 workspace id 也必须两两不同。"""
+        lines = [l for l in lk.format_agent_list(make_agents(3)).splitlines()
+                 if "project" in l and l.strip().startswith(("○","▶","✅","⏸"))]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(set(lines)), 3)
+
+    def test_distinct_names_get_no_suffix(self):
+        agents = [
+            {"pane_id": "w1:p1", "agent": "claude", "status": "idle",
+             "project": "alpha", "cwd": "/c/alpha", "host": "local"},
+            {"pane_id": "w2:p1", "agent": "claude", "status": "idle",
+             "project": "beta", "cwd": "/c/beta", "host": "local"},
+        ]
+        self.assertNotIn("[", lk.format_agent_list(agents))
+
+    def test_cwd_tail_used_when_dirs_differ(self):
+        """目录不同的重名，显示目录比显示 workspace id 好懂。"""
+        agents = [
+            {"pane_id": "w1:p1", "agent": "claude", "status": "idle",
+             "project": "api", "cwd": "/code/frontend/api", "host": "local",
+             "workspace_id": "w1"},
+            {"pane_id": "w2:p1", "agent": "claude", "status": "idle",
+             "project": "api", "cwd": "/code/backend/api", "host": "local",
+             "workspace_id": "w2"},
+        ]
+        out = lk.format_agent_list(agents)
+        self.assertIn("frontend", out)
+        self.assertIn("backend", out)
+
+    def test_picker_card_labels_distinguishable(self):
+        """卡片按钮同样要能分清。"""
+        card = lk.build_agent_picker_card("read", dup_agents())
+        labels = [b["text"]["content"] for b in buttons_in(card)]
+        dup = [l for l in labels if "yqg-dw-datapilot" in l]
+        self.assertEqual(len(set(dup)), 2)
+
+
+class ChatTitleDisambiguationTests(unittest.TestCase):
+    """两个群绑同名 agent 时，群名不能一模一样——会话列表里切都切不对。"""
+
+    def test_plain_title_without_marker(self):
+        self.assertEqual(lk.chat_title_for("tailcale"), lk.CHAT_TITLE_PREFIX + "tailcale")
+
+    def test_marker_included_when_given(self):
+        title = lk.chat_title_for("yqg-dw-datapilot", " [w22]")
+        self.assertIn("w22", title)
+        self.assertIn("yqg-dw-datapilot", title)
+
+    def test_two_markers_produce_distinct_titles(self):
+        a = lk.chat_title_for("same", " [w1B]")
+        b = lk.chat_title_for("same", " [w22]")
+        self.assertNotEqual(a, b)
+
+    def test_still_within_length_limit(self):
+        title = lk.chat_title_for("p" * 200, " [w99]")
+        self.assertLessEqual(len(title), 60)
+
+    def test_marker_survives_truncation(self):
+        """项目名太长时，宁可截项目名也要保住区分标记。"""
+        title = lk.chat_title_for("p" * 200, " [w99]")
+        self.assertIn("w99", title)
+
+    def test_marker_comes_before_project(self):
+        """会话列表宽度有限，尾部会被截掉——标记必须在前面才看得见。"""
+        title = lk.chat_title_for("some-project", " [w22]")
+        self.assertLess(title.index("w22"), title.index("some-project"))
+
+    def test_marker_visible_in_narrow_prefix(self):
+        """只看前 20 个字符也要能分清两个群。"""
+        a = lk.chat_title_for("very-long-project-name-here", " [w1B]")[:20]
+        b = lk.chat_title_for("very-long-project-name-here", " [w22]")[:20]
+        self.assertNotEqual(a, b)
+
+    def test_empty_marker_behaves_like_none(self):
+        self.assertEqual(lk.chat_title_for("x", ""), lk.chat_title_for("x"))
+
+
+class SetActiveTitleTests(unittest.TestCase):
+    def test_rename_uses_disambiguated_title(self):
+        """绑定重名 agent 时，群名要带上区分标记。"""
+        api = unittest.mock.MagicMock()
+        api.bot_open_id = "ou_bot"
+        bot = lk.LarkBot(api, "oc_1", loop=None)
+        bot.agents = dup_agents()
+        bot.set_active("oc_1", "w22:p1", "yqg-dw-datapilot")
+        called = api.set_chat_name.call_args[0][1]
+        self.assertIn("w22", called)
+
+    def test_unique_agent_gets_plain_title(self):
+        api = unittest.mock.MagicMock()
+        api.bot_open_id = "ou_bot"
+        bot = lk.LarkBot(api, "oc_1", loop=None)
+        bot.agents = dup_agents()
+        bot.set_active("oc_1", "w30:p1", "unique-one")
+        called = api.set_chat_name.call_args[0][1]
+        self.assertNotIn("[", called)
+
+
+class StreamBodyTests(unittest.TestCase):
+    """流式卡片的内容要稳，不能每帧整体平移。
+
+    原来按字符截末尾 N 个：内容一长，每多一个字所有文字就往上挪一格，
+    看着像在抖；开头还常是半个单词。
+    """
+
+    def test_cuts_on_line_boundary(self):
+        body = lk.stream_body("完整第一行\n第二行\n第三行", max_lines=2)
+        self.assertFalse(body.startswith("整"))
+        self.assertTrue(body.startswith("第二行"))
+
+    def test_keeps_tail_lines(self):
+        body = lk.stream_body("\n".join(f"行{i}" for i in range(10)), max_lines=3)
+        self.assertIn("行9", body)
+        self.assertNotIn("行5", body)
+
+    def test_short_content_untouched(self):
+        self.assertEqual(lk.stream_body("只有一行", max_lines=5), "只有一行")
+
+    def test_first_line_stable_while_appending(self):
+        """还没到行数上限时，追加内容不该让首行变。"""
+        a = lk.stream_body("行1\n行2", max_lines=5)
+        b = lk.stream_body("行1\n行2\n行3", max_lines=5)
+        self.assertEqual(a.splitlines()[0], b.splitlines()[0])
+
+    def test_scrolls_by_whole_lines(self):
+        """超过上限后按整行滚动，而不是按字符平移。"""
+        a = lk.stream_body("\n".join(f"行{i}" for i in range(5)), max_lines=3)
+        b = lk.stream_body("\n".join(f"行{i}" for i in range(6)), max_lines=3)
+        self.assertEqual(a.splitlines()[1], b.splitlines()[0])
+
+    def test_empty_is_safe(self):
+        self.assertEqual(lk.stream_body("", max_lines=3), "(无输出)")
+
+    def test_respects_char_ceiling(self):
+        """行数没超但单行超长时，仍要有字符上限兜底。"""
+        body = lk.stream_body("x" * 9000, max_lines=50)
+        self.assertLessEqual(len(body), lk.STREAM_BODY_LIMIT + 20)
+
+
+class TransientReadTests(unittest.TestCase):
+    """relay 偶发读超时会返回占位串；直接推上去卡片会突然清空。"""
+
+    def test_no_response_is_transient(self):
+        self.assertTrue(lk.is_transient_read("(no response)"))
+
+    def test_error_reading_is_transient(self):
+        self.assertTrue(lk.is_transient_read("(error reading pane: timeout)"))
+
+    def test_empty_is_transient(self):
+        self.assertTrue(lk.is_transient_read(""))
+
+    def test_real_content_is_not(self):
+        self.assertFalse(lk.is_transient_read("⏺ 正在编译\n  ⎿ done"))
+
+    def test_no_output_placeholder_is_not_transient(self):
+        """agent 真的没输出时是有效状态，不能当成故障跳过。"""
+        self.assertFalse(lk.is_transient_read("(无输出)"))
+
+
+class ProvisionGroupTests(unittest.TestCase):
+    """一键为每个 agent 拉一个群；已有的复用，不重复建。"""
+
+    def test_matches_existing_by_title(self):
+        existing = {"herdr · tailcale": "oc_1"}
+        self.assertEqual(
+            lk.find_existing_chat(existing, "tailcale", ""), "oc_1")
+
+    def test_matches_with_marker(self):
+        existing = {"herdr · [w22] dup": "oc_2"}
+        self.assertEqual(lk.find_existing_chat(existing, "dup", " [w22]"), "oc_2")
+
+    def test_marker_mismatch_is_not_a_match(self):
+        """标记不同就是不同的 agent，不能复用。"""
+        existing = {"herdr · [w1B] dup": "oc_1"}
+        self.assertIsNone(lk.find_existing_chat(existing, "dup", " [w22]"))
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(lk.find_existing_chat({}, "tailcale", ""))
+
+    def test_plan_creates_for_missing_only(self):
+        agents = [
+            {"pane_id": "w1:p1", "project": "a", "agent": "claude",
+             "status": "idle", "cwd": "/a", "host": "local"},
+            {"pane_id": "w2:p1", "project": "b", "agent": "claude",
+             "status": "idle", "cwd": "/b", "host": "local"},
+        ]
+        existing = {"herdr · a": "oc_a"}
+        plan = lk.plan_chat_provisioning(agents, existing)
+        reuse = [p for p in plan if p["chat_id"]]
+        create = [p for p in plan if not p["chat_id"]]
+        self.assertEqual(len(reuse), 1)
+        self.assertEqual(len(create), 1)
+        self.assertEqual(create[0]["project"], "b")
+
+    def test_plan_includes_marker_for_duplicates(self):
+        plan = lk.plan_chat_provisioning(dup_agents(), {})
+        titles = [p["title"] for p in plan if p["project"] == "yqg-dw-datapilot"]
+        self.assertEqual(len(set(titles)), 2)
+
+    def test_plan_covers_every_agent(self):
+        plan = lk.plan_chat_provisioning(dup_agents(), {})
+        self.assertEqual(len(plan), len(dup_agents()))
+
+
+class DuplicateChatNameTests(unittest.TestCase):
+    """群名可能重复（改名后撞上），复用判定不能认错。"""
+
+    def test_prefers_already_bound_chat(self):
+        """同名群里优先选已经绑了这个 pane 的那个。"""
+        candidates = {"herdr · x": ["oc_1", "oc_2"]}
+        bound = {"oc_2": "w9:p1"}
+        self.assertEqual(
+            lk.pick_chat_for_pane(candidates.get("herdr · x", []), "w9:p1", bound),
+            "oc_2")
+
+    def test_falls_back_to_first(self):
+        self.assertEqual(
+            lk.pick_chat_for_pane(["oc_1", "oc_2"], "w9:p1", {}), "oc_1")
+
+    def test_empty_yields_none(self):
+        self.assertIsNone(lk.pick_chat_for_pane([], "w9:p1", {}))
+
+
+class HelpRegistryTests(unittest.TestCase):
+    """命令表是单一数据源：加命令必须同时写帮助，否则测试挂。
+
+    这是为了防止 /help 随版本腐烂——之前它只显示状态，加了 8 个命令
+    一个都没体现。
+    """
+
+    def test_commands_derived_from_registry(self):
+        self.assertEqual(lk.COMMANDS, {c["name"] for c in lk.COMMAND_HELP})
+
+    def test_every_command_has_a_description(self):
+        for entry in lk.COMMAND_HELP:
+            self.assertTrue(entry.get("desc"), f"{entry['name']} 缺描述")
+
+    def test_every_handled_command_is_documented(self):
+        """代码里真正处理了的命令，都得在帮助里。"""
+        source = (pathlib.Path(lk.__file__).read_text()
+                  if hasattr(lk, "__file__") else "")
+        for entry in lk.COMMAND_HELP:
+            self.assertIn(entry["name"], lk.COMMANDS)
+
+    def test_help_lists_every_non_alias_command(self):
+        """非别名的命令一个都不能漏——这是防帮助腐烂的关键断言。"""
+        out = lk.format_help()
+        for entry in lk.COMMAND_HELP:
+            if entry["group"]:
+                self.assertIn(f"/{entry['name']}", out,
+                              f"{entry['name']} 没出现在帮助里")
+
+    def test_aliases_are_not_listed(self):
+        """别名不单列，省地方。"""
+        out = lk.format_help()
+        aliases = [e["name"] for e in lk.COMMAND_HELP if not e["group"]]
+        self.assertTrue(aliases, "应当至少有一个别名")
+        for name in aliases:
+            self.assertNotIn(f"/{name} ", out)
+
+    def test_help_is_short(self):
+        """手机上看的，太长就滑不动了。"""
+        out = lk.format_help()
+        self.assertLess(len(out.splitlines()), 30)
+        self.assertLess(len(out), 900)
+
+    def test_help_groups_are_labelled(self):
+        out = lk.format_help()
+        self.assertIn("看", out)
+
+    def test_no_duplicate_names(self):
+        names = [c["name"] for c in lk.COMMAND_HELP]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_args_shown_when_present(self):
+        out = lk.format_help()
+        self.assertIn("<序号>", out)
+
+
+class ImagePathTests(unittest.TestCase):
+    """agent 输出里提到的图片路径，直接发到飞书看，省得跑回电脑。"""
+
+    def test_finds_png_path(self):
+        found = lk.find_image_paths("截图存到 /tmp/shot.png 了")
+        self.assertIn("/tmp/shot.png", found)
+
+    def test_finds_multiple(self):
+        found = lk.find_image_paths("/t/a.png 和 /x/b.jpg")
+        self.assertEqual(len(found), 2)
+
+    def test_relative_path_ignored(self):
+        """相对路径无从定位——agent 的 cwd 和我们不一定一致。"""
+        self.assertEqual(lk.find_image_paths("生成了 shot.png"), [])
+
+    def test_ignores_non_image(self):
+        self.assertEqual(lk.find_image_paths("改了 main.py 和 README.md"), [])
+
+    def test_supports_common_formats(self):
+        for ext in ("png", "jpg", "jpeg", "gif", "webp"):
+            self.assertTrue(lk.find_image_paths(f"/t/x.{ext}"), ext)
+
+    def test_dedupes(self):
+        self.assertEqual(len(lk.find_image_paths("/a.png 又 /a.png")), 1)
+
+    def test_caps_count(self):
+        """一次别刷十几张图。"""
+        text = " ".join(f"/t/{i}.png" for i in range(20))
+        self.assertLessEqual(len(lk.find_image_paths(text)), lk.MAX_IMAGES_PER_MSG)
+
+    def test_strips_trailing_punctuation(self):
+        self.assertIn("/tmp/a.png", lk.find_image_paths("见 /tmp/a.png。"))
+
+
+class ImageSafetyTests(unittest.TestCase):
+    """别把任意文件当图片传上去。"""
+
+    def test_rejects_missing_file(self):
+        self.assertFalse(lk.is_sendable_image("/definitely/not/here.png"))
+
+    def test_rejects_oversize(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "big.png")
+            with open(path, "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n" + b"0" * (lk.MAX_IMAGE_BYTES + 10))
+            self.assertFalse(lk.is_sendable_image(path))
+
+    def test_accepts_real_png(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ok.png")
+            with open(path, "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n" + b"0" * 100)
+            self.assertTrue(lk.is_sendable_image(path))
+
+    def test_rejects_wrong_magic(self):
+        """扩展名是 png 但内容不是——不传。"""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "fake.png")
+            with open(path, "w") as fh:
+                fh.write("not an image at all")
+            self.assertFalse(lk.is_sendable_image(path))
+
+    def test_accepts_jpeg_magic(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ok.jpg")
+            with open(path, "wb") as fh:
+                fh.write(b"\xff\xd8\xff" + b"0" * 100)
+            self.assertTrue(lk.is_sendable_image(path))
+
+
+class TestIsolationTests(unittest.TestCase):
+    """单测不能写进真实配置——曾经把 oc_1 / oc_2 写进了 lark_bindings.json。"""
+
+    def test_state_paths_are_temporary(self):
+        self.assertNotIn(".config/herdr-remote", lk.BINDING_PATH)
+        self.assertNotIn(".config/herdr-remote", lk.SEEN_PATH)
+
+    def test_make_bot_does_not_touch_real_config(self):
+        real = os.path.expanduser("~/.config/herdr-remote/lark_bindings.json")
+        before = open(real).read() if os.path.exists(real) else None
+        bot = make_bot()
+        bot.set_active("oc_probe", "w99:p1")
+        after = open(real).read() if os.path.exists(real) else None
+        self.assertEqual(before, after, "单测污染了真实绑定文件")
+
+
+class BindingHygieneTests(unittest.TestCase):
+    """绑定表里不该留下已消失的群或 agent。"""
+
+    def test_prunes_unknown_chats(self):
+        kept = lk.prune_bindings(
+            {"oc_live": "w1:p1", "oc_gone": "w2:p1"},
+            known_chats={"oc_live"}, known_panes={"w1:p1", "w2:p1"})
+        self.assertEqual(kept, {"oc_live": "w1:p1"})
+
+    def test_prunes_dead_panes(self):
+        kept = lk.prune_bindings(
+            {"oc_live": "w1:p1", "oc_live2": "w9:p1"},
+            known_chats={"oc_live", "oc_live2"}, known_panes={"w1:p1"})
+        self.assertEqual(kept, {"oc_live": "w1:p1"})
+
+    def test_keeps_valid_entries(self):
+        table = {"oc_a": "w1:p1", "oc_b": "w2:p1"}
+        self.assertEqual(
+            lk.prune_bindings(table, {"oc_a", "oc_b"}, {"w1:p1", "w2:p1"}), table)
+
+    def test_empty_known_sets_keep_everything(self):
+        """还没拿到 agent 列表时别乱删。"""
+        table = {"oc_a": "w1:p1"}
+        self.assertEqual(lk.prune_bindings(table, set(), set()), table)
+
+
+class ChatIdPersistenceTests(unittest.TestCase):
+    """/spaces 建的群必须落盘，否则重启就丢，绑定还会被当成失效清掉。"""
+
+    def test_new_chat_added_to_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "chats.json")
+            store = lk.ChatIdStore(path)
+            store.add("oc_new")
+            self.assertIn("oc_new", lk.ChatIdStore(path).all())
+
+    def test_seed_from_env_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "chats.json")
+            store = lk.ChatIdStore(path)
+            store.seed({"oc_env"})
+            self.assertIn("oc_env", lk.ChatIdStore(path).all())
+
+    def test_corrupt_file_safe(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "chats.json")
+            open(path, "w").write("{broken")
+            self.assertEqual(lk.ChatIdStore(path).all(), set())
+
+    def test_prune_keeps_chats_from_store(self):
+        """群在存储里就不算消失——这是之前误删绑定的根因。"""
+        kept = lk.prune_bindings(
+            {"oc_spaces": "w1:p1"},
+            known_chats={"oc_env", "oc_spaces"}, known_panes={"w1:p1"})
+        self.assertIn("oc_spaces", kept)
+
+
+class UnbindCommandTests(unittest.TestCase):
+    """/unbind —— 解绑当前群；加 drop 连群一起解散。"""
+
+    def test_parses_plain(self):
+        self.assertEqual(lk.parse_unbind_args(""), (False,))
+
+    def test_parses_drop(self):
+        self.assertEqual(lk.parse_unbind_args("drop"), (True,))
+
+    def test_parses_chinese(self):
+        self.assertEqual(lk.parse_unbind_args("解散"), (True,))
+
+    def test_unknown_arg_is_not_drop(self):
+        """认不出来的一律当成只解绑——删群不可逆，宁可保守。"""
+        self.assertEqual(lk.parse_unbind_args("banana"), (False,))
+
+    def test_is_a_command(self):
+        self.assertEqual(lk.parse_command("/unbind drop"), ("unbind", "drop"))
+
+    def test_in_help(self):
+        self.assertIn("/unbind", lk.format_help())
+
+
+class BindingRemovalTests(unittest.TestCase):
+    def test_remove_drops_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            store = lk.BindingStore(path)
+            store.set("oc_1", "w1:p1")
+            store.remove("oc_1")
+            self.assertIsNone(lk.BindingStore(path).get("oc_1"))
+
+    def test_remove_missing_is_safe(self):
+        with tempfile.TemporaryDirectory() as d:
+            lk.BindingStore(os.path.join(d, "b.json")).remove("oc_none")
+
+    def test_chat_store_remove(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            store = lk.ChatIdStore(path)
+            store.add("oc_1")
+            store.remove("oc_1")
+            self.assertNotIn("oc_1", lk.ChatIdStore(path).all())
+
+
+class SpacesNoAutoSendTests(unittest.TestCase):
+    """/spaces 批量建群后不能自动绑定。
+
+    实际事故：/spaces 建了群，用户在新群里打了个「1」，直接发进了一个
+    他没选过的 agent 的终端。批量建群时用户并不知道哪个群绑了谁。
+    """
+
+    def test_pending_binding_is_not_active(self):
+        """预绑定要放在待确认区，不能直接进 _active。"""
+        bot = make_bot()
+        bot.stage_binding("oc_new", "w1:p1")
+        self.assertIsNone(bot.active_pane("oc_new"))
+
+    def test_staged_binding_can_be_confirmed(self):
+        bot = make_bot()
+        bot.stage_binding("oc_new", "w1:p1")
+        self.assertEqual(bot.confirm_staged("oc_new"), "w1:p1")
+        self.assertEqual(bot.active_pane("oc_new"), "w1:p1")
+
+    def test_confirm_unknown_yields_none(self):
+        self.assertIsNone(make_bot().confirm_staged("oc_nope"))
+
+    def test_staged_survives_until_confirmed(self):
+        bot = make_bot()
+        bot.stage_binding("oc_new", "w1:p1")
+        self.assertEqual(bot.staged_pane("oc_new"), "w1:p1")
+
+    def test_free_text_in_unbound_chat_is_refused(self):
+        """没确认绑定的群里，随便打字不该发到任何 agent。"""
+        bot = make_bot()
+        bot.stage_binding("oc_new", "w1:p1")
+        self.assertIsNone(bot.active_pane("oc_new"))
+
+
+class DigitSafetyTests(unittest.TestCase):
+    """纯数字只在 agent 真的在等选择时才当按键。"""
+
+    def test_digit_without_pending_approval_is_text(self):
+        """没有待审批时，「1」就是普通文本，不该当按键发。"""
+        self.assertTrue(lk.looks_like_option_press("1"))
+        # 真正的守卫在调用处：pane_id in approval_tokens
+        self.assertNotIn("w1:p1", {})
+
+
+def shell_pane(**kw):
+    base = {"pane_id": "w1:p1", "agent": "shell", "status": "unknown",
+            "project": "empty-space", "cwd": "/c/empty", "host": "local"}
+    base.update(kw)
+    return base
+
+
+class AgentPresenceTests(unittest.TestCase):
+    """有的 space 开了 agent，有的只是裸 shell —— 发消息前必须分清。
+
+    实际事故：往裸 shell 发了个「1」，shell 报 command not found。
+    """
+
+    def test_shell_without_agent_detected(self):
+        self.assertFalse(lk.has_live_agent(shell_pane()))
+
+    def test_claude_pane_has_agent(self):
+        self.assertTrue(lk.has_live_agent(make_agents(1)[0]))
+
+    def test_shell_with_real_status_counts_as_live(self):
+        """shell 但状态是 working —— 说明真在跑东西，不算空。"""
+        self.assertTrue(lk.has_live_agent(shell_pane(status="working")))
+
+    def test_missing_agent_field_is_not_live(self):
+        self.assertFalse(lk.has_live_agent({"pane_id": "w1:p1", "status": "unknown"}))
+
+    def test_empty_dict_safe(self):
+        self.assertFalse(lk.has_live_agent({}))
+
+
+class AgentPresenceDisplayTests(unittest.TestCase):
+    def test_list_marks_shell_panes(self):
+        agents = make_agents(1) + [shell_pane(pane_id="w9:p1")]
+        out = lk.format_agent_list(agents)
+        line = [l for l in out.splitlines() if "empty-space" in l][0]
+        self.assertIn(lk.SHELL_ICON, line)
+
+    def test_live_agents_keep_status_icon(self):
+        line = [l for l in lk.format_agent_list(make_agents(1)).splitlines()
+                if "project" in l][0]
+        self.assertNotIn(lk.SHELL_ICON, line)
+
+    def test_legend_explains_shell(self):
+        self.assertIn(lk.SHELL_ICON, lk.format_agent_list(make_agents(1)))
+
+
+class SendToShellGuardTests(unittest.TestCase):
+    """往裸 shell 发文本要提醒，不能默默发进去变成 command not found。"""
+
+    def test_warns_for_shell_pane(self):
+        self.assertTrue(lk.should_warn_shell(shell_pane()))
+
+    def test_no_warning_for_live_agent(self):
+        self.assertFalse(lk.should_warn_shell(make_agents(1)[0]))
+
+    def test_hint_names_the_fix(self):
+        hint = lk.shell_hint("empty-space")
+        self.assertIn("empty-space", hint)
+        self.assertIn("/new", hint)
+
+
+class HealthReportTests(unittest.TestCase):
+    """/health —— 一条命令看清全貌，现在排查要翻日志。"""
+
+    def _report(self, **kw):
+        base = dict(relay_connected=True, relay_url="ws://127.0.0.1:8375",
+                    agents=3, live_agents=2, chats=2, bindings=1, staged=0,
+                    queued=0, watchers=0, seen=10, render="card",
+                    autowatch=True, autowatch_limit=120)
+        base.update(kw)
+        return lk.format_health(**base)
+
+    def test_shows_relay_state(self):
+        self.assertIn("relay", self._report().lower())
+
+    def test_flags_disconnected_relay(self):
+        out = self._report(relay_connected=False)
+        self.assertIn("✗", out)
+
+    def test_healthy_shows_ok_marks(self):
+        self.assertIn("✓", self._report())
+
+    def test_counts_agents_and_live(self):
+        out = self._report(agents=16, live_agents=12)
+        self.assertIn("16", out)
+        self.assertIn("12", out)
+
+    def test_shows_queue_depth(self):
+        """连发多条时得知道排到第几个。"""
+        self.assertIn("3", self._report(queued=3))
+
+    def test_shows_watchers(self):
+        self.assertIn("2", self._report(watchers=2))
+
+    def test_shows_staged_bindings(self):
+        self.assertIn("5", self._report(staged=5))
+
+    def test_url_is_scrubbed(self):
+        """relay URL 带 token 时不能原样显示。"""
+        out = self._report(relay_url="ws://x:8375?token=SECRET")
+        self.assertNotIn("SECRET", out)
+
+    def test_is_short(self):
+        self.assertLess(len(self._report().splitlines()), 16)
+
+    def test_in_help(self):
+        self.assertIn("/health", lk.format_help())
+
+
+class QueueDepthTests(unittest.TestCase):
+    def test_empty_queue_is_zero(self):
+        self.assertEqual(lk.ChatQueue().depth(), 0)
+
+    def test_counts_pending_items(self):
+        async def main():
+            q = lk.ChatQueue()
+            q.submit("oc_1", lambda: asyncio.sleep(0.05))
+            q.submit("oc_1", lambda: asyncio.sleep(0))
+            depth = q.depth()
+            await q.drain()
+            return depth
+        self.assertGreaterEqual(asyncio.run(main()), 1)
+
+
+class AuditRecordTests(unittest.TestCase):
+    """审计群只读：记录谁在什么时候对哪个 agent 做了什么。"""
+
+    def test_formats_send(self):
+        line = lk.format_audit("send", "tailcale", "w1:p1", "继续改这个函数")
+        self.assertIn("tailcale", line)
+        self.assertIn("继续改这个函数", line)
+
+    def test_includes_action(self):
+        self.assertIn("approve", lk.format_audit("approve", "p", "w1:p1", "2"))
+
+    def test_truncates_long_detail(self):
+        line = lk.format_audit("send", "p", "w1:p1", "x" * 2000)
+        self.assertLess(len(line), 400)
+
+    def test_empty_detail_safe(self):
+        self.assertTrue(lk.format_audit("interrupt", "p", "w1:p1", ""))
+
+    def test_scrubs_secrets(self):
+        """指令里可能带 token，审计群不能原样记。"""
+        with unittest.mock.patch.object(lk, "_RELAY_TOKEN", "tok-secret"):
+            line = lk.format_audit("send", "p", "w1:p1", "用 tok-secret 登录")
+            self.assertNotIn("tok-secret", line)
+
+
+class AuditRoutingTests(unittest.TestCase):
+    """审计群是只读的——能看到全部指令，绝不能反过来下指令。"""
+
+    def test_audit_chat_rejects_commands(self):
+        self.assertFalse(lk.is_command_allowed("oc_audit", {"oc_audit"}))
+
+    def test_normal_chat_accepts_commands(self):
+        self.assertTrue(lk.is_command_allowed("oc_normal", {"oc_audit"}))
+
+    def test_no_audit_chat_allows_all(self):
+        self.assertTrue(lk.is_command_allowed("oc_any", set()))
+
+    def test_audit_chat_not_in_broadcast_targets(self):
+        """完成通知不该重复发到审计群——它有自己的记录。"""
+        bot = make_bot()
+        bot.audit_chats = {"oc_audit"}
+        bot.set_active("oc_work", "w1:p1")
+        self.assertNotIn("oc_audit", lk.chats_watching(bot, "w1:p1"))
+
+    def test_parses_audit_chat_ids(self):
+        self.assertEqual(lk.parse_chat_ids("oc_a,oc_b"), {"oc_a", "oc_b"})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

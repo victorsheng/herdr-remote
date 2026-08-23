@@ -54,6 +54,52 @@ echo "9. relay agent state behavior"
 python3 "$DIR/tests/test_agent_state.py"
 assert_eq "$?" "0" "agent state tests"
 
+# --- Lark bot ---
+echo ""
+echo "=== Lark bot ==="
+echo "L1. lark bot syntax"
+python3 -c "import ast; ast.parse(open('$DIR/relay/herdr_lark.py').read())" 2>/dev/null
+assert_eq "$?" "0" "herdr_lark.py parses"
+
+echo "L2. PEP 723 metadata"
+grep -q "requires-python" "$DIR/relay/herdr_lark.py"
+assert_eq "$?" "0" "inline deps present"
+
+echo "L3. lark bot env vars documented"
+grep -q "HERDR_LARK_APP_ID" "$DIR/relay/herdr_lark.py" && grep -q "HERDR_LARK_CHAT_ID" "$DIR/relay/herdr_lark.py"
+assert_eq "$?" "0" "env vars referenced"
+
+echo "L4. approval sends option index, never option text"
+grep -q 'send_keys_to_relay(pane_id, \[str(key)\])' "$DIR/relay/herdr_lark.py"
+assert_eq "$?" "0" "approval presses the option number"
+
+echo "L5. interrupt uses relay SAFE_KEYS name"
+grep -q '\["C-c"\]' "$DIR/relay/herdr_lark.py"
+assert_eq "$?" "0" "interrupt sends C-c"
+
+echo "L6. lark bot behavior"
+uv run "$DIR/tests/test_lark.py" >/dev/null 2>&1
+assert_eq "$?" "0" "lark bot tests"
+
+echo "L7. lark e2e (needs running relay)"
+if pgrep -f "herdr_relay.py" >/dev/null 2>&1; then
+  # 只读模式：全量套件不该往真实 agent 写东西。
+  # relay 可能启用了 token，从配置里取。
+  ( set -a
+    [ -f "$HOME/.config/herdr-remote/config.env" ] && . "$HOME/.config/herdr-remote/config.env"
+    [ -f "$HOME/.config/herdr-remote/secrets.env" ] && . "$HOME/.config/herdr-remote/secrets.env"
+    set +a
+    uv run "$DIR/tests/e2e_lark.py" --read-only >/dev/null 2>&1 )
+  RC=$?
+  if [ "$RC" = "2" ]; then
+    PASS=$((PASS+1)); echo "  skip: relay unreachable (no token?)"
+  else
+    assert_eq "$RC" "0" "lark e2e (read-only)"
+  fi
+else
+  PASS=$((PASS+1)); echo "  skip: relay not running"
+fi
+
 # --- TUI ---
 echo ""
 echo "=== TUI ==="
