@@ -1538,18 +1538,42 @@ _MAX_OPTIONS = 9
 # 选择器底部的操作提示行。真实抓屏长这样：
 #   Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 # 它顶格且不含边框字符，会被当成「选择器已经翻过去了」的正文，把整组丢掉
-# ——卡片上一个按钮都不剩。按整行匹配而不是搜关键词，免得正常输出里出现
-# 「Enter the build directory」也被放过。
+# ——卡片上一个按钮都不剩。
+#
+# 短语抄自 herdr 自己的检测 manifest（它判 blocked 用的就是这些）：
+#   ~/.local/state/herdr/agent-detection/remote/claude.toml → live_blocked_form
+# 那份文件跟着 Claude 版本远程更新，比照单次抓屏归纳可靠。照抓屏猜会漏变体
+# （最初就漏了 confirm、↑/↓、set as default 三种），漏一个，那个变体下的
+# 选择器就整组丢掉。加新变体时对着 manifest 抄，别自己想。
+_SELECTOR_HINT_PHRASES = [
+    r"enter to (?:select|confirm|set as default)",
+    r"(?:tab/)?arrows? (?:keys )?to navigate",
+    r"(?:↑/↓|↑↓|arrows?) to navigate",
+    r"esc to cancel",
+    r"press enter[\w\s]*",
+]
+# 整行必须由这些短语（可用 · 串联）拼满才算提示行。不搜子串：正常输出里的
+# 「Enter the build directory」「navigate to the folder」不该被放过，否则
+# 历史旧选择器会被误认成活的。
 _SELECTOR_HINT_RE = re.compile(
-    r"^(?:[·•\s]*(?:enter\s+to\s+select|tab(?:/arrow)?[\w\s/]*to\s+navigate"
-    r"|(?:arrow|↑↓)[\w\s/]*to\s+(?:navigate|select)|esc\s+to\s+cancel"
-    r"|press\s+enter[\w\s]*)[·•\s]*)+$",
+    r"^(?:[·•|\s]*(?:" + "|".join(_SELECTOR_HINT_PHRASES) + r"))+[·•|\s]*$",
     re.I)
 
 # AskUserQuestion 选择器自带的固定尾项，跟着每一组走，不是 agent 问你的内容。
 # 按下去会掉进自由输入框而不是选中什么，所以不该出现在卡片上。
+# 单选框写作 `Type something.`（带句点），多选框写作 `Type something`（不带）。
 _TUI_TAIL_OPTIONS = {"type something.", "type something",
                      "chat about this", "chat about this."}
+
+# 多选框每项前面的复选标记：`[ ] 单测`、`[x] 已选`。它是状态而非选项文字，
+# 留着会让按钮显示成「1. [ ] 单测」，白占本就不宽的按钮。
+# 只认方括号里为空或单个勾选字符的形式——正文里的 `[bug]` 不能被误摘。
+_CHECKBOX_RE = re.compile(r"^\[\s*[xX✓✔·*]?\s*\]\s*")
+
+
+def strip_checkbox(text: str) -> str:
+    """摘掉多选框选项前的 `[ ]` / `[x]` 标记。"""
+    return _CHECKBOX_RE.sub("", (text or "").strip())
 
 
 def detect_option_groups(text: str) -> list[dict]:
@@ -1635,7 +1659,7 @@ def is_tui_tail_option(text: str) -> bool:
     整行相等才算：正常选项里也可能出现这些词（「Type something into the
     form」是真选项），只搜关键词会误伤。
     """
-    return (text or "").strip().lower() in _TUI_TAIL_OPTIONS
+    return strip_checkbox(text).lower() in _TUI_TAIL_OPTIONS
 
 
 def _selector_start(lines: list[str], last_option_at: int) -> int:
@@ -1681,7 +1705,8 @@ def _parse_groups(lines: list[str], start: int, end: int) -> list[dict]:
                 # 先按屏幕编号校验连续性，再摘掉固定尾项：尾项也占编号，
                 # 提前摘掉会让 4/5 缺位，整组被连续性校验丢掉。
                 # 尾项恒在末尾，摘掉后剩下的仍是 1..n，按钮发的数字依旧对得上屏幕。
-                kept = [t for _, t in current if not is_tui_tail_option(t)]
+                kept = [strip_checkbox(t) for _, t in current
+                        if not is_tui_tail_option(t)]
                 if len(kept) >= 2:
                     groups.append({
                         "question": question.strip(),

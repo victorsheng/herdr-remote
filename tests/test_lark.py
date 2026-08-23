@@ -3084,6 +3084,68 @@ class RealPaneSelectorTests(unittest.TestCase):
         self.assertEqual(keys, ["1", "2", "3"])
 
 
+# 真实抓屏：AskUserQuestion 的多选框（allow multiple）。
+# 与单选的差别：每项前面带 `[ ]` 复选标记，尾项写作 `Type something`（无句点），
+# 且提示行用的是 `↑/↓ to navigate` 变体。
+REAL_MULTISELECT_PANE = """\
+要跑哪些检查？
+
+❯ 1. [ ] 单测
+  运行单元测试
+  2. [ ] 静态扫描
+  运行静态代码扫描
+  3. [ ] 安全审计
+  运行安全审计检查
+  4. [ ] Type something
+     Submit
+───────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel"""
+
+
+class MultiSelectFormTests(unittest.TestCase):
+    """多选框（allow multiple）的真实抓屏。
+
+    单选那套抓屏盖不住它：选项带 `[ ]` 复选标记，尾项没有句点。
+    """
+
+    def test_parses(self):
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTISELECT_PANE))
+        self.assertEqual(len(groups), 1)
+
+    def test_checkbox_marker_stripped(self):
+        """`[ ]` 是复选状态标记，不是选项文字的一部分。
+
+        留着它，按钮上会显示「1. [ ] 单测」，还白占按钮宽度。
+        """
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTISELECT_PANE))
+        self.assertEqual(groups[0]["options"], ["单测", "静态扫描", "安全审计"])
+
+    def test_checked_marker_also_stripped(self):
+        """已选中的是 `[x]`／`[✓]`，同样要摘掉。"""
+        pane = ("选哪些？\n❯ 1. [x] 甲\n  2. [✓] 乙\n  3. [ ] 丙\n"
+                "\nEnter to select · ↑/↓ to navigate · Esc to cancel")
+        groups = lk.detect_option_groups(lk.clean_pane(pane))
+        self.assertEqual(groups[0]["options"], ["甲", "乙", "丙"])
+
+    def test_tail_item_without_period_dropped(self):
+        """多选框的尾项写作 `Type something`，没有句点。"""
+        self.assertTrue(lk.is_tui_tail_option("[ ] Type something"))
+
+    def test_bracketed_tail_item_dropped(self):
+        """带复选标记的尾项也要滤掉——摘标记与滤尾项的顺序不能反。"""
+        for raw in ("[ ] Type something", "[ ] Chat about this",
+                    "[x] Type something."):
+            with self.subTest(raw=raw):
+                self.assertTrue(lk.is_tui_tail_option(raw), raw)
+
+    def test_real_option_with_bracket_kept(self):
+        """别误伤：正文里本来就可能有方括号。"""
+        self.assertFalse(lk.is_tui_tail_option("[ ] 单测"))
+        self.assertFalse(lk.is_tui_tail_option("修 [bug] 再发版"))
+
+
 class TuiTailItemTests(unittest.TestCase):
     """TUI 固定尾项的识别。它们跟着每一个 AskUserQuestion 选择器走。"""
 
@@ -3116,6 +3178,75 @@ class SelectorHintLineTests(unittest.TestCase):
         """普通输出别被当成提示行放过，否则历史旧选择器会被误认。"""
         self.assertFalse(lk.is_selector_hint("跑完测试了，全绿。"))
         self.assertFalse(lk.is_selector_hint("Enter the build directory"))
+        self.assertFalse(lk.is_selector_hint("Press any key"))
+        self.assertFalse(lk.is_selector_hint("navigate to the folder"))
+
+
+# herdr 自己判断 agent 是否 blocked，用的就是这些提示行。
+# 抄自它的检测 manifest（跟着 Claude 版本远程更新）：
+#   ~/.local/state/herdr/agent-detection/remote/claude.toml → live_blocked_form
+# 照单次抓屏归纳会漏变体，漏一个，那个变体下的选择器就整组丢掉。
+MANIFEST_HINT_PHRASES = [
+    "enter to confirm",
+    "enter to select",
+    "tab/arrow keys to navigate",
+    "arrow keys to navigate",
+    "arrows to navigate",
+    "↑/↓ to navigate",
+    "↑↓ to navigate",
+    "esc to cancel",
+    "enter to set as default",
+]
+
+
+class ManifestHintCoverageTests(unittest.TestCase):
+    """herdr manifest 列出的每个提示行变体都得认得。
+
+    这些短语单独成行、或用 · 串起来出现在选择器底部。任何一个没认出来，
+    _is_selector_tail 就会把它当正文，判定选择器已翻篇，卡片上一个按钮
+    都不剩——正是 f5b03e1 修的那个 bug。
+    """
+
+    def test_every_phrase_alone_is_a_hint(self):
+        for phrase in MANIFEST_HINT_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(lk.is_selector_hint(phrase), phrase)
+
+    def test_phrases_are_case_insensitive(self):
+        for phrase in MANIFEST_HINT_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(lk.is_selector_hint(phrase.title()), phrase)
+
+    def test_phrases_joined_by_separator(self):
+        """真实屏幕上是用 · 串起来的一整行。"""
+        for nav in ("Tab/Arrow keys to navigate", "Arrow keys to navigate",
+                    "Arrows to navigate", "↑/↓ to navigate", "↑↓ to navigate"):
+            line = f"Enter to select · {nav} · Esc to cancel"
+            with self.subTest(line=line):
+                self.assertTrue(lk.is_selector_hint(line), line)
+
+    def test_confirm_variant(self):
+        """AskUserQuestion 的多选框用的是 confirm 而不是 select。"""
+        self.assertTrue(lk.is_selector_hint("Enter to confirm · Esc to cancel"))
+
+    def test_model_picker_variant(self):
+        """选模型菜单：Enter to set as default。"""
+        self.assertTrue(
+            lk.is_selector_hint("Enter to set as default · Esc to cancel"))
+
+    def test_hint_line_survives_in_full_pane(self):
+        """每个变体都要能让选择器整体存活，而不只是谓词返回 True。"""
+        for nav in ("Tab/Arrow keys to navigate", "↑/↓ to navigate",
+                    "Arrows to navigate"):
+            pane = ("选哪个？\n"
+                    "❯ 1. 甲\n"
+                    "  2. 乙\n"
+                    "  3. Type something.\n"
+                    f"\nEnter to select · {nav} · Esc to cancel")
+            with self.subTest(nav=nav):
+                groups = lk.detect_option_groups(lk.clean_pane(pane))
+                self.assertEqual(len(groups), 1, nav)
+                self.assertEqual(groups[0]["options"], ["甲", "乙"], nav)
 
 
 if __name__ == "__main__":
