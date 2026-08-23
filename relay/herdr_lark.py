@@ -686,7 +686,14 @@ def build_options_card(pane_id: str, project: str, options: list[str],
 def current_option_group(groups: list[dict]) -> dict | None:
     """agent 当前在等的那一组。
 
-    TUI 逐组问：答完第一组才显示第二组，所以最后一组才是当前的。
+    实测（Claude Code v2.1.239）：顶部 tab 栏列出全部组（`☐ 方案 ☐ Agent`），
+    选项区只渲染当前 tab 那一组，答完后原地替换成下一组。所以同屏正常只有
+    一组，取最后一组即可；多于一组说明上方还粘着历史选择器的残影，此时
+    仍是最后一组最新。
+
+    只推当前这一组，不去渲染 tab 栏里的其它组：数字键只作用于当前 tab，
+    跨组得先发 Tab，按钮发数字答不了第二组。答完后 _push_next_group 会把
+    下一组接着推上来。
     """
     return groups[-1] if groups else None
 
@@ -1528,12 +1535,30 @@ _OPTION_SCAN_LINES = 200
 _OPTION_TRAILING_PROSE = 2
 _MAX_OPTIONS = 9
 
+# 选择器底部的操作提示行。真实抓屏长这样：
+#   Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+# 它顶格且不含边框字符，会被当成「选择器已经翻过去了」的正文，把整组丢掉
+# ——卡片上一个按钮都不剩。按整行匹配而不是搜关键词，免得正常输出里出现
+# 「Enter the build directory」也被放过。
+_SELECTOR_HINT_RE = re.compile(
+    r"^(?:[·•\s]*(?:enter\s+to\s+select|tab(?:/arrow)?[\w\s/]*to\s+navigate"
+    r"|(?:arrow|↑↓)[\w\s/]*to\s+(?:navigate|select)|esc\s+to\s+cancel"
+    r"|press\s+enter[\w\s]*)[·•\s]*)+$",
+    re.I)
+
+# AskUserQuestion 选择器自带的固定尾项，跟着每一组走，不是 agent 问你的内容。
+# 按下去会掉进自由输入框而不是选中什么，所以不该出现在卡片上。
+_TUI_TAIL_OPTIONS = {"type something.", "type something",
+                     "chat about this", "chat about this."}
+
 
 def detect_option_groups(text: str) -> list[dict]:
     """认出所有「正在等你选」的组。
 
-    AskUserQuestion 一次能问好几组，每组都从 1 重新编号。只认第一组的话
-    卡片显示的是第一组，而 agent 可能正等第二组的答案——点下去就答错了。
+    AskUserQuestion 一次能问好几组，每组都从 1 重新编号；屏幕上通常只渲染
+    当前 tab 那一组（见 current_option_group）。仍然解析多组，是因为屏幕上
+    可能粘着上一组的残影，得靠「编号回到 1」把它们切开，否则两组的选项会
+    连成一串，编号对不上屏幕。
 
     从末尾反向定位选择器区间，而不是截固定行数的窗口：窗口切在某组中间时，
     那组编号不从 1 起，会被连续性校验整组丢掉，卡片上就少选项。
@@ -1576,6 +1601,8 @@ def _is_selector_tail(rest: list[str]) -> bool:
         stripped = line.strip()
         if not stripped or _is_tui_chrome(stripped):
             continue
+        if is_selector_hint(stripped):  # 提示行属于选择器自己
+            continue
         if line[:1] in (" ", "\t"):  # 缩进 = 选项的描述行
             continue
         return False
@@ -1593,6 +1620,24 @@ def _is_tui_chrome(stripped: str) -> bool:
     return bool(_TUI_CHROME_RE.match(stripped))
 
 
+def is_selector_hint(stripped: str) -> bool:
+    """这行是选择器底部的操作提示吗。
+
+    提示行属于选择器自己，不是「选择器之后的正文」。把它当正文的话，
+    _is_selector_tail 会判定选择器已翻篇，整组选项被丢弃。
+    """
+    return bool(_SELECTOR_HINT_RE.match((stripped or "").strip()))
+
+
+def is_tui_tail_option(text: str) -> bool:
+    """这个选项是 TUI 的固定尾项（Type something / Chat about this）吗。
+
+    整行相等才算：正常选项里也可能出现这些词（「Type something into the
+    form」是真选项），只搜关键词会误伤。
+    """
+    return (text or "").strip().lower() in _TUI_TAIL_OPTIONS
+
+
 def _selector_start(lines: list[str], last_option_at: int) -> int:
     """选择器区间的起点：从最后一个选项往上，走到第一组的「1.」为止。
 
@@ -1608,7 +1653,7 @@ def _selector_start(lines: list[str], last_option_at: int) -> int:
             prose_run = 0
             continue
         stripped = line.strip()
-        if not stripped or _is_tui_chrome(stripped):
+        if not stripped or _is_tui_chrome(stripped) or is_selector_hint(stripped):
             prose_run = 0
             continue
         if line[:1] in (" ", "\t"):  # 选项的描述行，不是边界
@@ -1633,10 +1678,15 @@ def _parse_groups(lines: list[str], start: int, end: int) -> list[dict]:
         if len(current) >= 2:
             numbers = [n for n, _ in current]
             if numbers == list(range(1, len(numbers) + 1)):
-                groups.append({
-                    "question": question.strip(),
-                    "options": [t for _, t in current][:_MAX_OPTIONS],
-                })
+                # 先按屏幕编号校验连续性，再摘掉固定尾项：尾项也占编号，
+                # 提前摘掉会让 4/5 缺位，整组被连续性校验丢掉。
+                # 尾项恒在末尾，摘掉后剩下的仍是 1..n，按钮发的数字依旧对得上屏幕。
+                kept = [t for _, t in current if not is_tui_tail_option(t)]
+                if len(kept) >= 2:
+                    groups.append({
+                        "question": question.strip(),
+                        "options": kept[:_MAX_OPTIONS],
+                    })
         current = []
         question = ""
 

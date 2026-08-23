@@ -1860,10 +1860,11 @@ class MultiQuestionTests(unittest.TestCase):
 
 
 class CurrentGroupTests(unittest.TestCase):
-    """TUI 是逐组问的：答完第一组才显示第二组。
+    """只推 agent 当前在等的那一组。
 
-    所以只推 agent 当前在等的那一组——同时展示两组的话，你点了第二组，
-    那个数字会被当成第一组的答案。
+    实测：tab 栏列出全部组，选项区只渲染当前 tab 那一组。数字键只作用于
+    当前 tab——同时展示两组的话，你点第二组，那个数字会被当成第一组的答案。
+    真实抓屏见 RealPaneSelectorTests。
     """
 
     def test_uses_last_group(self):
@@ -2970,6 +2971,151 @@ class AuditRoutingTests(unittest.TestCase):
         bot.chat_ids = {"oc_a", "oc_b"}
         for chat in ("oc_a", "oc_b"):
             self.assertTrue(lk.is_authorized_chat(chat, bot.chat_ids))
+
+
+# 真实抓屏：Claude Code v2.1.239，一次 AskUserQuestion 问两组。
+# 逐字复制自 `herdr agent read w2A:p1 --source visible`，别"整理"它——
+# 这些行的顶格/缩进/尾行提示正是解析器踩过的坑。
+REAL_MULTI_TAB_PANE = """\
+ ▐▛███▛█   Claude Code v2.1.239
+▝▜██████▀  Opus 5 (1M context) with high effort · Claude Team
+  ▝▝ ▝▝    ~/code-github/dolphinscheduler-newversion
+
+
+❯ 请调用 AskUserQuestion 工具，在一次调用里同时问我两个问题。
+───────────────────────────────────────────────────────────────────────
+←  ☐ 方案  ☐ Agent  ✔ Submit  →
+
+要用哪种方案实现？
+
+❯ 1. 直接改现有函数
+     在现有函数内部直接修改实现
+  2. 新增一层抽象
+     引入新的抽象层，隔离改动
+  3. 先写测试
+     先补测试再动实现
+  4. Type something.
+───────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel"""
+
+
+# 同一次调用的第二组：答完第一组后原地替换，tab 栏第一个变成 ☒。
+REAL_SECOND_TAB_PANE = """\
+❯ 请调用 AskUserQuestion 工具，在一次调用里同时问我两个问题。
+───────────────────────────────────────────────────────────────────────
+←  ☒ 方案  ☐ Agent  ✔ Submit  →
+
+新 agent 用哪个？
+
+❯ 1. 默认 claude
+     使用默认 claude agent
+  2. 只起 codex
+     仅启动 codex agent
+  3. 只开空 shell
+     仅开一个空的 shell 环境
+  4. Type something.
+───────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel"""
+
+
+class RealPaneSelectorTests(unittest.TestCase):
+    """拿真实抓屏跑解析，而不是手写的理想样本。
+
+    手写样本让两个互相矛盾的前提都"测过"了：detect_option_groups 假设多组
+    同屏，current_option_group 假设逐组显示。真实 TUI 两者都不是——顶部
+    tab 栏列出所有组，选项区只渲染当前那一组。
+    """
+
+    def test_real_pane_yields_a_group(self):
+        """真实抓屏必须解析出选项。原来是 0 组，卡片上一个按钮都没有。"""
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
+        self.assertTrue(groups, "真实 pane 解析不出选项组")
+
+    def test_hint_line_does_not_kill_selector(self):
+        """`Enter to select · Tab/Arrow keys…` 是 TUI 提示，不是正文。
+
+        它顶格且非边框字符，被当成"选择器已翻过去"的正文，整组被丢弃。
+        """
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
+        self.assertEqual(len(groups), 1, "同屏只该有当前 tab 这一组")
+
+    def test_only_real_options_kept(self):
+        """`Type something.` / `Chat about this` 是 TUI 固定尾项。
+
+        它们不是 agent 问你的内容，按下去会掉进自由输入框。
+        """
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
+        self.assertEqual(groups[0]["options"],
+                         ["直接改现有函数", "新增一层抽象", "先写测试"])
+
+    def test_question_comes_from_the_tab(self):
+        """提问行取选项上方那句，而不是 tab 栏或用户的输入回显。"""
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
+        self.assertEqual(groups[0]["question"], "要用哪种方案实现？")
+
+    def test_tab_bar_is_not_an_option(self):
+        """`←  ☐ 方案  ☐ Agent  ✔ Submit  →` 不含编号，不该混进选项。"""
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
+        joined = " ".join(groups[0]["options"])
+        self.assertNotIn("Submit", joined)
+
+    def test_second_tab_parses_too(self):
+        """答完第一组后原地替换成第二组，同样要认得出。"""
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_SECOND_TAB_PANE))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["question"], "新 agent 用哪个？")
+        self.assertEqual(groups[0]["options"],
+                         ["默认 claude", "只起 codex", "只开空 shell"])
+
+    def test_numbers_stay_aligned_with_screen(self):
+        """按钮发的数字必须对得上屏幕上的编号。
+
+        过滤尾项不能重排序号——过滤后仍是 1/2/3，与屏幕一致。
+        """
+        groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
+        card = lk.build_options_card("w2A:p1", "proj", groups[0]["options"],
+                                     "abcde", question=groups[0]["question"])
+        keys = [b["value"]["k"]
+                for b in card["elements"][1]["actions"]]
+        self.assertEqual(keys, ["1", "2", "3"])
+
+
+class TuiTailItemTests(unittest.TestCase):
+    """TUI 固定尾项的识别。它们跟着每一个 AskUserQuestion 选择器走。"""
+
+    def test_type_something_dropped(self):
+        self.assertTrue(lk.is_tui_tail_option("Type something."))
+
+    def test_chat_about_this_dropped(self):
+        self.assertTrue(lk.is_tui_tail_option("Chat about this"))
+
+    def test_case_and_space_tolerated(self):
+        self.assertTrue(lk.is_tui_tail_option("  type something.  "))
+
+    def test_real_option_kept(self):
+        """别误伤：正常选项里也可能出现这些词。"""
+        self.assertFalse(lk.is_tui_tail_option("Type something into the form"))
+        self.assertFalse(lk.is_tui_tail_option("先写测试"))
+
+
+class SelectorHintLineTests(unittest.TestCase):
+    """选择器底部的操作提示行。"""
+
+    def test_enter_to_select_is_hint(self):
+        self.assertTrue(lk.is_selector_hint(
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"))
+
+    def test_esc_to_cancel_is_hint(self):
+        self.assertTrue(lk.is_selector_hint("Esc to cancel"))
+
+    def test_prose_is_not_hint(self):
+        """普通输出别被当成提示行放过，否则历史旧选择器会被误认。"""
+        self.assertFalse(lk.is_selector_hint("跑完测试了，全绿。"))
+        self.assertFalse(lk.is_selector_hint("Enter the build directory"))
 
 
 if __name__ == "__main__":
