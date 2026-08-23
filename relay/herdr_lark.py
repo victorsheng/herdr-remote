@@ -1398,8 +1398,12 @@ def audit_enabled(value: str | None) -> bool:
 
 # 「 ❯ 1. Yes 」「2. trust, always allow」——前面可能有箭头或缩进。
 _OPTION_RE = re.compile(r"^\s*[❯>»\*]?\s*(\d{1,2})[.)．]\s+(\S.*)$")
-# 选项必须靠近输出末尾，否则是历史记录里的旧选择器。
-_OPTION_TAIL_LINES = 14
+# 从末尾往上找选择器，最多翻这么多行。够深以容纳多组多选项的长选择器，
+# 真正的边界靠「连续正文块」判定，不靠行数。
+_OPTION_SCAN_LINES = 200
+# 选项后面允许跟几行缩进的描述文字——AskUserQuestion 每个选项都带一行说明，
+# 一旦把它当成「选择器后面的正文」，整个选择器就被丢掉，卡片一个按钮都没有。
+_OPTION_TRAILING_PROSE = 2
 _MAX_OPTIONS = 9
 
 
@@ -1409,18 +1413,98 @@ def detect_option_groups(text: str) -> list[dict]:
     AskUserQuestion 一次能问好几组，每组都从 1 重新编号。只认第一组的话
     卡片显示的是第一组，而 agent 可能正等第二组的答案——点下去就答错了。
 
+    从末尾反向定位选择器区间，而不是截固定行数的窗口：窗口切在某组中间时，
+    那组编号不从 1 起，会被连续性校验整组丢掉，卡片上就少选项。
+
     每组返回 {"question": 提问行, "options": [选项...]}。
     """
     lines = (text or "").splitlines()
     if not lines:
         return []
 
-    tail = lines[-_OPTION_TAIL_LINES * 3:]
+    tail = lines[-_OPTION_SCAN_LINES:]
+    last_option_at = _last_option_line(tail)
+    if last_option_at < 0:
+        return []
+    # 选项要贴着输出末尾。允许后面跟几行缩进说明（每个选项自带一行描述），
+    # 但跟着大段正文的是散文里的编号列表，不是选择器。
+    if not _is_selector_tail(tail[last_option_at + 1:]):
+        return []
+
+    start = _selector_start(tail, last_option_at)
+    return _parse_groups(tail, start, last_option_at)
+
+
+def _last_option_line(lines: list[str]) -> int:
+    """最后一个选项行的下标，没有则 -1。"""
+    for index in range(len(lines) - 1, -1, -1):
+        if _OPTION_RE.match(lines[index]):
+            return index
+    return -1
+
+
+def _is_selector_tail(rest: list[str]) -> bool:
+    """最后一个选项之后剩下的内容，还允许把这当成活着的选择器吗。
+
+    只放过缩进行——那是选项自己的描述（AskUserQuestion 每项都带一行说明，
+    误判成正文的话整个选择器被丢弃，卡片一个按钮都没有）。顶格正文说明
+    选择器已经翻过去了，是历史记录里的旧选择器或散文里的编号列表。
+    """
+    for line in rest:
+        stripped = line.strip()
+        if not stripped or _is_tui_chrome(stripped):
+            continue
+        if line[:1] in (" ", "\t"):  # 缩进 = 选项的描述行
+            continue
+        return False
+    return True
+
+
+# TUI 边框与输入框提示：不是 agent 的正文输出。
+# 圆角、直角、粗线四套框线都要收全——漏一个字符（比如 ╮），底部输入框就会
+# 被当成正文，整个选择器被判定为「已翻过去」，卡片一个按钮都不剩。
+_TUI_CHROME_RE = re.compile(
+    r"^[\s│┃|>❯╭╮╰╯─━┌┐└┘┏┓┗┛├┤┬┴┼╌╍┄┅·]*$")
+
+
+def _is_tui_chrome(stripped: str) -> bool:
+    return bool(_TUI_CHROME_RE.match(stripped))
+
+
+def _selector_start(lines: list[str], last_option_at: int) -> int:
+    """选择器区间的起点：从最后一个选项往上，走到第一组的「1.」为止。
+
+    途中遇到连续正文块就停——那是选择器上方的 agent 输出。
+    """
+    start = last_option_at
+    prose_run = 0
+    for index in range(last_option_at, -1, -1):
+        line = lines[index]
+        match = _OPTION_RE.match(line)
+        if match:
+            start = index
+            prose_run = 0
+            continue
+        stripped = line.strip()
+        if not stripped or _is_tui_chrome(stripped):
+            prose_run = 0
+            continue
+        if line[:1] in (" ", "\t"):  # 选项的描述行，不是边界
+            continue
+        # 顶格正文：一行可能是某组的提问，连续多行就是选择器上方的输出了。
+        prose_run += 1
+        if prose_run > _OPTION_TRAILING_PROSE:
+            break
+    return start
+
+
+def _parse_groups(lines: list[str], start: int, end: int) -> list[dict]:
+    """把选择器区间切成组。编号回到 1 就是新的一组。"""
     groups: list[dict] = []
     current: list[tuple[int, str]] = []
     question = ""
-    last_prose = ""
-    last_option_at = -1
+    # 提问行是选择器区间上方最近的一行正文。
+    last_prose = _preceding_prose(lines, start)
 
     def flush() -> None:
         nonlocal current, question
@@ -1429,33 +1513,37 @@ def detect_option_groups(text: str) -> list[dict]:
             if numbers == list(range(1, len(numbers) + 1)):
                 groups.append({
                     "question": question.strip(),
-                    "options": [t for _, t in current],
+                    "options": [t for _, t in current][:_MAX_OPTIONS],
                 })
         current = []
         question = ""
 
-    for index, line in enumerate(tail):
+    for index in range(start, end + 1):
+        line = lines[index]
         match = _OPTION_RE.match(line)
         if match:
             number = int(match.group(1))
-            # 编号回到 1 说明是新的一组
             if number == 1 and current:
                 flush()
             if not current:
                 question = last_prose
             current.append((number, match.group(2).strip()))
-            last_option_at = index
             continue
-        if line.strip():
-            last_prose = line.strip()
+        stripped = line.strip()
+        # 顶格正文才可能是下一组的提问；选项的缩进描述行不算。
+        if stripped and not _is_tui_chrome(stripped) and line[:1] not in (" ", "\t"):
+            last_prose = stripped
     flush()
-
-    if not groups:
-        return []
-    # 选项要贴着输出末尾；后面还有正文的是散文里的编号列表。
-    if any(l.strip() for l in tail[last_option_at + 1:]):
-        return []
     return groups
+
+
+def _preceding_prose(lines: list[str], start: int) -> str:
+    """选择器上方最近的一行正文，作为第一组的提问。"""
+    for index in range(start - 1, -1, -1):
+        stripped = lines[index].strip()
+        if stripped and not _is_tui_chrome(stripped):
+            return stripped
+    return ""
 
 
 def detect_pane_options(text: str) -> list[str] | None:
