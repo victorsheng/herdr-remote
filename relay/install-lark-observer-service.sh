@@ -1,16 +1,16 @@
 #!/bin/sh
-# install-lark-service.sh — 把飞书客户端装成开机自启的用户服务。
+# install-lark-observer-service.sh — 把飞书客户端装成开机自启的用户服务。
 #
 # 沿用 install-service.sh 的约定：配置在 ~/.config/herdr-remote/{config,secrets}.env，
 # 日志在 HERDR_LOG_DIR，macOS 用 LaunchAgent、Linux 用 systemd user unit。
 #
-#   ./install-lark-service.sh            安装并启动
-#   ./install-lark-service.sh status     查看状态
-#   ./install-lark-service.sh restart    重启
-#   ./install-lark-service.sh uninstall  卸载
+#   ./install-lark-observer-service.sh            安装并启动
+#   ./install-lark-observer-service.sh status     查看状态
+#   ./install-lark-observer-service.sh restart    重启
+#   ./install-lark-observer-service.sh uninstall  卸载
 set -eu
 
-LABEL="com.herdr-remote.lark"
+LABEL="com.herdr-remote.lark-observer"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="$HOME/.config/herdr-remote"
 CONFIG_FILE="$CONFIG_DIR/config.env"
@@ -24,7 +24,7 @@ esac
 
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UNIT_DIR="$HOME/.config/systemd/user"
-UNIT="$UNIT_DIR/herdr-lark.service"
+UNIT="$UNIT_DIR/herdr-lark-observer.service"
 
 # --- 通用 ---
 
@@ -49,7 +49,7 @@ stop_service() {
     if [ "$OS" = "macos" ]; then
         launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     else
-        systemctl --user stop herdr-lark.service 2>/dev/null || true
+        systemctl --user stop herdr-lark-observer.service 2>/dev/null || true
     fi
 }
 
@@ -58,7 +58,7 @@ start_service() {
         launchctl bootstrap "gui/$(id -u)" "$PLIST"
     else
         systemctl --user daemon-reload
-        systemctl --user enable --now herdr-lark.service
+        systemctl --user enable --now herdr-lark-observer.service
     fi
 }
 
@@ -74,13 +74,13 @@ cmd_status() {
         launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
             | grep -E "state|pid|last exit" || echo "服务未运行"
     else
-        systemctl --user status herdr-lark.service --no-pager || true
+        systemctl --user status herdr-lark-observer.service --no-pager || true
     fi
     echo ""
-    # Python 的 logging 默认写 stderr，所以日志都在 lark-stderr.log
-    echo "日志: $LOG_DIR/lark-stderr.log"
+    # Python 的 logging 默认写 stderr，所以日志都在 lark-observer-stderr.log
+    echo "日志: $LOG_DIR/lark-observer-stderr.log"
     echo "只看自己的日志（滤掉 SDK 噪音）:"
-    echo "  grep -v '^\\[Lark\\]\\|^INFO:Lark' $LOG_DIR/lark-stderr.log | tail -20"
+    echo "  grep -v '^\\[Lark\\]\\|^INFO:Lark' $LOG_DIR/lark-observer-stderr.log | tail -20"
 }
 
 cmd_uninstall() {
@@ -88,7 +88,7 @@ cmd_uninstall() {
     if [ "$OS" = "macos" ]; then
         rm -f "$PLIST"
     else
-        systemctl --user disable herdr-lark.service 2>/dev/null || true
+        systemctl --user disable herdr-lark-observer.service 2>/dev/null || true
         rm -f "$UNIT"
         systemctl --user daemon-reload 2>/dev/null || true
     fi
@@ -116,27 +116,30 @@ cmd_install() {
     }
 
     MISSING=""
-    [ -n "${HERDR_LARK_APP_ID:-}" ]     || MISSING="$MISSING HERDR_LARK_APP_ID"
-    [ -n "${HERDR_LARK_APP_SECRET:-}" ] || MISSING="$MISSING HERDR_LARK_APP_SECRET"
+    [ -n "${HERDR_LARK_OBSERVER_APP_ID:-}" ] \
+        || MISSING="$MISSING HERDR_LARK_OBSERVER_APP_ID"
+    [ -n "${HERDR_LARK_OBSERVER_APP_SECRET:-}" ] \
+        || MISSING="$MISSING HERDR_LARK_OBSERVER_APP_SECRET"
     if [ -n "$MISSING" ]; then
-        echo "缺少飞书凭据:$MISSING"
+        echo "缺少 observer 飞书凭据:$MISSING"
         echo ""
         echo "在 $SECRETS_FILE 里补上（权限 0600）:"
-        echo "  HERDR_LARK_APP_ID=cli_xxxxxxxx"
-        echo "  HERDR_LARK_APP_SECRET=xxxxxxxx"
-        echo "  HERDR_LARK_CHAT_ID=oc_xxxxxxxx"
+        echo "  HERDR_LARK_OBSERVER_APP_ID=cli_xxxxxxxx"
+        echo "  HERDR_LARK_OBSERVER_APP_SECRET=xxxxxxxx"
+        echo "  HERDR_LARK_QC_CHAT=oc_xxxxxxxx   # 质检群，留空则只落盘"
         echo ""
-        echo "获取方式见 docs/lark-client-manual.md 第四节。"
+        echo "observer 必须用独立的飞书应用：飞书长连接是一个应用一条，"
+        echo "和 demo 共用会互相抢连接。见 docs/lark-client-manual.md。"
         exit 1
     fi
 
-    if [ -z "${HERDR_LARK_CHAT_ID:-}" ]; then
-        echo "警告: 未设 HERDR_LARK_CHAT_ID —— 处于发现模式，任何会话都会被响应。"
+    if [ -z "${HERDR_LARK_QC_CHAT:-}" ]; then
+        echo "警告: 未设 HERDR_LARK_QC_CHAT —— 质检结论只落盘，不发群。"
     fi
 
     [ -n "$UV_PATH" ] || { echo "找不到 uv。安装: https://docs.astral.sh/uv/"; exit 1; }
-    [ -f "$RELAY_DIR/herdr_lark.py" ] || {
-        echo "找不到 $RELAY_DIR/herdr_lark.py"; exit 1;
+    [ -f "$RELAY_DIR/herdr_lark_observer.py" ] || {
+        echo "找不到 $RELAY_DIR/herdr_lark_observer.py"; exit 1;
     }
 
     # relay 若开了 token，HERDR_RELAY 必须带上 ?token=，否则一直 401 重连。
@@ -152,11 +155,11 @@ cmd_install() {
     fi
 
     # 前台进程还开着的话，两个实例会抢同一条飞书长连接（集群模式随机投递）。
-    RUNNING="$(pgrep -f 'herdr_lark\.py$' 2>/dev/null || true)"
+    RUNNING="$(pgrep -f 'herdr_lark_observer\.py' 2>/dev/null || true)"
     if [ -n "$RUNNING" ]; then
-        echo "检测到已在运行的 herdr_lark.py: $(printf '%s' "$RUNNING" | tr '\n' ' ')"
+        echo "检测到已在运行的 herdr_lark_observer.py: $(printf '%s' "$RUNNING" | tr '\n' ' ')"
         echo "先停掉它再装服务，否则两个实例会抢同一条长连接。"
-        echo "  pkill -f herdr_lark.py"
+        echo "  pkill -f herdr_lark_observer.py"
         exit 1
     fi
 
@@ -177,7 +180,7 @@ cmd_install() {
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>set -a; [ -f "\$HOME/.config/herdr-remote/config.env" ] &amp;&amp; source "\$HOME/.config/herdr-remote/config.env"; source "\$HOME/.config/herdr-remote/secrets.env"; set +a; exec "$UV_PATH" run "$RELAY_DIR/herdr_lark.py"</string>
+        <string>set -a; [ -f "\$HOME/.config/herdr-remote/config.env" ] &amp;&amp; source "\$HOME/.config/herdr-remote/config.env"; source "\$HOME/.config/herdr-remote/secrets.env"; set +a; exec "$UV_PATH" run "$RELAY_DIR/herdr_lark_observer.py"</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$RELAY_DIR</string>
@@ -188,9 +191,9 @@ cmd_install() {
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>$LOG_DIR/lark-stdout.log</string>
+    <string>$LOG_DIR/lark-observer-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>$LOG_DIR/lark-stderr.log</string>
+    <string>$LOG_DIR/lark-observer-stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -203,19 +206,19 @@ EOF
         mkdir -p "$UNIT_DIR"
         cat > "$UNIT" <<EOF
 [Unit]
-Description=herdr-remote Lark bot
+Description=herdr-remote Lark observer (发送质检)
 After=network-online.target herdr-relay.service
 Wants=network-online.target herdr-relay.service
 
 [Service]
-ExecStart=$UV_PATH run $RELAY_DIR/herdr_lark.py
+ExecStart=$UV_PATH run $RELAY_DIR/herdr_lark_observer.py
 WorkingDirectory=$RELAY_DIR
 Restart=always
 RestartSec=5
 EnvironmentFile=-$CONFIG_FILE
 EnvironmentFile=$SECRETS_FILE
-StandardOutput=append:$LOG_DIR/lark-stdout.log
-StandardError=append:$LOG_DIR/lark-stderr.log
+StandardOutput=append:$LOG_DIR/lark-observer-stdout.log
+StandardError=append:$LOG_DIR/lark-observer-stderr.log
 
 [Install]
 WantedBy=default.target
@@ -226,13 +229,13 @@ EOF
 
     echo "已安装 ${LABEL}（开机自启 + 崩溃自动重启）。"
     echo ""
-    echo "  日志:   $LOG_DIR/lark-stderr.log  (Python logging 走 stderr)"
+    echo "  日志:   $LOG_DIR/lark-observer-stderr.log  (Python logging 走 stderr)"
     echo "  状态:   $0 status"
     echo "  重启:   $0 restart"
     echo "  卸载:   $0 uninstall"
     echo ""
     echo "等几秒后检查是否就绪:"
-    echo "  grep -v '^\\[Lark\\]\\|^INFO:Lark' $LOG_DIR/lark-stderr.log"
+    echo "  grep -v '^\\[Lark\\]\\|^INFO:Lark' $LOG_DIR/lark-observer-stderr.log"
     echo "应看到 Bot ready / long connection thread started / Connected to relay 三条。"
 }
 
