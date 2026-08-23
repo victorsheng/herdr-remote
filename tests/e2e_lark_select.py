@@ -43,6 +43,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -173,6 +174,34 @@ def chat_ids(raw: str, api=None) -> list[str]:
         return []
 
 
+def card_option_lines(card: dict) -> list[str]:
+    """卡片正文里的选项清单。
+
+    选项全文列在正文、按钮只放序号，所以「选项对不对」得看这里。
+    """
+    out = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if node.get("tag") == "div":
+            text = node.get("text", {}).get("content", "")
+            for line in text.splitlines():
+                m = re.match(r"^\*\*(\d+)\.\*\*\s+(.*)$", line)
+                if m:
+                    out.append(m.group(2).strip())
+        for key in ("elements", "columns"):
+            if key in node:
+                walk(node[key])
+
+    walk(card.get("elements", []))
+    return out
+
+
 def latest_option_card(api, chats: list[str], *, since: float) -> dict | None:
     """拿 since 之后最新的一张带选项按钮的卡片。
 
@@ -215,8 +244,12 @@ async def test_single_select(pane_id: str, api, chats: list[str]) -> None:
     labels = card_buttons(card)
     check("卡片没有退化成 Yes/Trust/No",
           not any("Trust (always)" in l for l in labels), str(labels[:4]))
-    check("卡片按钮带上了真实选项",
-          any("alpha" in l for l in labels), str(labels[:4]))
+    body_opts = card_option_lines(card)
+    check("卡片正文列出了真实选项",
+          any("alpha" in o for o in body_opts), str(body_opts))
+    check("按钮只放序号（长选项不挤按钮）",
+          all(l.isdigit() for l in labels if l != "Open output & reply"),
+          str(labels))
     check("单选卡片不出 Submit 按钮",
           not any("Submit" in l for l in labels), str(labels))
 
@@ -224,8 +257,9 @@ async def test_single_select(pane_id: str, api, chats: list[str]) -> None:
         pushed = latest_option_card(api, chats, since=started)
         if pushed is not None:
             plabels = card_buttons(pushed)
-            check("飞书上实际收到的卡片也带真实选项",
-                  any("alpha" in l for l in plabels), str(plabels[:4]))
+            check("飞书上实际收到的卡片也列出真实选项",
+                  any("alpha" in o for o in card_option_lines(pushed)),
+                  str(card_option_lines(pushed)))
         else:
             print("    ⓘ 群里没有对应卡片。已知原因：agent 停在 "
                   "AskUserQuestion 选择器上时 herdr 报的状态是 working "
@@ -263,9 +297,11 @@ async def test_multi_select(pane_id: str, api, chats: list[str]) -> None:
     labels = card_buttons(card)
     check("多选卡片带 Submit 按钮",
           any("Submit" in l for l in labels), str(labels))
-    check(f"选项按钮齐全（{len(options)} 个）",
-          sum(1 for l in labels if l[:1].isdigit()) == len(options),
-          str(labels))
+    check(f"正文列全了 {len(options)} 个选项",
+          len(card_option_lines(card)) == len(options),
+          str(card_option_lines(card)))
+    check("按钮只放序号",
+          sum(1 for l in labels if l.isdigit()) == len(options), str(labels))
 
     if api and chats:
         pushed = latest_option_card(api, chats, since=started)

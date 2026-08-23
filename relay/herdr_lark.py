@@ -540,8 +540,27 @@ TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edi
 
 # 选项卡片的统一样式：两种来源共用，改一处就到处生效。
 OPTION_CARD_TEMPLATE = "turquoise"
-# 按钮文字上限——手机上太长会折行，把一排按钮挤变形。
-OPTION_LABEL_LIMIT = 40
+# 正文里每个选项的文字上限。
+#
+# 选项全文列在正文、按钮只放序号（见 build_option_card）：长选项塞进按钮
+# 会在手机上折成好几行，一排堆起来根本没法扫。拆开之后正文负责「看清楚」，
+# 按钮负责「点得准」。
+#
+# 正文不像按钮那样受排版挤压，额度给得宽：240 够装下实测遇到的选项
+# （抓屏里最长 59 字），真超了才截。原来按钮限 40 字时，一个 59 字的选项
+# 被砍成「…把 PRUNED 分」，丢掉的恰好是「但要注意存量调用方的兼容性问题」
+# 这个决策关键——而且不留任何标记，读起来像句子说完了。
+OPTION_LABEL_LIMIT = 240
+
+
+def option_label(text: str, limit: int = OPTION_LABEL_LIMIT) -> str:
+    """正文里显示的选项文字，超长才截，且一定留省略号。
+
+    无声截断最坑：砍在句子中间时看起来就像原文如此，人照着它做判断，
+    而真正影响决策的半句在屏幕上——他根本不知道自己没看全。
+    """
+    body = (text or "").strip()
+    return body if len(body) <= limit else body[:limit - 1].rstrip() + "…"
 
 TOOL_BUTTON_LABELS = ["Yes (once)", "Trust (always)", "No"]
 SUBAGENT_BUTTON_LABELS = ["Approve all", "Configure", "Cancel"]
@@ -659,10 +678,12 @@ def build_option_card(
     # （单选补了才提交，多选补了就把没勾完的答案交出去），而卡片是什么形态
     # 在这里就已经确定，编进 value 比事后读屏判断可靠。
     flag = {"m": 1} if multiselect else {}
+    # 按钮只放序号：选项全文在正文里列着，按钮再重复一遍就会在手机上折成
+    # 好几行，一排选项堆起来没法扫。
     actions = [
-        _button(f"{i + 1}. {marks[i]}{opt[:OPTION_LABEL_LIMIT]}", action_value(
+        _button(str(i + 1), action_value(
             "approval", pane_id, g=generation, k=str(i + 1), **flag), styles[i])
-        for i, opt in enumerate(shown)
+        for i, _ in enumerate(shown)
     ]
 
     elements: list[dict] = []
@@ -674,6 +695,12 @@ def build_option_card(
     if question:
         elements.append({"tag": "div", "text": {
             "tag": "lark_md", "content": f"**{question}**"}})
+    # 选项清单。多选的勾选态也在这儿——按钮只剩序号，放不下标记了。
+    elements.append({"tag": "div", "text": {
+        "tag": "lark_md",
+        "content": "\n".join(f"**{i + 1}.** {marks[i]}{option_label(opt)}"
+                             for i, opt in enumerate(shown)),
+    }})
     elements.append({"tag": "action", "actions": actions})
     if multiselect:
         # 多选要显式提交：勾完点 Submit，卡片才把答案交上去。

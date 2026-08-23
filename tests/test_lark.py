@@ -14,6 +14,7 @@ import json
 import os
 import string
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -413,6 +414,28 @@ def buttons_in(card):
     return out
 
 
+def option_lines_in(card):
+    """正文里的选项清单，一项一行（不含编号前缀）。
+
+    选项全文列在正文、按钮只放序号，所以「选项对不对」得看这里，
+    不能再看按钮文字。
+    """
+    out = []
+    for element in card.get("elements", []):
+        if element.get("tag") != "div":
+            continue
+        for line in element.get("text", {}).get("content", "").splitlines():
+            m = re.match(r"^\*\*(\d+)\.\*\*\s+(.*)$", line)
+            if m:
+                out.append(m.group(2).strip())
+    return out
+
+
+def option_text_in(card):
+    """正文选项清单拼成一串，方便做 assertIn。"""
+    return " ".join(option_lines_in(card))
+
+
 class TruncateTests(unittest.TestCase):
     """借鉴官方 Channels：命令结尾对审批者最要紧，不能被直接截掉。"""
 
@@ -456,15 +479,13 @@ class BlockedCardTests(unittest.TestCase):
         card = lk.build_blocked_card(
             "w1:p1", "a", "p", "q", ["yes, single permission", "trust, always allow"], "abcde",
         )
-        labels = [b["text"]["content"] for b in buttons_in(card)]
-        self.assertTrue(any("Trust" in l for l in labels))
+        self.assertIn("Trust", option_text_in(card))
 
     def test_uses_subagent_buttons_for_approve_all(self):
         card = lk.build_blocked_card(
             "w1:p1", "a", "p", "q", ["approve all pending", "configure"], "abcde",
         )
-        labels = [b["text"]["content"] for b in buttons_in(card)]
-        self.assertTrue(any("Approve all" in l for l in labels))
+        self.assertIn("Approve all", option_text_in(card))
 
     def test_defaults_to_tool_options_when_none(self):
         card = lk.build_blocked_card("w1:p1", "a", "p", "q", None, "abcde")
@@ -1961,16 +1982,17 @@ class UnifiedOptionCardTests(unittest.TestCase):
     def test_reject_option_is_danger(self):
         """拒绝项要红：点错了代价最大。"""
         card = lk.build_option_card("w1:p1", "p", ["Yes", "No (tab to edit)"], "g")
+        # 按钮只放序号，配色仍按选项文字判定，用序号索引取。
         styles = {b["text"]["content"]: b["type"] for b in buttons_in(card)}
-        self.assertEqual(styles["2. No (tab to edit)"], "danger")
+        self.assertEqual(styles["2"], "danger")
 
     def test_trust_does_not_steal_primary(self):
         """「总是允许」不该是最显眼的按钮——它风险最大。"""
         card = lk.build_option_card(
             "w1:p1", "p", ["trust, always allow", "yes once"], "g")
-        styles = {b["text"]["content"][:2]: b["type"] for b in buttons_in(card)}
-        self.assertEqual(styles["1."], "default")
-        self.assertEqual(styles["2."], "primary")
+        styles = {b["text"]["content"]: b["type"] for b in buttons_in(card)}
+        self.assertEqual(styles["1"], "default")
+        self.assertEqual(styles["2"], "primary")
 
     def test_plain_chinese_option_not_reddened(self):
         """「不错的方案」不是拒绝项，别染红。"""
@@ -3079,8 +3101,8 @@ class RealPaneSelectorTests(unittest.TestCase):
         groups = lk.detect_option_groups(lk.clean_pane(REAL_MULTI_TAB_PANE))
         card = lk.build_options_card("w2A:p1", "proj", groups[0]["options"],
                                      "abcde", question=groups[0]["question"])
-        keys = [b["value"]["k"]
-                for b in card["elements"][1]["actions"]]
+        keys = [b["value"]["k"] for b in buttons_in(card)
+                if b["value"].get("k")]
         self.assertEqual(keys, ["1", "2", "3"])
 
 
@@ -3191,11 +3213,8 @@ class BlockedCardReadabilityTests(unittest.TestCase):
                 if el.get("tag") == "div"]
 
     def _labels(self, card):
-        out = []
-        for el in card["elements"]:
-            if el.get("tag") == "action":
-                out.extend(b["text"]["content"] for b in el["actions"])
-        return out
+        """选项文字现在列在正文，按钮只放序号——断言得看正文。"""
+        return option_lines_in(card)
 
     def test_question_rendered_as_its_own_block(self):
         """问题行要单独成块，而不是只埋在代码块里等着被截断。"""
@@ -3320,6 +3339,118 @@ class MultiselectFlagOnButtonsTests(unittest.TestCase):
         card = lk.build_option_card("p1", "proj", ["是", "否"], "gen")
         for value in self._option_values(card):
             self.assertIsNone(value.get("m"), f"单选不该带多选标记: {value}")
+
+
+class OptionListInBodyTests(unittest.TestCase):
+    """选项全文列在正文，按钮只放序号。
+
+    长选项塞进按钮会在手机上折成好几行，一排选项堆起来很难扫。拆开之后
+    正文负责「看清楚」，按钮负责「点得准」，各司其职。
+    """
+
+    LONG = ("直接修改现有的 normalizePlanStatus 函数把 PRUNED 分支补进去"
+            "但要注意存量调用方的兼容性问题")
+
+    def _card(self, options, **kw):
+        return lk.build_option_card("p1", "proj", options, "gen", **kw)
+
+    def _labels(self, card):
+        return [b["text"]["content"]
+                for el in card["elements"] if el.get("tag") == "action"
+                for b in el["actions"] if b["value"].get("k")]
+
+    def _body(self, card):
+        return "\n".join(el["text"]["content"] for el in card["elements"]
+                         if el.get("tag") == "div")
+
+    def test_full_text_in_body(self):
+        """正文要有完整选项文字，一个字都不能少。"""
+        body = self._body(self._card([self.LONG, "短的"]))
+        self.assertIn(self.LONG, body)
+
+    def test_buttons_are_numbers_only(self):
+        labels = self._labels(self._card([self.LONG, "短的"]))
+        self.assertEqual(labels, ["1", "2"])
+
+    def test_body_numbers_match_buttons(self):
+        """正文的编号要和按钮对得上，否则人对照不了。"""
+        card = self._card(["甲", "乙", "丙"])
+        body = self._body(card)
+        for i in ("1", "2", "3"):
+            self.assertIn(f"{i}.", body)
+        self.assertEqual(self._labels(card), ["1", "2", "3"])
+
+    def test_multiselect_shows_checkmarks_in_body(self):
+        """多选的勾选态要在正文看得见——按钮只剩序号，放不下标记了。"""
+        card = self._card(["甲", "乙"], multiselect=True, checked=[True, False])
+        body = self._body(card)
+        self.assertIn("✔", body)
+        self.assertIn("☐", body)
+
+    def test_multiselect_buttons_still_numbers(self):
+        card = self._card(["甲", "乙"], multiselect=True, checked=[True, False])
+        self.assertEqual(self._labels(card), ["1", "2"])
+
+    def test_multiselect_flag_survives(self):
+        """按钮变短了，但多选标记不能丢——_approve 靠它决定补不补 Enter。"""
+        card = self._card(["甲", "乙"], multiselect=True, checked=[False, False])
+        values = [b["value"] for el in card["elements"]
+                  if el.get("tag") == "action"
+                  for b in el["actions"] if b["value"].get("k")]
+        for value in values:
+            self.assertEqual(value.get("m"), 1)
+
+    def test_overlong_option_still_truncated_in_body(self):
+        """正文也不能无限长，超长仍要截并留省略号。"""
+        huge = "很长" * 400
+        body = self._body(self._card([huge, "短的"]))
+        self.assertIn("…", body)
+
+
+class OptionLabelTruncationTests(unittest.TestCase):
+    """选项文字不能被无声砍掉。
+
+    实测：一个 59 字的选项被砍到 40 字变成「…把 PRUNED 分」，丢掉的恰好是
+    「但要注意存量调用方的兼容性问题」——决策关键。更糟的是不加任何标记，
+    读起来像句子说完了，人根本不知道后面还有内容。
+
+    AskUserQuestion 的选项行在终端上不折行（实测抓屏：59 字完整占一行），
+    所以解析拿到的就是全文，截断纯粹是我们自己按钮标签这一步造成的。
+    """
+
+    LONG = ("直接修改现有的 normalizePlanStatus 函数把 PRUNED 分支补进去"
+            "但要注意存量调用方的兼容性问题")
+
+    def _body(self, options):
+        card = lk.build_option_card("p1", "proj", options, "gen")
+        return "\n".join(el["text"]["content"] for el in card["elements"]
+                         if el.get("tag") == "div")
+
+    def test_realistic_long_option_kept_whole(self):
+        """实测那条 59 字的选项要能完整显示。"""
+        body = self._body([self.LONG, "短的"])
+        self.assertIn("兼容性问题", body, f"关键信息被砍掉了: {body}")
+
+    def test_overlong_option_gets_ellipsis(self):
+        """真超长时要截，但必须留个记号。"""
+        huge = "很长" * 400
+        self.assertIn("…", self._body([huge, "短的"]))
+
+    def test_overlong_option_respects_limit(self):
+        huge = "很长" * 400
+        line = [l for l in self._body([huge, "短的"]).splitlines()
+                if "很长" in l][0]
+        # 行首有 "**1.** " 前缀，比正文额度略长
+        self.assertLessEqual(len(line), lk.OPTION_LABEL_LIMIT + 10, len(line))
+
+    def test_short_option_untouched(self):
+        """没超限的选项不该被动，尤其不该平白多个省略号。"""
+        self.assertIn("**1.** 短的", self._body(["短的", "也短"]))
+        self.assertNotIn("…", self._body(["短的", "也短"]))
+
+    def test_limit_fits_realistic_options(self):
+        """额度得装得下实测遇到的选项长度。"""
+        self.assertGreaterEqual(lk.OPTION_LABEL_LIMIT, len(self.LONG))
 
 
 class ApprovalKeysTests(unittest.TestCase):
@@ -3477,11 +3608,8 @@ class BlockedUsesRealOptionsTests(unittest.TestCase):
     """
 
     def _labels(self, card):
-        out = []
-        for el in card["elements"]:
-            if el.get("tag") == "action":
-                out.extend(b["text"]["content"] for b in el["actions"])
-        return out
+        """选项文字现在列在正文，按钮只放序号——断言得看正文。"""
+        return option_lines_in(card)
 
     def test_real_options_win_over_fallback(self):
         """pane 里有真选择器时，用它，而不是 relay 的回落值。"""
@@ -3582,12 +3710,14 @@ class MultiSelectCardTests(unittest.TestCase):
         self.assertEqual(submit["value"]["a"], lk.ACTION_CODES["submit"])
 
     def test_checked_options_marked(self):
-        """已勾选的项要在按钮上看得出来。"""
-        labels = [b["text"]["content"]
-                  for b in self._buttons(self._card([True, False, True]))]
-        self.assertIn("✔", labels[0])
-        self.assertNotIn("✔", labels[1])
-        self.assertIn("✔", labels[2])
+        """已勾选的项要看得出来。
+
+        按钮只放序号，勾选态显示在正文的选项清单里。
+        """
+        lines = option_lines_in(self._card([True, False, True]))
+        self.assertTrue(lines[0].startswith("✔"), lines[0])
+        self.assertFalse(lines[1].startswith("✔"), lines[1])
+        self.assertTrue(lines[2].startswith("✔"), lines[2])
 
     def test_single_select_has_no_submit(self):
         """单选框点一下就定了，多一个 Submit 只会让人误以为还要再点。"""
