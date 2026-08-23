@@ -100,6 +100,21 @@ else
   PASS=$((PASS+1)); echo "  skip: relay not running"
 fi
 
+echo "L8. lark 选择器 e2e (opt-in)"
+# 它会往真实 agent 出题并按键，所以默认不跑——全量套件不该动别人的 agent。
+# 想跑就指定目标 pane（别用你自己所在的那个）：
+#   HERDR_E2E_SELECT_PANE=w2A:p1 tests/run.sh
+if [ -n "${HERDR_E2E_SELECT_PANE:-}" ] && pgrep -f "herdr_relay.py" >/dev/null 2>&1; then
+  ( set -a
+    [ -f "$HOME/.config/herdr-remote/config.env" ] && . "$HOME/.config/herdr-remote/config.env"
+    [ -f "$HOME/.config/herdr-remote/secrets.env" ] && . "$HOME/.config/herdr-remote/secrets.env"
+    set +a
+    uv run "$DIR/tests/e2e_lark_select.py" --pane "$HERDR_E2E_SELECT_PANE" )
+  assert_eq "$?" "0" "lark 选择器 e2e"
+else
+  PASS=$((PASS+1)); echo "  skip: 设 HERDR_E2E_SELECT_PANE=<pane> 才跑"
+fi
+
 echo "L8. usage stats"
 uv run "$DIR/tests/test_usage.py" >/dev/null 2>&1
 assert_eq "$?" "0" "usage stats tests"
