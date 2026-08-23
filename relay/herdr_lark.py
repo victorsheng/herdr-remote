@@ -35,8 +35,8 @@ DOMAIN = os.environ.get("HERDR_LARK_DOMAIN", "feishu")
 RENDER_MODE = os.environ.get("HERDR_LARK_RENDER", "card")
 # 发完指令自动跟随几秒；off 关闭。
 AUTOWATCH_ENV = os.environ.get("HERDR_LARK_AUTOWATCH", "")
-# 只读审计群：收全部操作记录，但不能下指令。
-AUDIT_CHAT_ENV = os.environ.get("HERDR_LARK_AUDIT_CHAT", "")
+# 审计回执：写操作在本群留一行痕迹。off/0/false 关闭。
+AUDIT_ENV = os.environ.get("HERDR_LARK_AUDIT", "on")
 
 CONFIG_DIR = os.path.expanduser("~/.config/herdr-remote")
 SEEN_PATH = os.environ.get("HERDR_LARK_SEEN_PATH", os.path.join(CONFIG_DIR, "lark_seen.json"))
@@ -1378,7 +1378,7 @@ _AUDIT_ICONS = {
 def format_audit(action: str, project: str, pane_id: str, detail: str) -> str:
     """一行审计记录：谁被做了什么。
 
-    指令内容可能带密钥（比如「用 xxx 登录」），审计群人多，必须脱敏。
+    指令内容可能带密钥（比如「用 xxx 登录」），群里人多，必须脱敏。
     """
     icon = _AUDIT_ICONS.get(action, "·")
     text = scrub(detail or "").strip().replace("\n", " ⏎ ")
@@ -1388,13 +1388,10 @@ def format_audit(action: str, project: str, pane_id: str, detail: str) -> str:
     return f"{icon} {action}  {project} ({pane_id}){tail}"
 
 
-def is_command_allowed(chat_id: str, audit_chats: set[str]) -> bool:
-    """审计群是只读的。
-
-    它能看到所有 agent 的指令内容，若同时能下命令就成了越权入口——
-    进得去审计群的人未必该有操控权。
-    """
-    return str(chat_id) not in (audit_chats or set())
+def audit_enabled(value: str | None) -> bool:
+    """审计回执开关。默认开：留痕的成本只有一行文本。"""
+    return str(value if value is not None else "").strip().lower() not in (
+        "off", "0", "false", "no")
 
 
 # --- 选择器检测 ---
@@ -1877,9 +1874,8 @@ class LarkBot:
         self._watchers: dict[str, asyncio.Task] = {}
         # 发完指令自动跟随，省得每次手打 /watch。
         self.autowatch = normalize_autowatch(AUTOWATCH_ENV)
-        # 只读审计群：收全部操作记录，但不接受命令。
-        self.audit_chats = parse_chat_ids(AUDIT_CHAT_ENV)
-        self.chat_ids |= self.audit_chats
+        # 审计回执：写操作在发起它的那个群里留一行痕迹。
+        self.audit_on = audit_enabled(AUDIT_ENV)
 
     # --- 出站 ---
 
@@ -2015,13 +2011,6 @@ class LarkBot:
     async def _handle_text(self, ctx: MessageContext) -> None:
         command, rest = parse_command(ctx.text)
 
-        # 审计群只读：它能看到所有 agent 的指令内容，若还能下命令
-        # 就成了越权入口。
-        if not is_command_allowed(ctx.chat_id, self.audit_chats):
-            if command:
-                self.reply_text(ctx.chat_id, "本群是只读审计群，不接受指令。")
-            return
-
         if command is None:
             await self._handle_free_text(ctx, rest)
             return
@@ -2147,7 +2136,7 @@ class LarkBot:
             await self._send_pane_content(ctx.chat_id, agent, prompt=True)
         elif command == "trust":
             await send_to_relay(pane_id, "trust, always allow")
-            self.audit("trust", agent)
+            self.audit(ctx.chat_id, "trust", agent)
             self.reply_text(ctx.chat_id, f"Trusted {agent.get('project')} (always allow)")
         elif command == "interrupt":
             await self._interrupt(ctx.chat_id, agent)
@@ -2156,7 +2145,7 @@ class LarkBot:
                 self._prompt_for_reply(ctx.chat_id, agent)
                 return
             await send_text_to_relay(pane_id, payload.strip())
-            self.audit("send", agent, payload.strip())
+            self.audit(ctx.chat_id, "send", agent, payload.strip())
             self.set_active(ctx.chat_id, pane_id, agent.get("project"))
             self.reply_text(ctx.chat_id, f"→ 已发给 {agent.get('project')}")
             self._maybe_autowatch(ctx.chat_id, pane_id, agent.get("project") or "")
@@ -2320,8 +2309,8 @@ class LarkBot:
         # 新 pane 是个空 shell，把启动命令打进去。
         try:
             await send_text_to_relay(pane_id, agent_launch_command(kind, cwd))
-            self.audit("new", {"project": label if False else project,
-                               "pane_id": pane_id}, f"启动 {kind}")
+            self.audit(ctx.chat_id, "new", {"project": project,
+                                            "pane_id": pane_id}, f"启动 {kind}")
         except Exception as exc:
             self.reply_text(ctx.chat_id, f"启动 {kind} 失败: {scrub(exc)}")
             return
@@ -2468,13 +2457,13 @@ class LarkBot:
         # 走 send_text 是没用的：粘贴进去的换行会被 TUI 当正文，确认不了提示。
         if looks_like_option_press(text) and pane_id in self.approval_tokens:
             await send_keys_to_relay(pane_id, [text.strip()])
-            self.audit("approve", agent, f"选项 {text.strip()}")
+            self.audit(ctx.chat_id, "approve", agent, f"选项 {text.strip()}")
             self.approval_tokens.pop(pane_id, None)
             self.reply_text(ctx.chat_id, f"→ 已选 {text.strip()}（{project}）")
             return
 
         await send_text_to_relay(pane_id, text)
-        self.audit("send", agent, text)
+        self.audit(ctx.chat_id, "send", agent, text)
         self.reply_text(ctx.chat_id, f"→ 已发给 {project}")
         self._maybe_autowatch(ctx.chat_id, pane_id, project)
 
@@ -2502,7 +2491,7 @@ class LarkBot:
             self._prompt_for_reply(ctx.chat_id, agent)
         elif action == "trust":
             await send_to_relay(pane_id, "trust, always allow")
-            self.audit("trust", agent)
+            self.audit(ctx.chat_id, "trust", agent)
             self.reply_text(ctx.chat_id, f"Trusted {agent.get('project')} (always allow)")
         elif action == "interrupt":
             await self._interrupt(ctx.chat_id, agent)
@@ -2525,7 +2514,8 @@ class LarkBot:
         # 按选项序号发按键。发选项文本不行：relay 用 send-text 粘贴，
         # Claude 的 TUI 把粘贴里的换行当正文而非回车，提示确认不了。
         await send_keys_to_relay(pane_id, [str(key)])
-        self.audit("approve", find_agent(self.agents, pane_id) or {"pane_id": pane_id},
+        self.audit(ctx.chat_id, "approve",
+                   find_agent(self.agents, pane_id) or {"pane_id": pane_id},
                    f"选项 {key}")
         self.approval_tokens.pop(pane_id, None)
         self.reply_text(ctx.chat_id, f"已选 {key}")
@@ -2565,18 +2555,21 @@ class LarkBot:
         message_id = self.reply_text(chat_id, follow_up_hint(project))
         self.remember(chat_id, message_id, agent["pane_id"])
 
-    def audit(self, action: str, agent: dict, detail: str = "") -> None:
-        """把一次写操作记到审计群。失败只记日志，不影响主流程。"""
-        if not self.audit_chats:
+    def audit(self, chat_id: str, action: str, agent: dict, detail: str = "") -> None:
+        """在发起操作的那个群里留一行痕迹。失败只记日志，不影响主流程。
+
+        痕迹落在本群而不是单独的审计群：操作发生在哪个群，追溯就该在哪个群，
+        不用切到别处对时间线。
+        """
+        if not self.audit_on or not chat_id:
             return
         project = (agent or {}).get("project") or "?"
         pane_id = (agent or {}).get("pane_id") or "?"
         line = format_audit(action, project, pane_id, detail)
-        for chat_id in sorted(self.audit_chats):
-            try:
-                self.api.send_text(chat_id, line)
-            except Exception as exc:
-                log.warning("audit send failed: %s", scrub(exc))
+        try:
+            self.api.send_text(chat_id, line)
+        except Exception as exc:
+            log.warning("audit send failed: %s", scrub(exc))
 
     def _send_images_in(self, chat_id: str, content: str) -> int:
         """输出里提到的图片直接发出去，省得跑回电脑看。"""
@@ -2629,7 +2622,7 @@ class LarkBot:
         # 必须走带 ack 的 helper，且键名只能是 relay SAFE_KEYS 里的 "C-c"。
         try:
             await send_keys_to_relay(agent["pane_id"], ["C-c"])
-            self.audit("interrupt", agent)
+            self.audit(chat_id, "interrupt", agent)
             self.reply_text(chat_id, f"Sent Ctrl+C to {agent.get('project')}")
         except Exception as exc:
             self.reply_text(chat_id, f"Failed: {scrub(exc)}")
@@ -2692,14 +2685,11 @@ def chats_watching(bot: "LarkBot", pane_id: str) -> list[str]:
     绑定了就发给绑定的群；一个都没绑时回落到默认会话，
     否则通知会悄无声息地丢掉。
     """
-    audit = getattr(bot, "audit_chats", set())
-    bound = [chat for chat, pane in bot._active.items()
-             if pane == pane_id and chat not in audit]
+    bound = [chat for chat, pane in bot._active.items() if pane == pane_id]
     if bound:
         return sorted(bound)
     # 一个群都没绑它：发给所有授权群，否则通知会悄无声息地丢掉。
-    fallback = sorted(bot.chat_ids - audit) if bot.chat_ids else []
-    return fallback
+    return sorted(bot.chat_ids) if bot.chat_ids else []
 
 
 # --- relay 监听 ---

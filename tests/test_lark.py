@@ -924,7 +924,7 @@ def make_bot(chat_id="oc_1"):
     bot._active = {}
     bot._staged = {}
     bot.chat_ids = lk.parse_chat_ids(chat_id)
-    bot.audit_chats = set()
+    bot.audit_on = True
     return bot
 
 
@@ -2566,7 +2566,7 @@ class QueueDepthTests(unittest.TestCase):
 
 
 class AuditRecordTests(unittest.TestCase):
-    """审计群只读：记录谁在什么时候对哪个 agent 做了什么。"""
+    """审计回执：记录谁在什么时候对哪个 agent 做了什么。"""
 
     def test_formats_send(self):
         line = lk.format_audit("send", "tailcale", "w1:p1", "继续改这个函数")
@@ -2584,33 +2584,58 @@ class AuditRecordTests(unittest.TestCase):
         self.assertTrue(lk.format_audit("interrupt", "p", "w1:p1", ""))
 
     def test_scrubs_secrets(self):
-        """指令里可能带 token，审计群不能原样记。"""
+        """指令里可能带 token，群里不能原样记。"""
         with unittest.mock.patch.object(lk, "_RELAY_TOKEN", "tok-secret"):
             line = lk.format_audit("send", "p", "w1:p1", "用 tok-secret 登录")
             self.assertNotIn("tok-secret", line)
 
 
 class AuditRoutingTests(unittest.TestCase):
-    """审计群是只读的——能看到全部指令，绝不能反过来下指令。"""
+    """审计回执落在发起操作的那个群，而不是某个单独的审计群。"""
 
-    def test_audit_chat_rejects_commands(self):
-        self.assertFalse(lk.is_command_allowed("oc_audit", {"oc_audit"}))
-
-    def test_normal_chat_accepts_commands(self):
-        self.assertTrue(lk.is_command_allowed("oc_normal", {"oc_audit"}))
-
-    def test_no_audit_chat_allows_all(self):
-        self.assertTrue(lk.is_command_allowed("oc_any", set()))
-
-    def test_audit_chat_not_in_broadcast_targets(self):
-        """完成通知不该重复发到审计群——它有自己的记录。"""
+    def test_posts_into_originating_chat(self):
         bot = make_bot()
-        bot.audit_chats = {"oc_audit"}
-        bot.set_active("oc_work", "w1:p1")
-        self.assertNotIn("oc_audit", lk.chats_watching(bot, "w1:p1"))
+        bot.audit("oc_work", "send", {"project": "tailcale", "pane_id": "w1:p1"}, "改一下")
+        bot.api.send_text.assert_called_once()
+        chat_id, line = bot.api.send_text.call_args[0]
+        self.assertEqual(chat_id, "oc_work")
+        self.assertIn("tailcale", line)
 
-    def test_parses_audit_chat_ids(self):
-        self.assertEqual(lk.parse_chat_ids("oc_a,oc_b"), {"oc_a", "oc_b"})
+    def test_does_not_fan_out_to_other_chats(self):
+        """A 群的操作不该出现在 B 群——各群只看自己的痕迹。"""
+        bot = make_bot()
+        bot.chat_ids = {"oc_a", "oc_b"}
+        bot.audit("oc_a", "send", {"project": "p", "pane_id": "w1:p1"}, "x")
+        targets = [c.args[0] for c in bot.api.send_text.call_args_list]
+        self.assertEqual(targets, ["oc_a"])
+
+    def test_disabled_sends_nothing(self):
+        bot = make_bot()
+        bot.audit_on = False
+        bot.audit("oc_work", "send", {"project": "p", "pane_id": "w1:p1"}, "x")
+        bot.api.send_text.assert_not_called()
+
+    def test_send_failure_does_not_raise(self):
+        """审计发不出去也不能连带把主流程搞挂。"""
+        bot = make_bot()
+        bot.api.send_text.side_effect = RuntimeError("boom")
+        bot.audit("oc_work", "trust", {"project": "p", "pane_id": "w1:p1"})
+
+    def test_audit_switch_defaults_on(self):
+        self.assertTrue(lk.audit_enabled("on"))
+        self.assertTrue(lk.audit_enabled(""))
+        self.assertTrue(lk.audit_enabled(None))
+
+    def test_audit_switch_off(self):
+        for value in ("off", "0", "false", "no", "OFF"):
+            self.assertFalse(lk.audit_enabled(value), value)
+
+    def test_every_chat_accepts_commands(self):
+        """没有只读群了：所有授权群都能下指令。"""
+        bot = make_bot()
+        bot.chat_ids = {"oc_a", "oc_b"}
+        for chat in ("oc_a", "oc_b"):
+            self.assertTrue(lk.is_authorized_chat(chat, bot.chat_ids))
 
 
 if __name__ == "__main__":

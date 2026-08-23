@@ -82,30 +82,34 @@ herdr · [w22] yqg-dw-datapilot
 >
 > 飞书的群公告是 docx 类型，API 改不了（`232097 Unable to operate docx type chat announcement`），所以用群名。群名在会话列表里本来就更醒目。
 
-### 只读审计群
+### 审计回执
 
-配一个群收全部写操作记录，做事后追溯：
-
-```bash
-HERDR_LARK_AUDIT_CHAT=oc_xxxxxxxx
-```
-
-记录长这样：
+每次写操作都在**发起它的那个群**里留一行痕迹，不再另设审计群：
 
 ```
 → send  tailcale (w1X:p1)  继续改这个函数
 ✓ approve  tailcale (w1X:p1)  选项 2
 🔓 trust  niuma (w19:p1)
 ⛔ interrupt  herdr (w21:p1)
+✚ new  herdr (w22:p1)  启动 codex
 ```
 
 覆盖 8 个写操作点：`send` / `approve` / `trust` / `interrupt` / `new` 等。
 
-三条约束：
+**为什么落在本群而不是单独一个审计群**：操作发生在哪个群，追溯就该在哪个群。
+一个项目一个群，痕迹和上下文（指令、pane 输出、完成通知）在同一条时间线上，
+不用切到别处对时间戳；也不必再为「审计群能看到全部项目的指令内容」单独设一层只读权限。
 
-- **审计群不接受指令** —— 它能看到所有 agent 的指令内容，若还能下命令就成了越权入口。发命令会被回「本群是只读审计群」
-- **不重复收通知** —— 完成推送、blocked 卡片都不发到审计群，它有自己的记录
+两条约束：
+
 - **内容脱敏** —— 指令里可能带密钥，`scrub()` 会滤掉；超长内容截断到 200 字
+- **发不出去不影响主流程** —— 审计只记日志，不让留痕失败连带把指令搞挂
+
+想关掉：
+
+```bash
+HERDR_LARK_AUDIT=off
+```
 
 ### agent 停下来时会主动推
 
@@ -410,7 +414,7 @@ grep -v "^\[Lark\]\|^INFO:Lark" /tmp/lark_run.log
 | `HERDR_LARK_BINDING_PATH` | 群↔agent 绑定落盘路径 | `~/.config/herdr-remote/lark_bindings.json` |
 | `HERDR_LARK_RENDER` | 输出样式 `card` / `text` | `card` |
 | `HERDR_LARK_AUTOWATCH` | 自动跟随 `off` / 秒数 | 开，120 秒 |
-| `HERDR_LARK_AUDIT_CHAT` | 只读审计群（逗号分隔） | 空 |
+| `HERDR_LARK_AUDIT` | 审计回执开关 `off` 关闭 | 开 |
 | `HERDR_RELAY` | relay 地址（含 token） | `ws://127.0.0.1:8375` |
 
 凭据存 `~/.config/herdr-remote/secrets.env`，权限 0600。
