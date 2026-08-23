@@ -126,6 +126,24 @@ class DegradedCardTests(unittest.TestCase):
             "content": self.DEGRADED, "text": ""}, time.time())
         obs.report.assert_not_called()
 
+    # 第二种降级文案（实测抓到，与上面那种并存）。只认一种的话，这种
+    # 会被当成真元素树，判成「没有按钮」——observer 一启动就刷一屏假警报。
+    DEGRADED_ALT = {"title": "", "elements": [[
+        {"tag": "text", "text": "卡片内容不支持查看，请在飞书客户端查看"}]]}
+
+    def test_recognizes_alternate_degraded_wording(self):
+        self.assertTrue(ob.card_is_degraded(self.DEGRADED_ALT))
+
+    def test_alternate_degraded_produces_no_finding(self):
+        obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(),
+                          seen=ob.SeenStore(os.path.join(_TMP, f"s2-{time.time()}.json")))
+        obs.report = unittest.mock.MagicMock()
+        obs._check_message("oc_1", "herdr · herdr-remote", {
+            "message_id": "om_degraded_alt", "msg_type": "interactive",
+            "create_time": time.time(), "sender": "app",
+            "content": self.DEGRADED_ALT, "text": ""}, time.time())
+        obs.report.assert_not_called()
+
     def test_pane_output_containing_word_button_not_treated_as_button(self):
         """pane 输出正文里出现 button 这个词，不等于卡片有按钮。
 

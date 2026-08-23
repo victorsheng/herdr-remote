@@ -150,7 +150,16 @@ def check_text(text: str) -> list[dict]:
 #   {"title": "...", "elements": [[{"tag":"img"...},
 #                                  {"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}
 # 所以「这张卡片有没有按钮」这个问题，用读消息的方式根本回答不了。
-_CARD_DEGRADED_MARK = "请升级至最新版本客户端"
+# 飞书 API 拿不到卡片元素树时的降级文案。不止一种，实测抓到过这两句：
+#   - 请升级至最新版本客户端，以查看内容
+#   - 卡片内容不支持查看，请在飞书客户端查看
+# 只认一种的话，另一种会被当成真元素树，判成「没有按钮」——observer 一
+# 启动就把历史卡片刷成一屏假警报（实测：连报 10 条 card_no_buttons）。
+# 加新变体时照抓屏原文抄，别自己改写措辞。
+_CARD_DEGRADED_MARKS = (
+    "请升级至最新版本客户端",
+    "卡片内容不支持查看",
+)
 
 
 def card_is_degraded(content: dict) -> bool:
@@ -159,7 +168,8 @@ def card_is_degraded(content: dict) -> bool:
     实际踩过：拿降级内容去判「有没有 button」，把正常的 DONE 卡片和
     审批卡片全判成死卡片——一晚上刷 8 条假警报。降级内容一律跳过。
     """
-    return _CARD_DEGRADED_MARK in json.dumps(content, ensure_ascii=False)
+    raw = json.dumps(content, ensure_ascii=False)
+    return any(mark in raw for mark in _CARD_DEGRADED_MARKS)
 
 
 def card_has_buttons(content: dict) -> bool:
