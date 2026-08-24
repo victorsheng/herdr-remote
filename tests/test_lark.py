@@ -3674,6 +3674,128 @@ class BlockedCardReadabilityTests(unittest.TestCase):
         self.assertIn("rm -rf build", code)
 
 
+class SplitLongPromptTests(unittest.TestCase):
+    """正文超长时拆成多条发，而不是砍掉。
+
+    审批场景最怕看不全：额度提到 2400 之后，极长的上文仍会被 truncate_prompt
+    砍掉开头。选择的时候尤其要命——判断依据在上文里，被砍了就只能盲选。
+
+    拆分规则：
+      - 超出额度的上文拆成前置卡片先发，**按钮永远在最后一条**
+      - 前置卡片最多 _MAX_PROMPT_CARDS - 1 条，再长就舍弃最开头的并留记号
+    """
+
+    def test_short_prompt_stays_one_piece(self):
+        """主路径：没超长就一条，不要凭空拆。"""
+        self.assertEqual(lk.split_prompt_cards("短正文"), ["短正文"])
+
+    def test_empty_prompt_yields_one_empty_piece(self):
+        self.assertEqual(lk.split_prompt_cards(""), [""])
+
+    def test_long_prompt_is_split(self):
+        text = "x" * (lk._CARD_BODY_LIMIT * 2 + 100)
+        self.assertGreater(len(lk.split_prompt_cards(text)), 1)
+
+    def test_no_content_is_lost_within_budget(self):
+        """在额度内一个字都不能丢——这是本次修复的全部意义。"""
+        text = "".join(f"[{i:04d}]" for i in range(900))   # 5400 字
+        self.assertLessEqual(len(text), lk._CARD_BODY_LIMIT * lk._MAX_PROMPT_CARDS)
+        self.assertEqual("".join(lk.split_prompt_cards(text)), text)
+
+    def test_tail_is_always_the_last_piece(self):
+        """末尾必须落在最后一条：问题和选项在那里，按钮也挂在那条。"""
+        text = ("y" * 8000) + "END-QUESTION"
+        self.assertTrue(lk.split_prompt_cards(text)[-1].endswith("END-QUESTION"))
+
+    def test_respects_max_cards(self):
+        text = "z" * 100000
+        self.assertLessEqual(len(lk.split_prompt_cards(text)), lk._MAX_PROMPT_CARDS)
+
+    def test_each_piece_within_limit(self):
+        pieces = lk.split_prompt_cards("w" * 100000)
+        for piece in pieces:
+            self.assertLessEqual(len(piece), lk._CARD_BODY_LIMIT + 4)
+
+    def test_overflow_marks_dropped_head(self):
+        """超出总额度时舍弃最开头的，但要留记号，别假装内容是全的。"""
+        pieces = lk.split_prompt_cards("q" * 100000)
+        self.assertTrue(pieces[0].startswith("⋯"), pieces[0][:20])
+
+    def test_no_mark_when_nothing_dropped(self):
+        """没丢东西就不该有记号——那会让人以为内容缺了。"""
+        text = "a" * (lk._CARD_BODY_LIMIT + 50)
+        self.assertNotIn("⋯", "".join(lk.split_prompt_cards(text)))
+
+
+class BlockedCardSplitDeliveryTests(unittest.TestCase):
+    """发送层：拆出来的前文先发，带按钮的审批卡最后发。"""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1)
+        # chats_watching 只认显式绑过的群，没有回落——不绑就一条都不发。
+        self.bot.set_active("oc_1", "w0:p1", "project0")
+        self.sent = []
+        self.bot.reply_card = lambda chat_id, card: (
+            self.sent.append(card) or f"om_{len(self.sent)}")
+
+    def _notify(self, prompt):
+        lk._notify_blocked(self.bot, {
+            "pane_id": "w0:p1", "agent": "claude", "project": "project0",
+            "prompt": prompt, "options": lk.TOOL_OPTIONS,
+        })
+        return self.sent
+
+    def test_short_prompt_sends_one_card(self):
+        """主路径不受影响：短正文还是一条。"""
+        self.assertEqual(len(self._notify("要执行 rm -rf 吗？")), 1)
+
+    def test_long_prompt_sends_multiple_cards(self):
+        self.assertGreater(len(self._notify("x" * 8000)), 1)
+
+    def test_only_the_last_card_has_buttons(self):
+        """按钮只能有一份：多份就会出现两组序号，点哪个都不知道。"""
+        cards = self._notify("x" * 8000)
+        with_buttons = [c for c in cards if buttons_in(c)]
+        self.assertEqual(len(with_buttons), 1)
+        self.assertIs(with_buttons[0], cards[-1])
+
+    def test_lead_cards_carry_the_head_of_the_prompt(self):
+        """前置卡片装的是上文开头，不是又重复一遍末尾。
+
+        长度取在总额度内（2400×3），这样开头不该被舍弃——正是「拆开发而不是
+        砍掉」要保证的事。
+        """
+        filler = "x" * (lk._CARD_BODY_LIMIT * 2)
+        cards = self._notify("HEAD-MARK" + filler + "TAIL-MARK")
+        self.assertIn("HEAD-MARK", json.dumps(cards[0], ensure_ascii=False))
+        self.assertIn("TAIL-MARK", json.dumps(cards[-1], ensure_ascii=False))
+
+    def test_beyond_total_budget_drops_the_head_with_a_mark(self):
+        """超过总额度就只能舍弃开头，但要留记号，不能假装内容是全的。"""
+        cards = self._notify("HEAD-MARK" + "x" * 100000 + "TAIL-MARK")
+        first = json.dumps(cards[0], ensure_ascii=False)
+        self.assertNotIn("HEAD-MARK", first)
+        self.assertIn("⋯", first)
+        self.assertIn("TAIL-MARK", json.dumps(cards[-1], ensure_ascii=False))
+        self.assertLessEqual(len(cards), lk._MAX_PROMPT_CARDS)
+
+    def test_last_card_carries_the_question_and_options(self):
+        cards = self._notify("x" * (lk._CARD_BODY_LIMIT * 2) + "\n  1. 是\n  2. 否")
+        self.assertTrue(buttons_in(cards[-1]))
+        last = json.dumps(cards[-1], ensure_ascii=False)
+        self.assertIn("**1.** 是", last)   # 正文里的选项清单
+        self.assertIn("**2.** 否", last)
+
+    def test_every_card_is_remembered(self):
+        """用户可能回复任意一条，每条都要能查到 pane。"""
+        self.bot.pending.clear()
+        self._notify("x" * 8000)
+        panes = {v for v in self.bot.pending.values()}
+        self.assertEqual(panes, {"w0:p1"})
+        self.assertGreater(len(self.bot.pending), 1)
+
+
 class SelectorHintVariantTests(unittest.TestCase):
     """脚注多出一个没见过的短语，不能让整组选项跟着丢。
 

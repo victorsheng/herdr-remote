@@ -596,6 +596,39 @@ def truncate_prompt(text: str, limit: int = _CARD_BODY_LIMIT) -> str:
     return "⋯\n" + text[-limit:]
 
 
+# 一条 blocked 最多铺几张卡片。超长正文拆开发，但不能无限铺——agent 吐一屏
+# 长输出时会把群刷满。3 张 = 前置 2 张 + 带按钮的审批卡 1 张，共 7200 字额度。
+_MAX_PROMPT_CARDS = 3
+
+
+def split_prompt_cards(text: str, limit: int = _CARD_BODY_LIMIT,
+                       max_cards: int = _MAX_PROMPT_CARDS) -> list[str]:
+    """把超长正文切成多段，**末尾一定落在最后一段**。
+
+    为什么不直接截断：审批（尤其是选择）的判断依据在上文里，砍掉就只能盲选。
+    额度提到 2400 之后仍不够用的场景是真实存在的，所以拆开发。
+
+    为什么末尾必须在最后一段：问题、选项、命令结尾都在末尾，而按钮挂在最后
+    那张卡上——人往下滑，最后看到的就该是要点的东西。
+
+    总额度还装不下时舍弃**最开头**的，并在首段留 ⋯ 记号：宁可明说「前面还有
+    内容」，也不假装内容是全的。
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+    budget = limit * max_cards
+    dropped = len(text) - budget
+    if dropped > 0:
+        text = text[-budget:]
+    # 从末尾往前切，保证最后一段是原文的末尾（不足一段的零头落在最前面）。
+    pieces = [text[max(0, i - limit):i] for i in range(len(text), 0, -limit)]
+    pieces.reverse()
+    if dropped > 0:
+        pieces[0] = "⋯\n" + pieces[0]
+    return pieces
+
+
 def _approval_labels(options: list[str] | None) -> list[str]:
     """把 relay 给的选项换成按钮文字。
 
@@ -750,8 +783,13 @@ def build_blocked_card(
     prompt: str,
     options: list[str] | None,
     generation: str,
+    body_override: str | None = None,
 ) -> dict:
     """agent 卡住时推的审批卡片。relay 监听那条路径在调。
+
+    body_override：正文超长拆多条时，这张卡只放最后一段正文。选项仍从**完整**
+    prompt 解析——问题和选项在末尾，但解析要看全文（比如多选的勾选态）。
+    两者分开传，别用截断后的文本去解析选项。
 
     优先用 prompt 里真正的选择器。relay 的 detect_options 只认两种权限提示
     （yes, single permission / approve all pending），AskUserQuestion 的选择器
@@ -766,6 +804,8 @@ def build_blocked_card(
     # 的额度——正文一长，中间那段省略正好盖住问题和选项。摘掉选择器，
     # 问题单独成块，剩下的额度留给上文。
     body = strip_selector(prompt or "") if group else (prompt or "")
+    if body_override is not None:
+        body = body_override
     return build_option_card(pane_id, project, labels, generation,
                              prompt=body or " ", agent=agent or "agent",
                              question=group["question"] if group else "",
@@ -3650,18 +3690,29 @@ def _notify_blocked(bot: "LarkBot", msg: dict) -> None:
         return
     generation = new_generation()
     project = msg.get("project", "")
-    card = build_blocked_card(
-        pane_id,
-        msg.get("agent", "unknown"),
-        project,
-        msg.get("prompt", ""),
-        msg.get("options"),
-        generation,
-    )
+    prompt = msg.get("prompt", "")
+    agent = msg.get("agent", "unknown")
+
+    # 正文超长就拆开发，别砍掉——选择时判断依据在上文里，砍了只能盲选。
+    # 摘掉选择器之后再拆：选项已经是按钮，正文里那份是重复的。
+    group = current_option_group(detect_option_groups(prompt))
+    body = strip_selector(prompt) if group else prompt
+    pieces = split_prompt_cards(body)
+
+    # 前置卡片只铺上文，按钮**只挂最后一张**：两组序号并存的话，点哪个都
+    # 说不清答的是谁。
+    lead_cards = [build_pane_card(project, agent, "blocked", piece)
+                  for piece in pieces[:-1]]
+    final_card = build_blocked_card(pane_id, agent, project, prompt,
+                                   msg.get("options"), generation,
+                                   body_override=pieces[-1] or " ")
+
     bot.approval_tokens[pane_id] = generation
     for chat_id in chats_watching(bot, pane_id):
-        message_id = bot.reply_card(chat_id, card)
-        bot.remember(chat_id, message_id, pane_id)
+        # 每条都 remember：用户回复哪一条都得知道发给哪个 pane。
+        for card in lead_cards:
+            bot.remember(chat_id, bot.reply_card(chat_id, card), pane_id)
+        bot.remember(chat_id, bot.reply_card(chat_id, final_card), pane_id)
 
 
 def _sync_chat_names(bot: "LarkBot", agents: list[dict],
