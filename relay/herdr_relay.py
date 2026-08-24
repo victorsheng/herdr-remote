@@ -780,6 +780,29 @@ async def get_all_agents_async():
 STALE_VIEWPORT_MARK = "⚠ 终端当时处于回滚状态，以下内容可能不是最新的"
 
 
+# 客户端能请求的最大行数。这个数必须和 run_herdr_async 的 15 秒超时匹配：
+# 实测 `herdr pane read` 约 36ms/行（50 行 1.0s、200 行 7.1s、300 行 11.0s、
+# 800 行 16s 撞上限），15 秒只够 ~400 行。
+#
+# 原先写死 5000，等于允许客户端提一个必然超时的请求——relay.log 里 41 次
+# `herdr call timed out` 全是 1200/1700 行。更糟的是超时的 lines 会被记进
+# pane_subs，push_subscribed_panes 每轮都用同一个必失败的行数重试，白烧
+# CPU 和 SSH 往返（日志里的成簇超时就是这么来的）。
+PANE_READ_MAX_LINES = 300
+
+
+def clamp_pane_lines(value, default: int = 30) -> int:
+    """把客户端要的行数收进能在超时内读完的范围。
+
+    非数字回落到 default 而不是报错：这是主循环，客户端传错参数不该让
+    整条连接失败。
+    """
+    try:
+        return max(1, min(int(value), PANE_READ_MAX_LINES))
+    except (TypeError, ValueError):
+        return default
+
+
 async def pane_scroll_offset(pane_id, remote=None) -> int:
     """视口离底部多少行。0 = 在底部（内容是最新的）。
 
@@ -1515,10 +1538,7 @@ async def handle_client(ws):
                 if pane_id not in known_panes:
                     await send_to_client(ws, {"type": "error", "message": "unknown pane_id"})
                     continue
-                try:
-                    lines = max(1, min(int(msg.get("lines", 30)), 5000))
-                except (TypeError, ValueError):
-                    lines = 30
+                lines = clamp_pane_lines(msg.get("lines", 30))
                 remote = pane_remote_map.get(pane_id)
                 content = await run_herdr_async("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
                 # 登记订阅：之后 poll_loop 发现这个 pane 有变化就主动推，

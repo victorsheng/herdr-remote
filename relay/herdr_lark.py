@@ -473,6 +473,37 @@ async def send_keys_to_relay(pane_id: str, keys: list[str]) -> None:
         raise RuntimeError("relay did not acknowledge keys")
 
 
+# relay 协议层对 send_text 的硬限制（herdr_relay.py 也校验同一个数）。
+SEND_TEXT_LIMIT = 1000
+
+
+def split_send_text(text: str, limit: int = SEND_TEXT_LIMIT) -> list[str]:
+    """把超长文本切成 ≤limit 的段，一个字都不丢。
+
+    以前超长直接抛 ValueError，异常冒到 _handle 顶层只记一行日志——群里
+    完全没反馈，人以为发出去了，其实 agent 根本没收到（lark-stderr.log
+    里那条 `handler failed` 就是）。
+
+    尽量在换行处断：粘进终端之后，从句子中间断开的可读性差很多。找不到
+    合适的换行就硬切，宁可难看也不能丢字。
+    """
+    text = text or ""
+    if not text:
+        return []
+    pieces = []
+    while len(text) > limit:
+        window = text[:limit]
+        cut = window.rfind("\n")
+        # 换行太靠前就不用了，否则会切出一堆碎片。
+        if cut < limit // 2:
+            cut = limit
+        pieces.append(text[:cut])
+        text = text[cut:].lstrip("\n") if cut < limit else text[cut:]
+    if text:
+        pieces.append(text)
+    return pieces
+
+
 async def send_text_to_relay(pane_id: str, text: str) -> None:
     """把文本送进 pane 并回车。
 
@@ -3304,9 +3335,13 @@ class LarkBot:
             await self._push_next_group(ctx.chat_id, pane_id)
             return
 
-        await send_text_to_relay(pane_id, text)
+        # 超长就分段：以前直接抛 ValueError，群里静默，消息等于丢了。
+        pieces = split_send_text(text)
+        for piece in pieces:
+            await send_text_to_relay(pane_id, piece)
         self.audit(ctx.chat_id, "send", agent, text)
-        self.reply_text(ctx.chat_id, f"→ 已发给 {project}")
+        suffix = f"（{len(pieces)} 段）" if len(pieces) > 1 else ""
+        self.reply_text(ctx.chat_id, f"→ 已发给 {project}{suffix}")
         self._maybe_autowatch(ctx.chat_id, pane_id, project)
 
     async def _handle_action(self, ctx: MessageContext) -> None:

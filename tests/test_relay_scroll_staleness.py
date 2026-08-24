@@ -101,3 +101,45 @@ class StalenessMarkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaneReadLineCapTests(unittest.TestCase):
+    """客户端能请求的行数必须和超时阈值匹配，否则请求必然失败。
+
+    真实故障（relay.log 里 41 次 `herdr call timed out`）：代码允许客户端
+    请求最多 5000 行，但 run_herdr_async 的超时固定 15 秒。实测在本机：
+
+        50 行 = 1.0s    200 行 = 7.1s
+       300 行 = 11.0s   800 行 = 16s（撞上限）
+
+    约 36ms/行，15 秒只够 ~400 行。5000 那个上限完全是虚的——请求必超时，
+    而且超时的 lines 会被记进 pane_subs，push_subscribed_panes 每轮拿同一个
+    必失败的行数重试，白烧 CPU 和 SSH 往返（日志里的成簇超时就是这么来的）。
+    """
+
+    def test_cap_is_below_the_timeout_budget(self):
+        """上限 × 每行耗时要留在超时阈值内，别定个一定失败的数。"""
+        self.assertLessEqual(herdr_relay.PANE_READ_MAX_LINES, 400)
+
+    def test_cap_is_still_useful(self):
+        """也不能收得太狠——一屏终端 47 行，得装得下几屏历史。"""
+        self.assertGreaterEqual(herdr_relay.PANE_READ_MAX_LINES, 150)
+
+    def test_clamp_rejects_oversized_request(self):
+        self.assertEqual(herdr_relay.clamp_pane_lines(5000),
+                         herdr_relay.PANE_READ_MAX_LINES)
+
+    def test_clamp_keeps_reasonable_request(self):
+        self.assertEqual(herdr_relay.clamp_pane_lines(50), 50)
+
+    def test_clamp_floors_at_one(self):
+        self.assertEqual(herdr_relay.clamp_pane_lines(0), 1)
+        self.assertEqual(herdr_relay.clamp_pane_lines(-5), 1)
+
+    def test_clamp_handles_garbage(self):
+        """客户端传了非数字不能让 relay 炸——这是主循环。"""
+        self.assertEqual(herdr_relay.clamp_pane_lines("abc"), 30)
+        self.assertEqual(herdr_relay.clamp_pane_lines(None), 30)
+
+    def test_clamp_default_matches_previous_behaviour(self):
+        self.assertEqual(herdr_relay.clamp_pane_lines("abc", default=99), 99)

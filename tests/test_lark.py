@@ -3850,6 +3850,99 @@ class TypedDigitPushesNextGroupTests(unittest.TestCase):
         push.assert_not_awaited()
 
 
+class LongMessageSplitTests(unittest.TestCase):
+    """超过 1000 字的消息要分段发，不能静默丢掉。
+
+    真实故障（lark-stderr.log 里的 `ERROR:herdr-lark:handler failed`）：
+    send_text_to_relay 对超长文本抛 ValueError，异常一路冒到 _handle 顶层，
+    那里只 log.exception ——**群里完全没反馈**。人以为发出去了，其实 agent
+    根本没收到。
+
+    1000 是 relay 协议层的硬限制（herdr_relay.py 对 send_text 也校验），
+    所以只能在这边分段，每段都得 ≤1000。
+    """
+
+    def test_short_text_is_one_piece(self):
+        self.assertEqual(lk.split_send_text("短消息"), ["短消息"])
+
+    def test_long_text_is_split(self):
+        self.assertGreater(len(lk.split_send_text("x" * 2500)), 1)
+
+    def test_every_piece_within_relay_limit(self):
+        for piece in lk.split_send_text("y" * 5000):
+            self.assertLessEqual(len(piece), lk.SEND_TEXT_LIMIT)
+
+    def test_nothing_is_lost(self):
+        """一个字都不能丢——这是本次修复的全部意义。"""
+        text = "".join(f"[{i:04d}]" for i in range(700))
+        self.assertEqual("".join(lk.split_send_text(text)), text)
+
+    def test_order_is_preserved(self):
+        text = "HEAD" + ("m" * 2000) + "TAIL"
+        pieces = lk.split_send_text(text)
+        self.assertTrue(pieces[0].startswith("HEAD"))
+        self.assertTrue(pieces[-1].endswith("TAIL"))
+
+    def test_empty_text_yields_nothing(self):
+        self.assertEqual(lk.split_send_text(""), [])
+
+    def test_prefers_newline_boundary(self):
+        """能在换行处断就别切断句子——粘进终端后可读性差很多。"""
+        text = ("a" * 900) + "\n" + ("b" * 300)
+        self.assertEqual(lk.split_send_text(text)[0], "a" * 900)
+
+
+class LongMessageDeliveryTests(unittest.TestCase):
+    """发送层：长消息分段送达，且要如实告诉用户分了几段。"""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1)
+        self.pane = lk.index_agents(self.bot.agents)[0]["pane_id"]
+        self.bot.set_active("oc_1", self.pane, "project0")
+
+    def _send(self, text):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text=text)
+        with unittest.mock.patch.object(
+                lk, "send_text_to_relay", new=unittest.mock.AsyncMock()) as sender:
+            asyncio.run(self.bot._handle_text(ctx))
+        return sender
+
+    def test_short_message_sends_once(self):
+        """主路径不受影响。"""
+        self._send("继续改这个函数").assert_awaited_once()
+
+    def test_long_message_is_not_dropped(self):
+        """回归防线：以前这里抛 ValueError，一个字都没发出去。"""
+        sender = self._send("x" * 2500)
+        self.assertGreater(sender.await_count, 1)
+
+    def test_long_message_pieces_are_all_within_limit(self):
+        sender = self._send("x" * 2500)
+        for call in sender.await_args_list:
+            self.assertLessEqual(len(call[0][1]), lk.SEND_TEXT_LIMIT)
+
+    def test_long_message_reassembles_to_original(self):
+        text = "".join(f"<{i:03d}>" for i in range(500))
+        sender = self._send(text)
+        joined = "".join(c[0][1] for c in sender.await_args_list)
+        self.assertEqual(joined, text)
+
+    def test_reply_mentions_the_piece_count(self):
+        """分了段就要说，不然用户不知道发生了什么。"""
+        self._send("x" * 2500)
+        said = " ".join(str(c) for c in self.bot.api.send_text.call_args_list)
+        self.assertIn("段", said)
+
+    def test_short_message_reply_has_no_piece_count(self):
+        """没分段就别提，避免噪音。"""
+        self._send("短消息")
+        said = " ".join(str(c) for c in self.bot.api.send_text.call_args_list)
+        self.assertNotIn("段", said)
+
+
 class PreviewPanelPollutionTests(unittest.TestCase):
     """选项右边并排一个 preview 面板时，选项文字不能被面板内容污染。
 
