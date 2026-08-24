@@ -73,6 +73,7 @@ ACTION_CODES = {
     "select_send": "s",
     "select_reply": "q",
     "trust": "t",
+    "clear": "c",
     "approval": "k",
     "submit": "u",
     "page": "g",
@@ -2111,6 +2112,7 @@ COMMAND_HELP = [
     {"group": "干", "name": "send", "args": "<序号> <内容>", "desc": "发指令（也可直接打字）"},
     {"group": "干", "name": "trust", "args": "<序号>", "desc": "批准并总是允许"},
     {"group": "干", "name": "interrupt", "args": "<序号>", "desc": "中断（Ctrl+C）"},
+    {"group": "干", "name": "clear", "args": "<序号>", "desc": "清空它的上下文"},
     {"group": "干", "name": "new", "args": "<序号> [类型]", "desc": "在同目录新开一个 agent"},
 
     {"group": "设", "name": "spaces", "args": "[数量|dry]", "desc": "一键一 agent 一群"},
@@ -2783,13 +2785,13 @@ class LarkBot:
             self.reply_text(ctx.chat_id, "No agents connected.")
             return
 
-        if command in ("read", "reply", "send", "trust", "interrupt"):
+        if command in ("read", "reply", "send", "trust", "interrupt", "clear"):
             await self._handle_agent_command(ctx, command, rest)
 
     async def _handle_agent_command(self, ctx: MessageContext, command: str, rest: str) -> None:
         pick_action = {
             "read": "read", "reply": "select_reply", "send": "select_send",
-            "trust": "trust", "interrupt": "interrupt",
+            "trust": "trust", "interrupt": "interrupt", "clear": "clear",
         }[command]
 
         if not rest:
@@ -2827,6 +2829,8 @@ class LarkBot:
             self.reply_text(ctx.chat_id, f"Trusted {agent.get('project')} (always allow)")
         elif command == "interrupt":
             await self._interrupt(ctx.chat_id, agent)
+        elif command == "clear":
+            await self._clear_context(ctx.chat_id, agent)
         elif command == "send":
             if not payload.strip():
                 self._prompt_for_reply(ctx.chat_id, agent)
@@ -2836,6 +2840,20 @@ class LarkBot:
             self.set_active(ctx.chat_id, pane_id, agent.get("project"))
             self.reply_text(ctx.chat_id, f"→ 已发给 {agent.get('project')}")
             self._maybe_autowatch(ctx.chat_id, pane_id, agent.get("project") or "")
+
+    async def _clear_context(self, chat_id: str, agent: dict) -> None:
+        """清掉 agent 自己的对话上下文，等价于在终端里手打 /clear。
+
+        走 send_text 而不是 send_keys：后者受 relay 的 SAFE_KEYS 白名单限制，
+        "/clear" 这种非按键名会被整条拒绝，而用户看到的却是「已清空」——
+        Telegram 版踩过同样的坑（见 send_keys_to_relay 的注释）。
+
+        命令路径和卡片按钮共用这里，别再各写一份：/trust 就是分两处写的，
+        两边文案已经不一致了。
+        """
+        await send_text_to_relay(agent["pane_id"], "/clear")
+        self.audit(chat_id, "clear", agent)
+        self.reply_text(chat_id, f"→ 已清空 {agent.get('project')} 的上下文")
 
     def _start_watch(self, chat_id: str, pane_id: str, project: str,
                      agent_name: str = "", limit: int = 0) -> None:
@@ -3193,6 +3211,8 @@ class LarkBot:
             self.reply_text(ctx.chat_id, f"Trusted {agent.get('project')} (always allow)")
         elif action == "interrupt":
             await self._interrupt(ctx.chat_id, agent)
+        elif action == "clear":
+            await self._clear_context(ctx.chat_id, agent)
         elif action == "approval":
             await self._approve(ctx, data, pane_id)
         elif action == "submit":

@@ -4320,6 +4320,78 @@ class SuggestCommandTests(unittest.TestCase):
         self.assertIsNone(lk.suggest_command("/Users/victor/code/foo.py"))
 
 
+class ClearCommandTests(unittest.TestCase):
+    """/clear 把字面量 "/clear" 发进 pane，清掉 agent 自己的上下文。
+
+    清的是 agent 的对话上下文（Claude Code 的 /clear），不是飞书群里的
+    消息——所以走 send_text_to_relay，和用户在终端里手打完全等价。
+
+    必须用 send_text（粘贴 + 等 ack + 回车）而不是 send_keys：
+    send_keys 走 relay 的 SAFE_KEYS 白名单，"/clear" 不在里面会被整条
+    拒绝，而用户看到的却是「已清空」。
+    """
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(2)
+
+    def _run(self, text):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text=text)
+        with unittest.mock.patch.object(
+                lk, "send_text_to_relay",
+                new=unittest.mock.AsyncMock()) as sender:
+            asyncio.run(self.bot._handle_text(ctx))
+        return sender
+
+    def test_clear_is_a_known_command(self):
+        """必须进命令表，否则 parse_command 把它当自由文本粘进 pane。"""
+        self.assertIn("clear", lk.COMMANDS)
+
+    def test_clear_sends_literal_slash_clear(self):
+        sender = self._run("/clear 1")
+        sender.assert_called_once()
+        pane_id, text = sender.call_args[0][0], sender.call_args[0][1]
+        self.assertEqual(text, "/clear")
+        self.assertEqual(pane_id, lk.index_agents(self.bot.agents)[0]["pane_id"])
+
+    def test_clear_targets_the_indexed_agent(self):
+        """序号要对上 index_agents 的顺序，不能用 sorted_agents。"""
+        sender = self._run("/clear 2")
+        self.assertEqual(sender.call_args[0][0],
+                         lk.index_agents(self.bot.agents)[1]["pane_id"])
+
+    def test_clear_confirms_which_agent(self):
+        """回执要点名项目，否则清错了都不知道。"""
+        self._run("/clear 1")
+        said = " ".join(str(c) for c in self.bot.api.send_text.call_args_list)
+        target = lk.index_agents(self.bot.agents)[0]["project"]
+        self.assertIn(target, said)
+
+    def test_clear_without_index_does_not_send(self):
+        """没指定序号时先让人选，绝不能瞎清一个。"""
+        sender = self._run("/clear")
+        sender.assert_not_called()
+
+    def test_clear_unknown_agent_does_not_send(self):
+        sender = self._run("/clear nonexistent-project")
+        sender.assert_not_called()
+
+    def test_clear_is_audited(self):
+        """不可逆操作必须留痕。"""
+        with unittest.mock.patch.object(
+                self.bot, "audit") as audit:
+            with unittest.mock.patch.object(
+                    lk, "send_text_to_relay", new=unittest.mock.AsyncMock()):
+                ctx = lk.MessageContext(
+                    chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+                    chat_type="p2p", mentioned_bot=True, text="/clear 1")
+                asyncio.run(self.bot._handle_text(ctx))
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args[0][1], "clear")
+
+
 class TypoInterceptTests(unittest.TestCase):
     """打错的命令必须被拦住，不能粘进终端。
 
