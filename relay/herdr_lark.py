@@ -1138,6 +1138,24 @@ _STATUS_ICONS = {
     "idle": "○",
     "unknown": "○",
 }
+# 群名用的彩色符号。卡片里的 _STATUS_ICONS 是黑白的（正文里更克制），
+# 群名要彩色：会话列表里灰扑扑的符号扫一眼分不出轻重。
+# 颜色语义与 _STATUS_COLORS 一致（red/orange/green/grey）。
+_STATUS_GLYPHS = {
+    "blocked": "🔴",
+    "working": "🟡",
+    "done": "🟢",
+    "idle": "⚪️",
+    "unknown": "⚪️",
+}
+_IDLE_GLYPH = "⚪️"
+
+
+def status_glyph(status: str) -> str:
+    """状态 → 群名里的彩色符号。没见过的状态回落成「闲着」。"""
+    return _STATUS_GLYPHS.get(status or "", _IDLE_GLYPH)
+
+
 _CARD_BODY_LIMIT = 2400
 
 
@@ -1477,14 +1495,29 @@ def pick_chat_for_pane(candidates: list[str], pane_id: str,
     return candidates[0]
 
 
-def find_existing_chat(existing: dict[str, str], project: str, marker: str) -> str | None:
-    """按群名找已有的群，找到就复用，不重复建。"""
-    return existing.get(chat_title_for(project, marker))
+def find_bound_chat(bindings: dict[str, str], pane_id: str,
+                    authorized) -> str | None:
+    """这个 agent 已经有群了吗。
+
+    曾经按群名精确匹配（find_existing_chat），但群名带上状态符号后会变：
+    agent 从 working 变 done、群名从「🟡 x」变「🟢 x」，就认不出来了，
+    于是给同一个 agent 重复建群。绑定表才是事实源。
+
+    绑定还在但群已不在授权列表（群被解散了）时返回 None——当成没群。
+    """
+    for chat_id, bound_pane in bindings.items():
+        if bound_pane != pane_id:
+            continue
+        if authorized and chat_id not in authorized:
+            continue
+        return chat_id
+    return None
 
 
 def plan_chat_provisioning(agents: list[dict],
-                           existing: dict[str, str]) -> list[dict]:
-    """算出每个 agent 该用哪个群：已有的复用，缺的才建。
+                           bindings: dict[str, str],
+                           authorized=None) -> list[dict]:
+    """算出每个 agent 该用哪个群：已绑的复用，缺的才建。
 
     返回 [{pane_id, project, title, chat_id}]，chat_id 为空表示要新建。
     """
@@ -1495,12 +1528,13 @@ def plan_chat_provisioning(agents: list[dict],
         pane_id = str(agent.get("pane_id") or "")
         project = agent.get("project") or agent.get("agent") or "agent"
         marker = markers.get(pane_id, "")
-        title = chat_title_for(project, marker)
+        title = chat_title_for(project, marker,
+                              status=agent.get("status", ""))
         plan.append({
             "pane_id": pane_id,
             "project": project,
             "title": title,
-            "chat_id": find_existing_chat(existing, project, marker) or "",
+            "chat_id": find_bound_chat(bindings, pane_id, authorized) or "",
         })
     return plan
 
@@ -2493,6 +2527,8 @@ class LarkBot:
         self.seen = SeenStore()
         # 只有你和机器人的群，不该逼你每句话都 @ 一下
         self._solo_groups: dict[str, bool] = {}
+        # 群名改名节流器。启动时的群名基线在 main() 里填（要打 API）。
+        self.renamer = ChatRenamer()
         # 每个会话「当前正在跟哪个 agent 说话」。读完就设上，
         # 之后直接发文本即可继续指挥，不用每句都带序号。
         # 落盘：重启后不用重新 /read 一遍。
@@ -2835,7 +2871,7 @@ class LarkBot:
 
         if not drop:
             try:
-                self.api.set_chat_name(chat_id, CHAT_TITLE_PREFIX.rstrip(" ·· "))
+                self.api.set_chat_name(chat_id, UNBOUND_CHAT_NAME)
             except Exception as exc:
                 log.warning("reset chat name failed: %s", scrub(exc))
             self.reply_text(chat_id, "已解绑。用 /agents 重新选一个。")
@@ -2864,13 +2900,8 @@ class LarkBot:
         dry_run = arg in ("dry", "preview", "看看")
         # /spaces 3 —— 先建几个试试，别一次刷出十几个群。
         cap = int(arg) if arg.isdigit() else 0
-        try:
-            existing = self.api.list_chats()
-        except Exception as exc:
-            self.reply_text(ctx.chat_id, f"列群失败: {scrub(exc)}")
-            return
-
-        plan = plan_chat_provisioning(self.agents, existing)
+        plan = plan_chat_provisioning(
+            self.agents, self.bindings.as_dict(), self.chat_ids)
         reuse = [p for p in plan if p["chat_id"]]
         create = [p for p in plan if not p["chat_id"]]
 
@@ -3405,25 +3436,118 @@ def format_finish_message(project: str, agent: str, output: str) -> str:
 
 # --- 群与 agent 的绑定 ---
 
-# 一个群只跟一个 agent 打交道。15 个 agent 挤一个群会分不清谁是谁，
-# 完成推送也会互相刷屏。群名直接写上当前绑的是谁，会话列表里一眼可见。
-CHAT_TITLE_PREFIX = "herdr · "
+# 没绑 agent 的群叫这个：没有状态可显示，也不该顶着别人的符号。
+UNBOUND_CHAT_NAME = "herdr"
 _CHAT_TITLE_LIMIT = 60
 
 
-def chat_title_for(project: str, marker: str = "") -> str:
-    """把群名改成「herdr · [标记] <项目>」，一眼看出这个群管的是谁。
+def chat_title_for(project: str, marker: str = "", status: str = "") -> str:
+    """把群名改成「<状态符号> [标记] <项目>」，一眼看出这个群管的是谁、忙不忙。
 
-    重名 agent 必须带上标记：两个群都叫「herdr · yqg-dw-datapilot」的话，
+    曾经用统一的「herdr · 」前缀，但每个群都一样，在会话列表这种窄地方
+    纯属浪费。换成状态符号：同样的宽度，还能看出该先处理谁。
+
+    重名 agent 必须带上标记：两个群都叫「🟡 yqg-dw-datapilot」的话，
     会话列表里根本切不对。
 
     标记放在项目名**前面**：会话列表宽度有限，尾部会被截掉，放后面等于
-    看不见。项目名太长时宁可截项目名，也要保住标记。
+    看不见。项目名太长时宁可截项目名，也要保住符号和标记。
+
+    status 为空表示调用方还不知道状态，此时不带符号——塞一个假符号
+    比不带更糟。
     """
     marker = (marker or "").strip()
     head = f"{marker} " if marker else ""
-    room = _CHAT_TITLE_LIMIT - len(CHAT_TITLE_PREFIX) - len(head)
-    return CHAT_TITLE_PREFIX + head + (project or "?")[:max(1, room)]
+    glyph = f"{status_glyph(status)} " if status else ""
+    room = _CHAT_TITLE_LIMIT - len(glyph) - len(head)
+    return glyph + head + (project or "?")[:max(1, room)]
+
+
+def is_project_chat(name: str) -> bool:
+    """这个群名是不是 herdr 的项目群。
+
+    observer 靠这个过滤对账范围。原来的判据是 startswith("herdr")，
+    前缀删掉后改看状态符号；「herdr」开头仍然认，一是覆盖 /unbind 之后
+    的空闲群，二是改造期间新旧群名并存。
+    """
+    name = (name or "").lstrip()
+    if not name:
+        return False
+    if name.startswith(UNBOUND_CHAT_NAME):
+        return True
+    return any(name.startswith(g) for g in set(_STATUS_GLYPHS.values()))
+
+
+# 改名节流。实测每次改群名都会在群里留一条「XXX 修改群名为…」的系统
+# 消息，而 relay 每 2 秒推一次状态（herdr_relay.POLL_INTERVAL）——
+# 不节流的话状态抖几下就刷一屏，比原来浪费群名宽度的问题严重得多。
+RENAME_DEBOUNCE_S = 30
+# 同一群两次改名的最小间隔。兜底，防御没预料到的抖动模式。
+RENAME_MIN_INTERVAL_S = 60
+
+
+class ChatRenamer:
+    """决定「现在该不该改这个群的名字」。
+
+    决策与执行分离：decide() 是纯函数式的（now 从外面传进来，不读时钟），
+    时间和 IO 都在外层，测试不需要 mock 时钟或网络。
+
+    状态纯内存不落盘：落盘会多一份可能与飞书实际群名不一致的副本。
+    启动时用 chat_inventory() 拉一次群名当基线即可。
+    """
+
+    def __init__(self, known_names: dict[str, str] | None = None):
+        # 飞书上当前的群名。启动时拉一次当基线，之后跟着改名更新。
+        self._known: dict[str, str] = dict(known_names or {})
+        # chat_id -> (待定的目标名, 该目标名第一次出现的时刻)
+        self._pending: dict[str, tuple[str, float]] = {}
+        # chat_id -> 上次真正改名的时刻，用于最小间隔
+        self._last_rename: dict[str, float] = {}
+
+    def decide(self, chat_id: str, target_name: str,
+               status: str, now: float) -> str | None:
+        """该改成什么名字，或 None 表示按住不动。
+
+        blocked 是唯一「要人立刻动手」的状态，不等防抖也不守最小间隔——
+        等的那半分钟正是最该看见它的时候。其余状态走防抖 + 最小间隔。
+        """
+        chat_id = str(chat_id)
+        if self._known.get(chat_id) == target_name:
+            self._pending.pop(chat_id, None)
+            return None
+
+        if status == "blocked":
+            return self._commit(chat_id, target_name, now)
+
+        pending = self._pending.get(chat_id)
+        if pending is None or pending[0] != target_name:
+            # 目标名变了，防抖重新计时
+            self._pending[chat_id] = (target_name, now)
+            return None
+
+        if now - pending[1] < RENAME_DEBOUNCE_S:
+            return None
+
+        last = self._last_rename.get(chat_id)
+        if last is not None and now - last < RENAME_MIN_INTERVAL_S:
+            return None
+
+        return self._commit(chat_id, target_name, now)
+
+    def _commit(self, chat_id: str, target_name: str,
+                now: float) -> str:
+        """记下「已经改成这个名字了」，返回该改的名字。"""
+        self._known[chat_id] = target_name
+        self._last_rename[chat_id] = now
+        self._pending.pop(chat_id, None)
+        return target_name
+
+    def forget(self, chat_id: str) -> None:
+        """群解散或解绑后清掉它的状态，别占着内存。"""
+        chat_id = str(chat_id)
+        self._known.pop(chat_id, None)
+        self._pending.pop(chat_id, None)
+        self._last_rename.pop(chat_id, None)
 
 
 def chats_watching(bot: "LarkBot", pane_id: str) -> list[str]:
@@ -3467,6 +3591,42 @@ def _notify_blocked(bot: "LarkBot", msg: dict) -> None:
         bot.remember(chat_id, message_id, pane_id)
 
 
+def _sync_chat_names(bot: "LarkBot", agents: list[dict],
+                     now: float | None = None) -> None:
+    """按当前状态刷各群群名，节流器说不改就不改。
+
+    两份 agent 数据各有用处，别混：
+
+    - `agents` 是这一帧刚到的，status 最新，但 agent_update 分支里只有一个。
+    - `bot.agents` 是上一帧的全集（调用点在 bot.agents 赋值**之前**），
+      status 旧，但重名消歧需要看全集才算得出标记。
+
+    消歧只依赖 project/agent/cwd/workspace_id，不依赖 status，所以用旧全集
+    算标记是安全的；agent 集合真变了下一帧就收敛。
+
+    改名失败只记日志：群名是展示，不是功能前提（与 set_active 一致）。
+    """
+    if now is None:
+        now = time.time()
+    markers = disambiguate_suffixes(index_agents(bot.agents or agents))
+    by_pane = {str(a.get("pane_id")): a for a in agents if a.get("pane_id")}
+    for chat_id, pane_id in list(bot._active.items()):
+        agent = by_pane.get(str(pane_id))
+        if not agent:
+            continue  # 这一帧没带这个 pane 的消息，下一帧再说
+        project = agent.get("project") or agent.get("agent") or "agent"
+        status = agent.get("status", "")
+        target = chat_title_for(project, markers.get(str(pane_id), ""),
+                                status=status)
+        name = bot.renamer.decide(chat_id, target, status, now)
+        if not name:
+            continue
+        try:
+            bot.api.set_chat_name(chat_id, name)
+        except Exception as exc:
+            log.warning("rename chat failed: %s", scrub(exc))
+
+
 def _track_updates(bot: "LarkBot", updated: list[dict]) -> None:
     """维护每日统计，并在 agent 干完活时推一条通知。"""
     import time
@@ -3494,6 +3654,9 @@ def _track_updates(bot: "LarkBot", updated: list[dict]) -> None:
             # 读 pane 要走 relay 往返，不能卡住监听循环——丢到后台跑。
             asyncio.create_task(_notify_finished(bot, dict(agent)))
         bot.prev_statuses[pane_id] = new_status
+
+    # 状态可能变了，群名跟上（节流器决定这次要不要真改）
+    _sync_chat_names(bot, updated, now)
 
 
 async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
@@ -3621,6 +3784,14 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     bot = LarkBot(api, CHAT_ID, loop)
+    # 拉一次群名当节流器基线：不拉的话每次重启都要把所有群名重改一遍，
+    # 每群刷一条系统消息。开发期重启频繁，群数又会长到十几个。
+    try:
+        bot.renamer = ChatRenamer(
+            {item["chat_id"]: item.get("name", "")
+             for item in api.chat_inventory()})
+    except Exception as exc:
+        log.warning("拉取群名基线失败，降级为空基线: %s", scrub(exc))
     _start_lark_thread(bot)
     loop.run_until_complete(relay_listener(bot))
 

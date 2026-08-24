@@ -473,8 +473,39 @@ class ReportTests(unittest.TestCase):
         self.assertIn("⏎", text)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class ProjectChatDetectionTests(unittest.TestCase):
+    """哪些群参与对账。
+
+    群名前缀改成状态符号后，原来的 startswith("herdr") 会把所有项目群
+    判成无关群——漏发检测直接失效，而且是静默失效（不报错，只是什么都
+    不检查了），所以必须有测试兜着。
+    """
+
+    def test_recognizes_status_glyph_chats(self):
+        for name in ("🔴 datapilot", "🟡 datapilot",
+                     "🟢 datapilot", "⚪️ datapilot"):
+            self.assertTrue(ob.is_project_chat(name), name)
+
+    def test_recognizes_unbound_and_legacy_names(self):
+        self.assertTrue(ob.is_project_chat("herdr"))
+        self.assertTrue(ob.is_project_chat("herdr · datapilot"))
+
+    def test_rejects_unrelated_chat(self):
+        """有人把机器人拉进闲聊群，那儿的消息不该参与对账。"""
+        self.assertFalse(ob.is_project_chat("盛大宝123"))
+        self.assertFalse(ob.is_project_chat(""))
+
+    def test_glyph_table_matches_herdr_lark(self):
+        """符号表两处各一份，必须一致——不一致会静默漏掉整类群。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "lk_for_glyph_check",
+            os.path.join(os.path.dirname(__file__), "..",
+                         "relay", "herdr_lark.py"))
+        lk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lk)
+        self.assertEqual(set(ob._PROJECT_CHAT_GLYPHS),
+                         set(lk._STATUS_GLYPHS.values()))
 
 
 class BindingAwarenessTests(unittest.TestCase):
@@ -603,3 +634,7 @@ class PaneCardHasNoButtonsTests(unittest.TestCase):
             "create_time": time.time(), "sender": "app",
             "content": broken, "text": ""}, time.time())
         obs.report.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

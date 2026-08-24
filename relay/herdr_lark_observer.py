@@ -183,6 +183,30 @@ def card_is_degraded(content: dict) -> bool:
 # 与 herdr_lark.py 保持同步：那边加状态就往这里加。
 _PANE_CARD_LABELS = ("DONE", "WORKING", "IDLE", "NEEDS YOU")
 
+# herdr_lark.py 的 _STATUS_GLYPHS 的值 + UNBOUND_CHAT_NAME。
+# observer 是独立进程、不 import herdr_lark，所以这里留一份副本。
+# 与 herdr_lark.py 保持同步：那边改符号就往这里改。
+_PROJECT_CHAT_GLYPHS = ("🔴", "🟡", "🟢", "⚪️")
+_UNBOUND_CHAT_NAME = "herdr"
+
+
+def is_project_chat(name: str) -> bool:
+    """这个群是不是 herdr 的项目群。
+
+    群名以状态符号开头（herdr_lark 的 chat_title_for 生成），或者是
+    没绑 agent 的「herdr」。别的群（比如有人把机器人拉进了闲聊群）
+    里的消息不参与对账。
+
+    判错的后果是静默的：把项目群判成无关群，漏发检测什么都不查了
+    但也不报错。所以 tests 里有一条断言符号表与 herdr_lark 一致。
+    """
+    name = (name or "").lstrip()
+    if not name:
+        return False
+    if name.startswith(_UNBOUND_CHAT_NAME):
+        return True
+    return any(name.startswith(g) for g in _PROJECT_CHAT_GLYPHS)
+
 
 def card_is_output_only(content: dict) -> bool:
     """这张卡片是不是「只展示输出」的那类，本来就不该有按钮。
@@ -577,12 +601,8 @@ class Observer:
             break
 
     def _chat_covers(self, chat_name: str, chat_id: str) -> bool:
-        """这个群是不是 herdr 的项目群。
-
-        群名前缀是 herdr_lark.py 里的 CHAT_TITLE_PREFIX。别的群（比如
-        有人把机器人拉进了闲聊群）里的消息不参与对账。
-        """
-        return (chat_name or "").startswith("herdr")
+        """这个群是不是 herdr 的项目群。判据见模块级 is_project_chat。"""
+        return is_project_chat(chat_name)
 
     def _sweep_expired(self, now: float) -> None:
         """过了宽限期还没被满足的，判漏发。"""

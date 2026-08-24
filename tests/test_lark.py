@@ -1142,9 +1142,10 @@ class ChatBindingTests(unittest.TestCase):
     def test_chat_title_names_the_agent(self):
         self.assertIn("tailcale", lk.chat_title_for("tailcale"))
 
-    def test_chat_title_has_stable_prefix(self):
-        """统一前缀，一眼看出哪些群是 herdr 的。"""
-        self.assertTrue(lk.chat_title_for("x").startswith(lk.CHAT_TITLE_PREFIX))
+    def test_chat_title_leads_with_status_glyph(self):
+        """项目群靠状态符号识别，不再靠统一前缀。"""
+        self.assertTrue(
+            lk.chat_title_for("x", status="working").startswith("🟡 "))
 
     def test_chat_title_truncates_long_project(self):
         self.assertLessEqual(len(lk.chat_title_for("p" * 200)), 60)
@@ -2335,11 +2336,277 @@ class DuplicateNameTests(unittest.TestCase):
         self.assertEqual(len(set(dup)), 2)
 
 
+class StatusGlyphTests(unittest.TestCase):
+    """群名用的彩色状态符号。
+
+    卡片里用的是黑白符号（_STATUS_ICONS: ⏸ ▶ ✅ ○），群名要彩色——
+    会话列表里灰扑扑的符号扫一眼分不出轻重。两套刻意不同。
+    """
+
+    def test_four_states_map_to_colored_glyphs(self):
+        self.assertEqual(lk.status_glyph("blocked"), "🔴")
+        self.assertEqual(lk.status_glyph("working"), "🟡")
+        self.assertEqual(lk.status_glyph("done"), "🟢")
+        self.assertEqual(lk.status_glyph("idle"), "⚪️")
+
+    def test_unknown_falls_back_to_idle_glyph(self):
+        """unknown 与 idle 同色——都是「没事干」。"""
+        self.assertEqual(lk.status_glyph("unknown"), "⚪️")
+
+    def test_unrecognized_status_falls_back(self):
+        """没见过的状态不能抛异常，群名比状态准确性重要。"""
+        self.assertEqual(lk.status_glyph("wat"), "⚪️")
+        self.assertEqual(lk.status_glyph(""), "⚪️")
+
+    def test_glyphs_are_all_distinct_except_idle_unknown(self):
+        """四个符号必须互不相同，否则区分不出状态。"""
+        glyphs = {lk.status_glyph(s)
+                  for s in ("blocked", "working", "done", "idle")}
+        self.assertEqual(len(glyphs), 4)
+
+    def test_every_known_status_has_a_glyph(self):
+        """STATUS_ORDER 里的状态都得有符号，加状态时别漏。"""
+        for status in lk.STATUS_ORDER:
+            self.assertNotEqual(lk.status_glyph(status), "",
+                                f"{status} 没有符号")
+
+
+class ChatTitleStatusTests(unittest.TestCase):
+    """群名带状态符号，不再带 herdr · 前缀。
+
+    前缀每个群都一样，在会话列表这种窄地方纯属浪费；换成符号后
+    同样的宽度能表达「该先处理谁」。
+    """
+
+    def test_status_glyph_leads_the_title(self):
+        title = lk.chat_title_for("datapilot", status="blocked")
+        self.assertTrue(title.startswith("🔴 "), title)
+        self.assertIn("datapilot", title)
+
+    def test_no_herdr_prefix_anymore(self):
+        """前缀省下来的宽度是这次改动的全部意义。"""
+        self.assertNotIn("herdr", lk.chat_title_for("x", status="working"))
+
+    def test_status_omitted_means_no_glyph(self):
+        """还不知道状态的调用点不该被塞一个假符号。"""
+        self.assertEqual(lk.chat_title_for("tailcale"), "tailcale")
+
+    def test_marker_sits_between_glyph_and_project(self):
+        """标记仍在项目名前面——会话列表尾部会被截掉。"""
+        title = lk.chat_title_for("same", " [w22]", status="done")
+        self.assertTrue(title.startswith("🟢 "), title)
+        self.assertLess(title.index("w22"), title.index("same"))
+
+    def test_long_project_truncated_but_glyph_survives(self):
+        """项目名太长时宁可截项目名，也要保住符号和标记。"""
+        title = lk.chat_title_for("p" * 200, " [w22]", status="blocked")
+        self.assertLessEqual(len(title), 60)
+        self.assertTrue(title.startswith("🔴 "), title)
+        self.assertIn("w22", title)
+
+    def test_empty_project_still_produces_a_title(self):
+        title = lk.chat_title_for("", status="idle")
+        self.assertTrue(title.startswith("⚪️ "), title)
+        self.assertIn("?", title)
+
+    def test_same_project_different_status_differs(self):
+        """状态变了群名就得变，否则符号不起作用。"""
+        a = lk.chat_title_for("x", status="working")
+        b = lk.chat_title_for("x", status="done")
+        self.assertNotEqual(a, b)
+
+
+class UnboundChatNameTests(unittest.TestCase):
+    """/unbind 之后群名重置成什么。"""
+
+    def test_unbound_name_has_no_glyph(self):
+        """没绑 agent 就没有状态可显示。"""
+        self.assertEqual(lk.UNBOUND_CHAT_NAME, "herdr")
+
+    def test_old_prefix_constant_is_gone(self):
+        """CHAT_TITLE_PREFIX 的两个用途都被接管了，别留着误用。"""
+        self.assertFalse(hasattr(lk, "CHAT_TITLE_PREFIX"))
+
+
+class ProjectChatDetectionTests(unittest.TestCase):
+    """群名是不是 herdr 项目群。
+
+    observer 靠这个判定过滤对账范围（它自己有一份副本）。原来靠
+    startswith("herdr")，前缀删掉后必须换判据，否则所有项目群都被
+    判成无关群、对账全废。
+    """
+
+    def test_recognizes_all_four_status_glyphs(self):
+        for status in ("blocked", "working", "done", "idle"):
+            name = lk.chat_title_for("proj", status=status)
+            self.assertTrue(lk.is_project_chat(name), name)
+
+    def test_recognizes_unbound_chat(self):
+        """/unbind 之后的空闲群仍属项目群。"""
+        self.assertTrue(lk.is_project_chat(lk.UNBOUND_CHAT_NAME))
+
+    def test_recognizes_unbound_with_trailing_text(self):
+        """历史上的「herdr · xxx」旧群名也得认，改造期间新旧并存。"""
+        self.assertTrue(lk.is_project_chat("herdr · datapilot"))
+
+    def test_rejects_unrelated_chat(self):
+        """闲聊群不参与对账。"""
+        self.assertFalse(lk.is_project_chat("盛大宝123"))
+        self.assertFalse(lk.is_project_chat("项目讨论"))
+
+    def test_rejects_empty_name(self):
+        self.assertFalse(lk.is_project_chat(""))
+        self.assertFalse(lk.is_project_chat(None))
+
+    def test_rejects_glyph_in_the_middle(self):
+        """符号必须在开头，正文里出现不算。"""
+        self.assertFalse(lk.is_project_chat("讨论 🔴 的问题"))
+
+
+class ChatRenamerDebounceTests(unittest.TestCase):
+    """改名节流：状态稳住了才改，别刷屏。
+
+    实测每次改群名都在群里留一条「XXX 修改群名为…」的系统消息，
+    而 relay 每 2 秒推一次状态。不节流的话 working⇄idle 抖几下
+    就刷一屏系统消息，比原来浪费群名宽度的问题严重得多。
+
+    decide() 传入 now，不读时钟——测试不需要 sleep 或 mock。
+    """
+
+    def test_first_sight_waits_for_debounce(self):
+        """刚看到一个状态先不动，可能只是抖动。"""
+        r = lk.ChatRenamer()
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=0))
+
+    def test_stable_past_debounce_renames(self):
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertEqual(
+            r.decide("oc_1", "🟡 x", "working", now=31), "🟡 x")
+
+    def test_just_under_debounce_holds(self):
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=29))
+
+    def test_flapping_never_renames(self):
+        """working→idle→working 在防抖窗口内反复，全程不改名。"""
+        r = lk.ChatRenamer()
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=0))
+        self.assertIsNone(r.decide("oc_1", "⚪️ x", "idle", now=10))
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=20))
+        self.assertIsNone(r.decide("oc_1", "⚪️ x", "idle", now=25))
+
+    def test_flapping_then_settling_renames(self):
+        """抖完了稳住 30s，还是要改的。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        r.decide("oc_1", "⚪️ x", "idle", now=10)
+        self.assertEqual(
+            r.decide("oc_1", "⚪️ x", "idle", now=45), "⚪️ x")
+
+    def test_idempotent_when_name_already_correct(self):
+        """群名已经对了就不要再调 API——那会白刷一条系统消息。"""
+        r = lk.ChatRenamer(known_names={"oc_1": "🟡 x"})
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=100))
+
+    def test_renaming_updates_known_name(self):
+        """改过一次之后，同样的目标名不该再改第二次。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertEqual(r.decide("oc_1", "🟡 x", "working", now=31), "🟡 x")
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=200))
+
+    def test_chats_are_independent(self):
+        """一个群的防抖不该影响另一个群。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertIsNone(r.decide("oc_2", "🟡 y", "working", now=31))
+        self.assertEqual(r.decide("oc_1", "🟡 x", "working", now=31), "🟡 x")
+
+    def test_baseline_from_startup_avoids_pointless_rename(self):
+        """启动时拉一次群名当基线，省掉每次重启的整轮无谓改名。"""
+        r = lk.ChatRenamer(known_names={"oc_1": "🟢 x"})
+        r.decide("oc_1", "🟢 x", "done", now=0)
+        self.assertIsNone(r.decide("oc_1", "🟢 x", "done", now=999))
+
+    def test_empty_baseline_degrades_gracefully(self):
+        """拉群名失败就空基线：每群多改一次名，不阻断启动。"""
+        r = lk.ChatRenamer(known_names={})
+        r.decide("oc_1", "🟢 x", "done", now=0)
+        self.assertEqual(r.decide("oc_1", "🟢 x", "done", now=31), "🟢 x")
+
+
+class ChatRenamerBlockedAndIntervalTests(unittest.TestCase):
+    """blocked 立即改名，其余守最小间隔。
+
+    blocked 是唯一「要人立刻动手」的状态，等 30s 防抖没有意义——
+    等的这半分钟正是最该看见它的时候。
+    """
+
+    def test_blocked_renames_immediately(self):
+        r = lk.ChatRenamer()
+        self.assertEqual(
+            r.decide("oc_1", "🔴 x", "blocked", now=0), "🔴 x")
+
+    def test_blocked_beats_min_interval(self):
+        """刚改过名也照样立即改——例外优先于最小间隔。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertEqual(r.decide("oc_1", "🟡 x", "working", now=31), "🟡 x")
+        self.assertEqual(
+            r.decide("oc_1", "🔴 x", "blocked", now=32), "🔴 x")
+
+    def test_blocked_still_idempotent(self):
+        """已经是 blocked 名字了就别再改。"""
+        r = lk.ChatRenamer(known_names={"oc_1": "🔴 x"})
+        self.assertIsNone(r.decide("oc_1", "🔴 x", "blocked", now=0))
+
+    def test_leaving_blocked_uses_debounce(self):
+        """离开 blocked 走正常防抖，不必抢时间。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🔴 x", "blocked", now=0)
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=1))
+        self.assertIsNone(r.decide("oc_1", "🟡 x", "working", now=20))
+
+    def test_min_interval_holds_non_blocked(self):
+        """两次改名间隔不足 60s，非 blocked 的一律按住。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertEqual(r.decide("oc_1", "🟡 x", "working", now=31), "🟡 x")
+        r.decide("oc_1", "🟢 x", "done", now=40)
+        self.assertIsNone(r.decide("oc_1", "🟢 x", "done", now=71))
+
+    def test_rename_allowed_after_min_interval(self):
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        self.assertEqual(r.decide("oc_1", "🟡 x", "working", now=31), "🟡 x")
+        r.decide("oc_1", "🟢 x", "done", now=40)
+        self.assertEqual(r.decide("oc_1", "🟢 x", "done", now=95), "🟢 x")
+
+    def test_min_interval_is_per_chat(self):
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🟡 x", "working", now=0)
+        r.decide("oc_1", "🟡 x", "working", now=31)
+        r.decide("oc_2", "🟡 y", "working", now=32)
+        self.assertEqual(r.decide("oc_2", "🟡 y", "working", now=63), "🟡 y")
+
+    def test_forget_clears_interval_state(self):
+        """群解散后再出现的同 id，不该被旧的间隔按住。"""
+        r = lk.ChatRenamer()
+        r.decide("oc_1", "🔴 x", "blocked", now=0)
+        r.forget("oc_1")
+        self.assertEqual(
+            r.decide("oc_1", "🔴 x", "blocked", now=1), "🔴 x")
+
+
 class ChatTitleDisambiguationTests(unittest.TestCase):
     """两个群绑同名 agent 时，群名不能一模一样——会话列表里切都切不对。"""
 
     def test_plain_title_without_marker(self):
-        self.assertEqual(lk.chat_title_for("tailcale"), lk.CHAT_TITLE_PREFIX + "tailcale")
+        self.assertEqual(lk.chat_title_for("tailcale", status="idle"),
+                         "⚪️ tailcale")
 
     def test_marker_included_when_given(self):
         title = lk.chat_title_for("yqg-dw-datapilot", " [w22]")
@@ -2457,25 +2724,126 @@ class TransientReadTests(unittest.TestCase):
         self.assertFalse(lk.is_transient_read("(无输出)"))
 
 
+class SpacesReuseByBindingTests(unittest.TestCase):
+    """/spaces 靠绑定关系复用群，不靠群名。
+
+    群名带上会变的状态符号后，按名字精确匹配必然失配——agent 从
+    working 变 done、群名从 🟡 x 变 🟢 x，/spaces 就认不出这个群，
+    会给同一个 agent 重复建群。
+
+    绑定表（lark_bindings.json 的 {chat_id: pane_id}）才是事实源。
+    """
+
+    def _agent(self, pane_id, project):
+        return {"pane_id": pane_id, "project": project,
+                "agent": "claude", "status": "working"}
+
+    def test_reuses_chat_bound_to_pane(self):
+        plan = lk.plan_chat_provisioning(
+            [self._agent("w1:p1", "datapilot")],
+            bindings={"oc_a": "w1:p1"},
+            authorized={"oc_a"})
+        self.assertEqual(plan[0]["chat_id"], "oc_a")
+
+    def test_creates_when_no_binding(self):
+        plan = lk.plan_chat_provisioning(
+            [self._agent("w1:p1", "datapilot")],
+            bindings={}, authorized=set())
+        self.assertEqual(plan[0]["chat_id"], "")
+
+    def test_creates_when_bound_chat_left_authorized_set(self):
+        """群被解散了，绑定还在——得当成没群，重新建。"""
+        plan = lk.plan_chat_provisioning(
+            [self._agent("w1:p1", "datapilot")],
+            bindings={"oc_gone": "w1:p1"},
+            authorized={"oc_other"})
+        self.assertEqual(plan[0]["chat_id"], "")
+
+    def test_each_agent_gets_its_own_chat(self):
+        plan = lk.plan_chat_provisioning(
+            [self._agent("w1:p1", "a"), self._agent("w2:p1", "b")],
+            bindings={"oc_a": "w1:p1", "oc_b": "w2:p1"},
+            authorized={"oc_a", "oc_b"})
+        got = {p["pane_id"]: p["chat_id"] for p in plan}
+        self.assertEqual(got, {"w1:p1": "oc_a", "w2:p1": "oc_b"})
+
+    def test_plan_titles_carry_status_glyph(self):
+        """建群时就带上当时的状态符号。"""
+        plan = lk.plan_chat_provisioning(
+            [self._agent("w1:p1", "datapilot")],
+            bindings={}, authorized=set())
+        self.assertTrue(plan[0]["title"].startswith("🟡 "), plan[0]["title"])
+
+    def test_duplicate_projects_still_disambiguated(self):
+        """同名 agent 的标记逻辑没被破坏。"""
+        plan = lk.plan_chat_provisioning(
+            [self._agent("w1:p1", "same"), self._agent("w2:p1", "same")],
+            bindings={}, authorized=set())
+        self.assertNotEqual(plan[0]["title"], plan[1]["title"])
+
+
+class RenameOnStatusChangeTests(unittest.TestCase):
+    """状态变了就（按节流规则）改群名。"""
+
+    def _bot_with_binding(self):
+        bot = make_bot()
+        bot.chat_ids = {"oc_1"}
+        bot._active = {"oc_1": "w1:p1"}
+        bot.api.set_chat_name = unittest.mock.Mock()
+        return bot
+
+    def test_blocked_triggers_immediate_rename(self):
+        bot = self._bot_with_binding()
+        lk._sync_chat_names(
+            bot,
+            [{"pane_id": "w1:p1", "project": "datapilot",
+              "status": "blocked"}],
+            now=0)
+        bot.api.set_chat_name.assert_called_once()
+        args = bot.api.set_chat_name.call_args[0]
+        self.assertEqual(args[0], "oc_1")
+        self.assertTrue(args[1].startswith("🔴 "), args[1])
+
+    def test_working_waits_for_debounce(self):
+        bot = self._bot_with_binding()
+        agents = [{"pane_id": "w1:p1", "project": "datapilot",
+                   "status": "working"}]
+        lk._sync_chat_names(bot, agents, now=0)
+        bot.api.set_chat_name.assert_not_called()
+        lk._sync_chat_names(bot, agents, now=31)
+        bot.api.set_chat_name.assert_called_once()
+
+    def test_unbound_chat_not_renamed(self):
+        """没绑 agent 的群不该被改名。"""
+        bot = self._bot_with_binding()
+        bot._active = {}
+        lk._sync_chat_names(
+            bot,
+            [{"pane_id": "w1:p1", "project": "x", "status": "blocked"}],
+            now=0)
+        bot.api.set_chat_name.assert_not_called()
+
+    def test_rename_failure_does_not_raise(self):
+        """改名失败不能影响正事——它只是展示。"""
+        bot = self._bot_with_binding()
+        bot.api.set_chat_name.side_effect = RuntimeError("改群名失败: boom")
+        lk._sync_chat_names(
+            bot,
+            [{"pane_id": "w1:p1", "project": "x", "status": "blocked"}],
+            now=0)  # 不抛异常即通过
+
+    def test_agent_without_matching_chat_is_skipped(self):
+        bot = self._bot_with_binding()
+        lk._sync_chat_names(
+            bot,
+            [{"pane_id": "w9:p9", "project": "other",
+              "status": "blocked"}],
+            now=0)
+        bot.api.set_chat_name.assert_not_called()
+
+
 class ProvisionGroupTests(unittest.TestCase):
-    """一键为每个 agent 拉一个群；已有的复用，不重复建。"""
-
-    def test_matches_existing_by_title(self):
-        existing = {"herdr · tailcale": "oc_1"}
-        self.assertEqual(
-            lk.find_existing_chat(existing, "tailcale", ""), "oc_1")
-
-    def test_matches_with_marker(self):
-        existing = {"herdr · [w22] dup": "oc_2"}
-        self.assertEqual(lk.find_existing_chat(existing, "dup", " [w22]"), "oc_2")
-
-    def test_marker_mismatch_is_not_a_match(self):
-        """标记不同就是不同的 agent，不能复用。"""
-        existing = {"herdr · [w1B] dup": "oc_1"}
-        self.assertIsNone(lk.find_existing_chat(existing, "dup", " [w22]"))
-
-    def test_no_match_returns_none(self):
-        self.assertIsNone(lk.find_existing_chat({}, "tailcale", ""))
+    """一键为每个 agent 拉一个群；已绑的复用，不重复建。"""
 
     def test_plan_creates_for_missing_only(self):
         agents = [
@@ -2484,8 +2852,9 @@ class ProvisionGroupTests(unittest.TestCase):
             {"pane_id": "w2:p1", "project": "b", "agent": "claude",
              "status": "idle", "cwd": "/b", "host": "local"},
         ]
-        existing = {"herdr · a": "oc_a"}
-        plan = lk.plan_chat_provisioning(agents, existing)
+        bindings = {"oc_a": "w1:p1"}
+        authorized = {"oc_a"}
+        plan = lk.plan_chat_provisioning(agents, bindings, authorized)
         reuse = [p for p in plan if p["chat_id"]]
         create = [p for p in plan if not p["chat_id"]]
         self.assertEqual(len(reuse), 1)
@@ -2493,12 +2862,12 @@ class ProvisionGroupTests(unittest.TestCase):
         self.assertEqual(create[0]["project"], "b")
 
     def test_plan_includes_marker_for_duplicates(self):
-        plan = lk.plan_chat_provisioning(dup_agents(), {})
+        plan = lk.plan_chat_provisioning(dup_agents(), {}, set())
         titles = [p["title"] for p in plan if p["project"] == "yqg-dw-datapilot"]
         self.assertEqual(len(set(titles)), 2)
 
     def test_plan_covers_every_agent(self):
-        plan = lk.plan_chat_provisioning(dup_agents(), {})
+        plan = lk.plan_chat_provisioning(dup_agents(), {}, set())
         self.assertEqual(len(plan), len(dup_agents()))
 
 
@@ -3902,8 +4271,6 @@ class ManifestHintCoverageTests(unittest.TestCase):
                 self.assertEqual(groups[0]["options"], ["甲", "乙"], nav)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class SuggestCommandTests(unittest.TestCase):
@@ -4146,3 +4513,7 @@ class AgentsOverviewTests(unittest.TestCase):
                 self.assertEqual(
                     lk.match_agent(self.bot.agents, str(position))["pane_id"],
                     agent["pane_id"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
