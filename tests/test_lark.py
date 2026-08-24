@@ -3850,6 +3850,145 @@ class TypedDigitPushesNextGroupTests(unittest.TestCase):
         push.assert_not_awaited()
 
 
+class UnansweredGroupsOnReviewTests(unittest.TestCase):
+    """Review 页上还有未答的组时，要 Tab 切过去，不能就这么放弃。
+
+    真机复现（用户："第一组之后就卡了"）：AskUserQuestion 问两组，答完
+    第一组后 Claude Code 不会自动切到第二组，而是停在 Review 页：
+
+        ←  ☒ 第一组  ☐ 第二组  ✔ Submit  →
+        Review your answers
+        ⚠ You have not answered all questions
+         ● 第一组：选择一个选项？  → A1
+        ❯ 1. Submit answers    2. Cancel
+
+    _push_next_group 遇到 Review 页直接 return（注释说「Tab 之后停在
+    Review 页很正常」），于是群里什么都不出现——就是"卡了"。
+
+    但这个 Review 页明明写着「未答完」，tab 栏里 ☐ 第二组 还空着。这时
+    该做的是发 Tab 切到未答那组，而不是当成已完成。
+    """
+
+    REVIEW_WITH_UNANSWERED = (
+        "←  ☒ 第一组  ☐ 第二组  ✔ Submit  →\n"
+        "Review your answers\n"
+        "⚠ You have not answered all questions\n"
+        " ● 第一组：选择一个选项？\n"
+        "   → A1\n"
+        "Ready to submit your answers?\n"
+        "❯ 1. Submit answers\n"
+        "  2. Cancel")
+
+    REVIEW_ALL_ANSWERED = (
+        "←  ☒ 第一组  ☒ 第二组  ✔ Submit  →\n"
+        "Review your answers\n"
+        " ● 第一组：选择一个选项？\n"
+        "   → A1\n"
+        " ● 第二组：选择一个选项？\n"
+        "   → B2\n"
+        "Ready to submit your answers?\n"
+        "❯ 1. Submit answers\n"
+        "  2. Cancel")
+
+    def test_counts_unanswered_tabs(self):
+        self.assertEqual(lk.unanswered_tab_count(self.REVIEW_WITH_UNANSWERED), 1)
+
+    def test_all_answered_counts_zero(self):
+        self.assertEqual(lk.unanswered_tab_count(self.REVIEW_ALL_ANSWERED), 0)
+
+    def test_no_tab_bar_counts_zero(self):
+        """单组问题没有 tab 栏，别凭空判出未答组。"""
+        self.assertEqual(lk.unanswered_tab_count("选一个？\n  1. 甲\n  2. 乙"), 0)
+
+    def test_warning_text_also_signals_unanswered(self):
+        """tab 栏被裁掉时，靠 Claude 自己的警告文案兜底。"""
+        self.assertTrue(lk.review_has_unanswered(
+            "Review your answers\n⚠ You have not answered all questions"))
+
+    def test_all_answered_review_has_no_unanswered(self):
+        self.assertFalse(lk.review_has_unanswered(self.REVIEW_ALL_ANSWERED))
+
+    def test_review_page_is_still_detected(self):
+        """不能因为加了这个就把 Review 页本身认错。"""
+        self.assertTrue(lk.is_review_page(self.REVIEW_WITH_UNANSWERED))
+        self.assertTrue(lk.is_review_page(self.REVIEW_ALL_ANSWERED))
+
+
+class PushNextGroupTabsToUnansweredTests(unittest.TestCase):
+    """_push_next_group 在 Review 页遇到未答组时，发 Tab 再读一次。"""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1)
+        self.pane = lk.index_agents(self.bot.agents)[0]["pane_id"]
+        self.bot.set_active("oc_1", self.pane, "project0")
+        self.cards = []
+        self.bot.reply_card = lambda chat_id, card: (
+            self.cards.append(card) or "om_x")
+
+    def _run(self, screens):
+        """screens 依次作为 read_pane 的返回值。"""
+        reads = unittest.mock.AsyncMock(side_effect=screens)
+        keys = unittest.mock.AsyncMock()
+        with unittest.mock.patch.object(lk, "read_pane", new=reads), \
+             unittest.mock.patch.object(lk, "send_keys_to_relay", new=keys):
+            asyncio.run(self.bot._push_next_group("oc_1", self.pane))
+        return keys
+
+    def test_tabs_when_review_has_unanswered(self):
+        """核心：未答完就发 Tab，别放弃。"""
+        keys = self._run([
+            UnansweredGroupsOnReviewTests.REVIEW_WITH_UNANSWERED,
+            "第二组：选择一个选项？\n  1. B1\n  2. B2\n  3. B3\n"
+            "Enter to select · Esc to cancel",
+        ])
+        keys.assert_awaited()
+        # Left 而不是 Tab：tab 栏两端的 ← → 就是提示用左右键切组。真机实测
+        # Tab 停在 Review 页不动，Left 立刻切到未答的那组。
+        self.assertEqual(keys.await_args[0][1], ["Left"])
+
+    def test_pushes_the_next_group_after_tab(self):
+        """Tab 之后读到第二组，就要把它推成卡片。"""
+        self._run([
+            UnansweredGroupsOnReviewTests.REVIEW_WITH_UNANSWERED,
+            "第二组：选择一个选项？\n  1. B1\n  2. B2\n  3. B3\n"
+            "Enter to select · Esc to cancel",
+        ])
+        self.assertEqual(len(self.cards), 1)
+        body = json.dumps(self.cards[0], ensure_ascii=False)
+        self.assertIn("B1", body)
+        self.assertIn("第二组", body)
+
+    def test_no_tab_when_all_answered(self):
+        """全答完了就别乱按 Tab——那会把 Review 页翻走。"""
+        keys = self._run([UnansweredGroupsOnReviewTests.REVIEW_ALL_ANSWERED])
+        keys.assert_not_awaited()
+        self.assertEqual(self.cards, [])
+
+    def test_never_pushes_the_review_page_itself(self):
+        """回归防线：Submit answers / Cancel 绝不能被推成选项卡。"""
+        self._run([UnansweredGroupsOnReviewTests.REVIEW_ALL_ANSWERED])
+        self.assertEqual(self.cards, [])
+
+    def test_gives_up_when_key_lands_nowhere(self):
+        """切换键按下后仍是 Review 页就停手，别无限按下去。"""
+        keys = self._run([
+            UnansweredGroupsOnReviewTests.REVIEW_WITH_UNANSWERED,
+            UnansweredGroupsOnReviewTests.REVIEW_WITH_UNANSWERED,
+        ])
+        self.assertEqual(keys.await_count, 1)
+        self.assertEqual(self.cards, [])
+
+    def test_normal_next_group_unaffected(self):
+        """主路径：直接读到下一组时不该发 Tab。"""
+        keys = self._run([
+            "第二组：选择一个选项？\n  1. B1\n  2. B2\n  3. B3\n"
+            "Enter to select · Esc to cancel",
+        ])
+        keys.assert_not_awaited()
+        self.assertEqual(len(self.cards), 1)
+
+
 class OptionNumberAlignmentTests(unittest.TestCase):
     """卡片上的序号必须和屏幕上的编号一致，否则点了等于乱答。
 

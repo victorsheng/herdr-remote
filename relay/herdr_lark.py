@@ -1946,6 +1946,36 @@ def is_review_page(text: str) -> bool:
                               for o in group["options"]))
 
 
+# 顶部 tab 栏：`←  ☒ 第一组  ☐ 第二组  ✔ Submit  →`
+# ☒ 是已答，☐ 是未答。Submit 那项不算组。
+_TAB_BAR_RE = re.compile(r"[←→].*[☐☒]")
+# Claude 自己的未答警告。tab 栏被裁掉时靠它兜底。
+_UNANSWERED_WARN_RE = re.compile(
+    r"not answered all|未回答|还有.*未答", re.I)
+
+
+def unanswered_tab_count(text: str) -> int:
+    """tab 栏里还有几组没答（☐ 的个数）。没有 tab 栏就是 0。
+
+    单组问题不渲染 tab 栏，别凭空判出未答组——那会让 _push_next_group
+    对着单组问题乱按 Tab。
+    """
+    for line in (text or "").splitlines():
+        if _TAB_BAR_RE.search(line):
+            return line.count("☐")
+    return 0
+
+
+def review_has_unanswered(text: str) -> bool:
+    """这个 Review 页上还有没答完的组吗。
+
+    两个判据都要：tab 栏数 ☐ 最准，但它可能被窄屏裁掉，那时认 Claude
+    自己打出的「You have not answered all questions」。
+    """
+    body = text or ""
+    return unanswered_tab_count(body) > 0 or bool(_UNANSWERED_WARN_RE.search(body))
+
+
 def approval_keys(key: str, *, multiselect: bool) -> list[str]:
     """点一个选项按钮要发的按键序列。
 
@@ -3504,10 +3534,33 @@ class LarkBot:
             return
         content = clean_pane(raw)
         if is_review_page(content):
-            # Tab 之后停在 Review 页很正常，它不是「下一组问题」。推成卡片
-            # 的话人会看到一张「1. Submit answers / 2. Cancel」，点下去等于
-            # 替 agent 乱答。
-            return
+            # Review 页本身绝不能推成卡片：人会看到「1. Submit answers /
+            # 2. Cancel」，点下去等于替 agent 乱答。
+            #
+            # 但停在 Review 页**不等于**答完了。实测（用户报「第一组之后就
+            # 卡了」）：两组问题答完第一组后，Claude Code 不会自动切到第二
+            # 组，而是停在 Review 页并打出「You have not answered all
+            # questions」，tab 栏里 ☐ 第二组 还空着。原先这里直接 return，
+            # 群里就再没动静——看着就是卡住了。
+            #
+            # 有未答组就切过去，再读一次。用 Left 而不是 Tab——tab 栏
+            # 两端的 `←  ☒ 第一组  ☐ 第二组  ✔ Submit  →` 就是提示用左右
+            # 键切组，而 Review 页的焦点停在最右的 Submit 上，往左才回到
+            # 未答那组。真机实测：Tab 按下去屏幕不动，Left 立刻切过去。
+            # 只试一次：按完仍是 Review 页就停手，免得无限按下去。
+            if not review_has_unanswered(content):
+                return
+            try:
+                await send_keys_to_relay(pane_id, ["Left"])
+                raw = await read_pane(pane_id)
+            except Exception as exc:
+                log.warning("next-group tab failed: %s", scrub(exc))
+                return
+            if is_pane_read_error(raw):
+                return
+            content = clean_pane(raw)
+            if is_review_page(content):
+                return
         groups = detect_option_groups(content)
         current = current_option_group(groups)
         if not current:
