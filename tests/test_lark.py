@@ -3850,6 +3850,93 @@ class TypedDigitPushesNextGroupTests(unittest.TestCase):
         push.assert_not_awaited()
 
 
+class OptionNumberAlignmentTests(unittest.TestCase):
+    """卡片上的序号必须和屏幕上的编号一致，否则点了等于乱答。
+
+    真实故障：_parse_groups 的连续性校验「不强求从 1 起」——屏幕滚动把首项
+    卷出去时只剩 `2. / 3.`，那组仍被接受。但 options 是个列表，下标 0 存的
+    是屏幕上的 2 号，而按钮发的是下标+1 也就是 1：
+
+        屏幕：2. 新增一层抽象   3. 先写测试
+        卡片：1. 新增一层抽象   2. 先写测试   ← 序号全错
+        点「1」→ 发数字 1 → 终端选中的是屏幕 1 号（另一个选项）
+
+    「不强求从 1 起」这个放宽本身是对的（强求会整组丢掉，人一个都点不到），
+    错在没把**真实编号**带下去。修法是记住每项的屏幕编号，按钮发那个数字。
+    """
+
+    SCROLLED = ("选哪个方案？\n"
+                "  2. 新增一层抽象\n"
+                "  3. 先写测试\n"
+                "  4. Type something.\n"
+                "  5. Chat about this\n"
+                "Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+    NORMAL = ("选哪个方案？\n"
+              "  1. 直接改现有函数\n"
+              "  2. 新增一层抽象\n"
+              "  3. 先写测试\n"
+              "Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+    @staticmethod
+    def _keys(card):
+        return [a["value"].get("k") for el in card.get("elements", [])
+                for a in (el.get("actions") or [])
+                if a.get("value", {}).get("a") == lk.ACTION_CODES["approval"]]
+
+    @staticmethod
+    def _labels(card):
+        return [a["text"]["content"] for el in card.get("elements", [])
+                for a in (el.get("actions") or [])
+                if a.get("value", {}).get("a") == lk.ACTION_CODES["approval"]]
+
+    def _group(self, text):
+        return lk.current_option_group(lk.detect_option_groups(text))
+
+    def test_normal_case_unchanged(self):
+        """主路径：编号从 1 起时一切照旧。"""
+        g = self._group(self.NORMAL)
+        self.assertEqual(g["numbers"], [1, 2, 3])
+
+    def test_scrolled_group_keeps_screen_numbers(self):
+        """首项被卷出去时，要记住这两项在屏幕上是 2 和 3。"""
+        self.assertEqual(self._group(self.SCROLLED)["numbers"], [2, 3])
+
+    def test_scrolled_card_buttons_send_screen_numbers(self):
+        """按钮发的键必须是屏幕编号，不是列表下标+1。"""
+        g = self._group(self.SCROLLED)
+        card = lk.build_option_card("w1:p1", "p", g["options"], "abcde",
+                                    question=g["question"], numbers=g["numbers"])
+        self.assertEqual(self._keys(card), ["2", "3"])
+
+    def test_scrolled_card_labels_show_screen_numbers(self):
+        """按钮上显示的数字也要跟屏幕一致，否则人对不上。"""
+        g = self._group(self.SCROLLED)
+        card = lk.build_option_card("w1:p1", "p", g["options"], "abcde",
+                                    question=g["question"], numbers=g["numbers"])
+        self.assertEqual(self._labels(card), ["2", "3"])
+
+    def test_body_list_shows_screen_numbers(self):
+        """正文里的编号同样得是屏幕编号。"""
+        g = self._group(self.SCROLLED)
+        card = lk.build_option_card("w1:p1", "p", g["options"], "abcde",
+                                    question=g["question"], numbers=g["numbers"])
+        body = json.dumps(card, ensure_ascii=False)
+        self.assertIn("**2.** 新增一层抽象", body)
+        self.assertIn("**3.** 先写测试", body)
+
+    def test_numbers_default_to_sequential(self):
+        """不传 numbers 时按 1..n（旧调用方不受影响）。"""
+        card = lk.build_option_card("w1:p1", "p", ["甲", "乙"], "abcde")
+        self.assertEqual(self._keys(card), ["1", "2"])
+
+    def test_blocked_card_passes_numbers_through(self):
+        """端到端：build_blocked_card 也得把屏幕编号带下去。"""
+        card = lk.build_blocked_card("w1:p1", "claude", "p",
+                                     self.SCROLLED, None, "abcde")
+        self.assertEqual(self._keys(card), ["2", "3"])
+
+
 class LongMessageSplitTests(unittest.TestCase):
     """超过 1000 字的消息要分段发，不能静默丢掉。
 

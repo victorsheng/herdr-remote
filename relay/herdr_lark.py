@@ -729,8 +729,13 @@ def build_option_card(
     agent: str = "",
     multiselect: bool = False,
     checked: list[bool] | None = None,
+    numbers: list[int] | None = None,
 ) -> dict:
     """「正等你选」的唯一一张卡片。
+
+    numbers 是各选项在**屏幕上**的编号。不传就按 1..n（旧调用方）。
+    传了就必须用它渲染和发键——屏幕滚动后编号可能从 2 起，用下标+1 会
+    让人点错。
 
     两种来源同一个样子：relay 推的 blocked（带 prompt 和 agent 名），和读
     pane 时顺手发现的下一组（带 question）。以前是两个 build 函数各带一份
@@ -755,11 +760,15 @@ def build_option_card(
     # （单选补了才提交，多选补了就把没勾完的答案交出去），而卡片是什么形态
     # 在这里就已经确定，编进 value 比事后读屏判断可靠。
     flag = {"m": 1} if multiselect else {}
+    # 屏幕上的真实编号。shown 可能被 _MAX_OPTIONS 截过，所以按 shown 对齐。
+    labels = [str(n) for n in (numbers or [])][:len(shown)]
+    if len(labels) < len(shown):
+        labels = [str(i + 1) for i in range(len(shown))]
     # 按钮只放序号：选项全文在正文里列着，按钮再重复一遍就会在手机上折成
     # 好几行，一排选项堆起来没法扫。
     actions = [
-        _button(str(i + 1), action_value(
-            "approval", pane_id, g=generation, k=str(i + 1), **flag), styles[i])
+        _button(labels[i], action_value(
+            "approval", pane_id, g=generation, k=labels[i], **flag), styles[i])
         for i, _ in enumerate(shown)
     ]
 
@@ -775,7 +784,7 @@ def build_option_card(
     # 选项清单。多选的勾选态也在这儿——按钮只剩序号，放不下标记了。
     elements.append({"tag": "div", "text": {
         "tag": "lark_md",
-        "content": "\n".join(f"**{i + 1}.** {marks[i]}{option_label(opt)}"
+        "content": "\n".join(f"**{labels[i]}.** {marks[i]}{option_label(opt)}"
                              for i, opt in enumerate(shown)),
     }})
     elements.append({"tag": "action", "actions": actions})
@@ -841,6 +850,7 @@ def build_blocked_card(
                              prompt=body or " ", agent=agent or "agent",
                              question=group["question"] if group else "",
                              multiselect=multiselect,
+                             numbers=group.get("numbers") if group else None,
                              checked=checked_flags(prompt or "") if multiselect else None)
 
 
@@ -2192,12 +2202,17 @@ def _parse_groups(lines: list[str], start: int, end: int,
                 # 先按屏幕编号校验连续性，再摘掉固定尾项：尾项也占编号，
                 # 提前摘掉会让 4/5 缺位，整组被连续性校验丢掉。
                 # 尾项恒在末尾，摘掉后剩下的仍是 1..n，按钮发的数字依旧对得上屏幕。
-                kept = [t if keep_markers else strip_checkbox(t)
-                        for _, t in current if not is_tui_tail_option(t)]
-                if len(kept) >= 2:
+                pairs = [(n, t if keep_markers else strip_checkbox(t))
+                         for n, t in current if not is_tui_tail_option(t)]
+                if len(pairs) >= 2:
+                    pairs = pairs[:_MAX_OPTIONS]
                     groups.append({
                         "question": question.strip(),
-                        "options": kept[:_MAX_OPTIONS],
+                        "options": [t for _, t in pairs],
+                        # 屏幕上的真实编号。不能用列表下标+1：屏幕滚动把首项
+                        # 卷出去时只剩 2./3.，下标+1 会渲染成 1./2.，按钮发的
+                        # 数字就跟屏幕错开一位——点了等于答另一个选项。
+                        "numbers": [n for n, _ in pairs],
                     })
         current = []
         question = ""

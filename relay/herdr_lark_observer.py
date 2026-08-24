@@ -248,6 +248,28 @@ def check_option_card(content: dict) -> list[dict]:
             "detail": (f"正文列了 {len(pairs)} 个选项，却只有 {len(numeric)} 个"
                        f"数字按钮——有答案点不到"),
         })
+
+    # 序号必须连续递增。不强求从 1 起——屏幕滚动会把首项卷出去，只剩 2./3.
+    # 是正常的（herdr_lark 会把屏幕编号带下来）。跳号或颠倒才是问题：说明
+    # 有选项被丢掉或渲染顺序乱了，人点不到或点错。
+    body_nums = [int(n) for n, _ in pairs]
+    if body_nums != list(range(body_nums[0], body_nums[0] + len(body_nums))):
+        problems.append({
+            "rule": "option_number_gap",
+            "detail": (f"正文序号不是连续递增：{body_nums}——有选项被丢掉"
+                       f"或顺序乱了"),
+        })
+
+    # 正文序号与按钮序号必须逐个相等。这是那个错位的直接特征：正文 2./3.
+    # 而按钮 1./2.，卡片上看不出异常（1./2. 本身很正常），只有两边对比才
+    # 发现得了——点「1」实际答的是屏幕 1 号，另一个选项。
+    btn_nums = [int(b) for b in numeric]
+    if btn_nums and len(btn_nums) == len(body_nums) and btn_nums != body_nums:
+        problems.append({
+            "rule": "option_number_mismatch",
+            "detail": (f"正文序号 {body_nums} 与按钮序号 {btn_nums} 不一致"
+                       f"——点下去答的是别的选项"),
+        })
     return problems
 
 

@@ -225,6 +225,78 @@ class OptionCardIntegrityTests(unittest.TestCase):
         self.assertNotIn("option_text_polluted", self._rules(card))
 
 
+class OptionNumberOrderTests(unittest.TestCase):
+    """选项序号必须连续递增，且和按钮一一对应，否则点了等于乱答。
+
+    真实故障：_parse_groups 的连续性校验「不强求从 1 起」，屏幕滚动把首项
+    卷出去时只剩 2./3.，而卡片按列表下标+1 渲染成 1./2.——序号跟屏幕错开
+    一位，点「1」实际答的是屏幕 1 号（另一个选项）。
+
+    这条规则是事后防线：修完 lark 侧还要盯着，因为错位在卡片上看不出异常
+    （1./2./3. 本身很正常），只有跟按钮对比、看是否跳号才发现得了。
+    """
+
+    @staticmethod
+    def _card(body_nums, button_nums):
+        cells = []
+        for n in body_nums:
+            cells.append({"tag": "text", "text": f"{n}."})
+            cells.append({"tag": "text", "text": f" 选项{n}\n"})
+        return {"elements": [
+            cells,
+            [{"tag": "button", "text": str(n)} for n in button_nums],
+        ]}
+
+    def _rules(self, card):
+        return {p["rule"] for p in ob.check_option_card(card)}
+
+    def test_aligned_card_is_clean(self):
+        """主路径：序号和按钮一致就不该报。"""
+        self.assertEqual(ob.check_option_card(self._card([1, 2, 3], [1, 2, 3])), [])
+
+    def test_body_and_buttons_disagree_is_reported(self):
+        """正文写 2./3.，按钮却是 1./2.——正是那个错位。"""
+        rules = self._rules(self._card([2, 3], [1, 2]))
+        self.assertIn("option_number_mismatch", rules)
+
+    def test_mismatch_detail_shows_both_sides(self):
+        problems = [p for p in ob.check_option_card(self._card([2, 3], [1, 2]))
+                    if p["rule"] == "option_number_mismatch"]
+        self.assertTrue(problems)
+        detail = problems[0]["detail"]
+        self.assertIn("2", detail)
+        self.assertIn("1", detail)
+
+    def test_non_sequential_body_is_reported(self):
+        """正文里跳号：1. 3. 4. —— 中间那项丢了，人点不到。"""
+        self.assertIn("option_number_gap",
+                      self._rules(self._card([1, 3, 4], [1, 3, 4])))
+
+    def test_out_of_order_body_is_reported(self):
+        """顺序颠倒：2. 1. 3. —— 渲染顺序乱了。"""
+        self.assertIn("option_number_gap",
+                      self._rules(self._card([2, 1, 3], [2, 1, 3])))
+
+    def test_starting_from_two_is_allowed_when_buttons_agree(self):
+        """屏幕滚动导致从 2 起是**正常**的，只要按钮跟着一起从 2 起。
+
+        这是修复后的正确形态，绝不能报——否则每次滚动都刷一条假警报。
+        """
+        self.assertEqual(ob.check_option_card(self._card([2, 3], [2, 3])), [])
+
+    def test_degraded_card_is_skipped(self):
+        degraded = {"elements": [[{"tag": "text",
+                                   "text": "请升级至最新版本客户端，以查看内容"}]]}
+        self.assertEqual(ob.check_option_card(degraded), [])
+
+    def test_card_without_buttons_only_checks_body(self):
+        """没有数字按钮时只校验正文本身的连续性，不报 mismatch。"""
+        card = {"elements": [[
+            {"tag": "text", "text": "1."}, {"tag": "text", "text": " 甲\n"},
+            {"tag": "text", "text": "2."}, {"tag": "text", "text": " 乙"}]]}
+        self.assertNotIn("option_number_mismatch", self._rules(card))
+
+
 class OptionCardCheckWiringTests(unittest.TestCase):
     """校验函数必须真的接进 _check_message，光有函数等于没加。"""
 
