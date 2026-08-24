@@ -76,6 +76,7 @@ ACTION_CODES = {
     "approval": "k",
     "submit": "u",
     "page": "g",
+    "agent_menu": "m",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
 
@@ -831,6 +832,45 @@ def build_agent_picker_card(
     }
 
 
+def build_agent_actions_card(agent: dict) -> dict:
+    """选中一个 agent 后能做什么，全部摊成按钮。
+
+    /agents 原来只回纯文本，看完还得手打「/read 1」——手机上打字是最累的
+    一步，序号设计本就是为了省事，更省事的是根本不打。
+
+    按钮按状态给，不是一律全给：空闲的 agent 没什么可中断，没卡住就没有
+    可批的东西。判断口径与 agents_for_action 保持一致，免得卡片上有按钮、
+    点下去却被「无可用 agent」拒掉。
+    """
+    pane_id = agent.get("pane_id") or ""
+    project = agent.get("project") or agent.get("agent") or "agent"
+    status = agent.get("status") or "unknown"
+
+    actions = [
+        _button("看进展", action_value("read", pane_id), "primary"),
+        _button("发指令", action_value("select_send", pane_id)),
+    ]
+    if status in ("working", "blocked"):
+        actions.append(_button("中断", action_value("interrupt", pane_id), "danger"))
+    if status == "blocked":
+        # 放在中断之后：最显眼的位置不该是「总是允许」。
+        actions.append(_button("批准并总是允许", action_value("trust", pane_id)))
+
+    icon = _STATUS_ICONS.get(status, "○")
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": _STATUS_HEADERS.get(status, "grey"),
+            "title": {"tag": "plain_text", "content": f"{icon} {project}"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": f"`{agent.get('agent', '')}` · {status}"}},
+            {"tag": "action", "actions": actions},
+        ],
+    }
+
+
 # --- 飞书事件解析 ---
 
 @dataclass
@@ -959,8 +999,8 @@ def parse_chat_ids(value: str) -> set[str]:
 def parse_chat_list(value) -> list[str]:
     """同上，但保留配置里的顺序并去重。
 
-    顺序有意义：第一个是主群，未绑定的通知回落到它。用 set 的话主群就成了
-    字典序偶然排在前面的那个，通知会落到一个你没预期的群里。
+    顺序本身不再有语义（主群回落已去掉），保留它只为让日志和 /health 的
+    输出跟配置对得上——排查时能照着配置逐条比。
     """
     if not isinstance(value, str):
         value = ",".join(value or [])
@@ -2085,6 +2125,36 @@ def parse_command(text: str) -> tuple[str | None, str]:
     return head, rest.strip()
 
 
+# 打错命令时的建议阈值。0.6 是 difflib 的惯例默认值：再低会开始把
+# 无关的词硬认成命令，反而更迷惑人。
+_SUGGEST_CUTOFF = 0.6
+
+
+def suggest_command(text: str) -> str | None:
+    """把形似命令的错拼映射到最接近的真命令；猜不出就返回 None。
+
+    存在的理由不是便利，而是安全：parse_command 对不认识的命令一律降级成
+    自由文本，于是「/raed 3」会被原样粘进终端当指令发给 agent。这里先把
+    这类输入拦下来问一句。
+
+    只处理以 / 开头的单词。自由文本必须放过——那才是指挥 agent 的正道。
+    """
+    import difflib
+
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return None
+    head = stripped[1:].partition(" ")[0].split("@", 1)[0].lower()
+    if not head or head in COMMANDS:
+        return None
+    # 路径不是打错的命令：/Users/... 这种一眼可分，别去猜。
+    if "/" in head or "." in head:
+        return None
+    matches = difflib.get_close_matches(head, sorted(COMMANDS), n=1,
+                                        cutoff=_SUGGEST_CUTOFF)
+    return matches[0] if matches else None
+
+
 def match_agent(agents: list[dict], query: str) -> dict | None:
     """按序号或名字选 agent。
 
@@ -2407,18 +2477,12 @@ class LarkBot:
         self.api = api
         # 支持多群：每个群绑一个 agent，互不干扰。
         # 环境变量是种子，/spaces 建的群会落盘，重启后不丢。
-        env_order = parse_chat_list(chat_id)
-        env_chats = set(env_order)
+        env_chats = set(parse_chat_list(chat_id))
         self.chat_store = ChatIdStore()
         self.chat_store.seed(env_chats)
         self.chat_ids = self.chat_store.all() or env_chats
-        # 主群 = 配置里的第一个。未绑定的通知回落到它，而不是广播给全部群：
-        # /spaces 建过十几个群后，广播意味着一条通知响十几次。
-        self.primary_chat = next(
-            (c for c in env_order if c in self.chat_ids),
-            next(iter(sorted(self.chat_ids)), ""))
-        # 单值形式仍保留，供只需要「默认群」的地方用。
-        self.chat_id = self.primary_chat
+        # 没有「主群」这个概念：通知只发显式绑过的群（见 chats_watching）。
+        # 曾经有过主群回落，但主群自己也会被某个 pane 绑走，无主通知因此串群。
         self.loop = loop
         self.agents: list[dict] = []
         self.relay_connected = False
@@ -2592,7 +2656,17 @@ class LarkBot:
                 ctx.chat_id, f"{self._dashboard_text()}\n\n{format_help()}")
             return
         if command == "agents":
+            # 文本列表 + 卡片都发，两条路都留着：
+            #   - 列表带序号，能扫全局状态，也支撑 /read 3 这种直达；
+            #   - 卡片能点，省掉手机上打字那一步。
+            # 序号只能来自 format_agent_list（用 index_agents），不能按卡片
+            # 按钮的位置标——picker 用 sorted_agents，两者顺序不一定相同。
             self.reply_text(ctx.chat_id, format_agent_list(self.agents))
+            if not self.agents:
+                return  # 空卡片只是个空壳。
+            self.reply_card(ctx.chat_id, build_agent_picker_card(
+                "agent_menu", self.agents,
+                title=f"点一个直接操作（共 {len(self.agents)} 个）"))
             return
         if command == "status":
             state = "Connected" if self.relay_connected else "Disconnected"
@@ -2993,6 +3067,19 @@ class LarkBot:
         """自由文本直接发给当前 agent——这是「看完接着指挥」的闭环。"""
         if not text:
             return
+
+        # 形似命令的错拼在这里拦住。不拦的话 parse_command 已经把它降级成
+        # 自由文本，接下来会被原样粘进终端——实际发生过：「/raed 3」进了
+        # pane。猜不出来的照旧放行，免得挡住正常指挥。
+        typo = suggest_command(text)
+        if typo:
+            self.reply_text(
+                ctx.chat_id,
+                f"没有 /{text.strip()[1:].partition(' ')[0]} 这个命令，"
+                f"你是不是想用 **/{typo}**？\n"
+                f"确认要把这行原样发给 agent 的话，去掉开头的 / 再发一次。",
+            )
+            return
         pane_id = self.active_pane(ctx.chat_id)
         if pane_id is None:
             staged = self.staged_pane(ctx.chat_id)
@@ -3060,7 +3147,10 @@ class LarkBot:
             return
         agent = find_agent(self.agents, pane_id) or {"pane_id": pane_id, "project": pane_id}
 
-        if action == "read":
+        if action == "agent_menu":
+            # 列表上点一个 agent：摊开它能做的事，省掉手打命令那一步。
+            self.reply_card(ctx.chat_id, build_agent_actions_card(agent))
+        elif action == "read":
             await self._send_pane_content(ctx.chat_id, agent)
         elif action == "select_reply":
             await self._send_pane_content(ctx.chat_id, agent, prompt=True)
@@ -3337,38 +3427,21 @@ def chat_title_for(project: str, marker: str = "") -> str:
 
 
 def chats_watching(bot: "LarkBot", pane_id: str) -> list[str]:
-    """哪些群该收到这个 pane 的通知。
+    """哪些群该收到这个 pane 的通知。只有显式绑过的群，没有回落。
 
-    绑定了就发给绑定的群；一个都没绑时回落到全部授权群，
-    否则通知会悄无声息地丢掉。
+    曾经有过「一个群都没绑就回落到主群」的设计，理由是通知不能丢。但主群
+    不是中立的收件箱——它自己也会被某个 pane 绑走，于是无主通知就串了群：
+    datapilot6（w1R:p1）没绑任何群，它的进展被倒进了「herdr · herdr-remote」
+    群（那个群绑的是 w2B:p1），看的人会以为那是 herdr-remote 的输出。
+
+    串群比丢通知更糟：丢了你还知道要去查，串了你会读到错的东西。没绑的
+    agent 用 /agents 主动看。
     """
-    bound = bound_chats(bot, pane_id)
-    if bound:
-        return bound
-    return fallback_chats(bot)
-
-
-def fallback_chats(bot: "LarkBot") -> list[str]:
-    """没有任何群绑这个 pane 时，通知该落在哪。
-
-    只落主群，不广播：/spaces 建过十几个群后，广播意味着一条通知在十几个
-    群里同时响。通知不能丢，但也没必要人人都收到。
-
-    主群不在授权列表里（被 /unbind drop 掉了）就退回授权列表的第一个；
-    一个群都没有就返回空——没有可发的地方，硬发只会报错。
-    """
-    primary = getattr(bot, "primary_chat", "") or ""
-    if primary in bot.chat_ids:
-        return [primary]
-    return sorted(bot.chat_ids)[:1]
+    return bound_chats(bot, pane_id)
 
 
 def bound_chats(bot: "LarkBot", pane_id: str) -> list[str]:
-    """显式绑到这个 pane 的群。空列表意味着接下来只能靠回落广播。
-
-    单独一个函数，是为了让「这次是广播还是定向」在调用处能判出来：
-    广播时绝不能顺手写绑定（见 _notify_finished）。
-    """
+    """显式绑到这个 pane 的群。空列表就意味着不发。"""
     return sorted(chat for chat, pane in bot._active.items() if pane == pane_id)
 
 
@@ -3416,7 +3489,7 @@ def _track_updates(bot: "LarkBot", updated: list[dict]) -> None:
         if old_status != new_status:
             stats["last_change"] = now
 
-        # 有群绑着它就推（没绑时 chats_watching 会回落到默认会话）。
+        # 只有群绑着它才推：没绑就没有该收这条通知的地方，不发。
         if is_finish_transition(old_status, new_status) and chats_watching(bot, pane_id):
             # 读 pane 要走 relay 往返，不能卡住监听循环——丢到后台跑。
             asyncio.create_task(_notify_finished(bot, dict(agent)))
@@ -3439,10 +3512,10 @@ async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
     if generation:
         bot.approval_tokens[pane_id] = generation
 
-    # 广播（没有任何群绑它）时绝不能写绑定：一次回落会把全部授权群都绑到
-    # 同一个 pane，此后它每次完成都在每个群各刷一遍，且绑定已落盘，重启
-    # 也不会自愈。只有用户主动 /read /send 建立的绑定才该被刷新。
-    targeted = bool(bound_chats(bot, pane_id))
+    # chats_watching 现在只返回显式绑过的群，所以这里每个 chat_id 本来就是
+    # 定向的，刷新绑定是安全的。曾经不是：那时会回落成「发给全部授权群」，
+    # 循环里对每个群都 set_active，一次广播就把 16 个群全绑到同一个 pane，
+    # 且绑定已落盘、重启也不自愈。回落既已去掉，这个坑的入口也就没了。
     for chat_id in chats_watching(bot, pane_id):
         if bot.render_mode == "card":
             # 完成时状态已是 idle/done，用 done 让头部显示为绿色。
@@ -3452,8 +3525,7 @@ async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
             message_id = bot.reply_text(
                 chat_id, format_finish_message(project, agent.get("agent", ""), content))
         bot.remember(chat_id, message_id, pane_id)
-        if targeted:
-            bot.set_active(chat_id, pane_id, project)
+        bot.set_active(chat_id, pane_id, project)
         bot._send_images_in(chat_id, content)
         if groups:
             current = current_option_group(groups)

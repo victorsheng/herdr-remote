@@ -60,6 +60,16 @@ herdr · [w22] yqg-dw-datapilot
 - 它的完成通知、blocked 审批**只推到这个群**，不会和别的 agent 互相刷屏
 - 想换人就再 `/read <序号>`，群名跟着变
 
+**没绑过的 agent 收不到推送。** 通知只发显式绑过的群，没有「默认群」兜底：
+
+```
+你只在 A 群 /read 过 herdr-remote
+→ datapilot6 卡住了，飞书上不会有任何提示
+   （用 /agents 主动看，或先 /read 一次把它绑到某个群）
+```
+
+这是有意的。早期版本会把「无主」通知倒进配置里的第一个群，结果那个群自己也绑了 agent —— datapilot6 的进展出现在 `herdr · herdr-remote` 群里，看的人以为那是 herdr-remote 的输出。**串群比丢通知更糟**：丢了你还知道要去查，串了你会读到错的东西。
+
 **要同时盯多个 agent，就建多个群**，各自 `/read` 绑不同的 agent。15 个 agent 挤一个群会分不清谁是谁。
 
 一键搞定：
@@ -195,7 +205,7 @@ uv run relay/herdr_usage.py --detail  # 加缓存明细与耗时
 | 命令 | 作用 |
 |---|---|
 | `/start` 或 `/help` | 面板概览 + agent 选择卡片 |
-| `/agents` | 列出全部 agent，**带稳定序号**，行首图标表状态 |
+| `/agents` | 列出全部 agent，**带稳定序号**，行首图标表状态；并附一张可点的卡片 |
 | `/status` | relay 连接状态与 agent 计数 |
 | `/read <序号>` | 读终端输出（200 行，清理后约 40 行） |
 | `/reply <序号>` | 同 `/read`，并提示可直接回复 |
@@ -217,7 +227,7 @@ uv run relay/herdr_usage.py --detail  # 加缓存明细与耗时
 | 方式 | 用法 | 适合 |
 |---|---|---|
 | 序号 | `/read 3` | 已看过 `/agents`，最快 |
-| 卡片按钮 | `/read`（不带参数） | 不想先看列表，点一下 |
+| 卡片按钮 | `/agents` 或 `/read`（不带参数） | 不想打字，点一下 |
 | 名字 | `/read herdr` | 记得住名字 |
 
 **序号是稳定的**：按 `pane_id` 排序，与状态无关。agent 开始干活、卡住、完成，序号都不会变。
@@ -244,6 +254,20 @@ uv run relay/herdr_usage.py --detail  # 加缓存明细与耗时
 `/new <序号>` 就是用来在这种空 space 里开 agent 的。
 
 优先用父目录（`api [frontend]` / `api [backend]`），目录也一样时用 workspace id。不重名的不加标记，保持干净。
+
+### 打错命令会被拦住
+
+不带 `/` 的文本直接发给当前 agent，这是主路径。但**形似命令的错拼会先拦一道**：
+
+```
+你: /raed 3
+    没有 /raed 这个命令，你是不是想用 /read？
+    确认要把这行原样发给 agent 的话，去掉开头的 / 再发一次。
+```
+
+不拦的话，`/raed 3` 会被当成普通文本原样粘进终端 —— 实际发生过。
+
+猜不出来的（比如 `/xyzzyplugh`，或 `/Users/victor/foo.py` 这种路径）照旧放行，不会挡住正常输入。
 
 ### 新开一个 agent：`/new`
 

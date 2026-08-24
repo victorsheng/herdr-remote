@@ -1168,10 +1168,10 @@ class BroadcastScopeTests(unittest.TestCase):
         bot.set_active("oc_2", "w1:p1")
         self.assertEqual(sorted(lk.chats_watching(bot, "w1:p1")), ["oc_1", "oc_2"])
 
-    def test_falls_back_to_default_chat_when_unbound(self):
-        """没有任何群绑它时，回落到默认会话——否则通知就丢了。"""
+    def test_unbound_pane_gets_nothing(self):
+        """没有任何群绑它就不发。宁可丢通知，也不能串到别人的群里。"""
         bot = make_bot()
-        self.assertEqual(lk.chats_watching(bot, "w9:p1"), ["oc_1"])
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
 
     def test_no_default_and_no_binding_yields_nothing(self):
         api = unittest.mock.MagicMock()
@@ -1222,29 +1222,41 @@ class ChatInventoryTests(unittest.TestCase):
         self.assertIn(index["同名"], ("oc_a", "oc_b"))
 
 
-class FallbackScopeTests(unittest.TestCase):
-    """没有任何群绑定这个 pane 时，通知只落一个群，不广播。
+class NoFallbackTests(unittest.TestCase):
+    """没有群绑这个 pane 就不发。绝不回落到任何群。
 
-    线上事故：/spaces 建了 16 个群，全部进了授权列表。一个未绑定的 pane
-    完成时，回落逻辑把通知发给全部 16 个群，一条通知响 16 次。
-    通知不能丢，但也不该群发——落到默认群即可。
+    去掉主群回落的原因：主群不是中立收件箱，它自己也会被某个 pane 绑走。
+    实际发生过——datapilot6（w1R:p1）一个群都没绑，它的通知回落到主群，
+    而主群已经绑给了 herdr-remote（w2B:p1），于是 datapilot6 的进展出现在
+    「herdr · herdr-remote」群里，看的人会以为那是 herdr-remote 的输出。
+
+    宁可不发：通知只到你明确指定过的地方。没绑的 agent 靠 /agents 主动查。
     """
 
-    def test_unbound_pane_goes_to_one_chat_only(self):
+    def test_unbound_pane_gets_nothing(self):
         bot = make_bot("oc_main,oc_b,oc_c")
-        self.assertEqual(len(lk.chats_watching(bot, "w9:p1")), 1)
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
 
-    def test_fallback_uses_configured_primary_chat(self):
-        """回落落在配置的第一个群，而不是字典序偶然排在前面的那个。"""
+    def test_unbound_pane_ignores_configured_order(self):
+        """配置里的第一个群不再有特殊地位。"""
         bot = make_bot("oc_zzz,oc_aaa")
-        self.assertEqual(lk.chats_watching(bot, "w9:p1"), ["oc_zzz"])
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
 
     def test_bound_pane_unaffected(self):
-        """显式绑定优先，且绑几个就发几个。"""
+        """显式绑定优先，且绑几个就发几个——主路径不能受影响。"""
         bot = make_bot("oc_main,oc_b,oc_c")
         bot.set_active("oc_b", "w1:p1")
         bot.set_active("oc_c", "w1:p1")
         self.assertEqual(lk.chats_watching(bot, "w1:p1"), ["oc_b", "oc_c"])
+
+    def test_other_panes_binding_does_not_leak(self):
+        """回归防线：别的 pane 绑了群，不代表这个 pane 能用那个群。
+
+        这正是串群的形状——oc_main 绑着 w1:p1，w9:p1 不该借它发消息。
+        """
+        bot = make_bot("oc_main,oc_b")
+        bot.set_active("oc_main", "w1:p1")
+        self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
 
     def test_no_chats_at_all_yields_nothing(self):
         api = unittest.mock.MagicMock()
@@ -1252,7 +1264,6 @@ class FallbackScopeTests(unittest.TestCase):
         bot = lk.LarkBot(api, "", loop=None)
         bot.chat_ids = set()
         bot._active = {}
-        bot.primary_chat = ""
         self.assertEqual(lk.chats_watching(bot, "w9:p1"), [])
 
 
@@ -3893,3 +3904,245 @@ class ManifestHintCoverageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class SuggestCommandTests(unittest.TestCase):
+    """打错命令时给建议，而不是静默把它当指令发给 agent。
+
+    这不只是便利性：/raed 3 原来会一路走到 _handle_free_text，
+    真的把「/raed 3」粘进终端。
+    """
+
+    def test_typo_suggests_nearest(self):
+        self.assertEqual(lk.suggest_command("/raed 3"), "read")
+
+    def test_transposed_letters(self):
+        self.assertEqual(lk.suggest_command("/agnets"), "agents")
+
+    def test_missing_letter(self):
+        self.assertEqual(lk.suggest_command("/intrrupt 1"), "interrupt")
+
+    def test_valid_command_needs_no_suggestion(self):
+        self.assertIsNone(lk.suggest_command("/read 1"))
+
+    def test_free_text_is_not_a_typo(self):
+        """不以 / 开头的就是要发给 agent 的正文，绝不能拦。"""
+        self.assertIsNone(lk.suggest_command("run the tests"))
+
+    def test_unrelated_slash_word_gives_no_suggestion(self):
+        """离所有命令都太远时不要硬猜，否则更迷惑。"""
+        self.assertIsNone(lk.suggest_command("/xyzzyplugh"))
+
+    def test_ignores_at_suffix(self):
+        self.assertEqual(lk.suggest_command("/raed@demo 3"), "read")
+
+    def test_case_insensitive(self):
+        self.assertEqual(lk.suggest_command("/RAED 3"), "read")
+
+    def test_bare_slash_is_not_a_typo(self):
+        self.assertIsNone(lk.suggest_command("/"))
+
+    def test_suggestion_is_a_real_command(self):
+        """建议必须真的能用——否则提示等于把人引到另一个错。"""
+        for typo in ("/raed", "/agnets", "/statu", "/hlep"):
+            with self.subTest(typo=typo):
+                self.assertIn(lk.suggest_command(typo), lk.COMMANDS)
+
+    def test_path_like_text_is_not_a_typo(self):
+        """粘一条绝对路径进来，不该被当成打错的命令。"""
+        self.assertIsNone(lk.suggest_command("/Users/victor/code/foo.py"))
+
+
+class TypoInterceptTests(unittest.TestCase):
+    """打错的命令必须被拦住，不能粘进终端。
+
+    回归防线：/raed 3 曾经一路走到 _handle_free_text，被当成要发给
+    agent 的正文原样送进 pane。
+    """
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(2)
+        self.bot.set_active("oc_1", "w1:p1", "project1")
+
+    def _run(self, text):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text=text)
+        with unittest.mock.patch.object(
+                lk, "send_text_to_relay",
+                new=unittest.mock.AsyncMock()) as sender:
+            asyncio.run(self.bot._handle_text(ctx))
+        return sender
+
+    def test_typo_is_not_sent_to_agent(self):
+        sender = self._run("/raed 3")
+        sender.assert_not_called()
+
+    def test_typo_reply_names_the_real_command(self):
+        self._run("/raed 3")
+        said = " ".join(str(c) for c in self.bot.api.send_text.call_args_list)
+        self.assertIn("/read", said)
+
+    def test_free_text_still_reaches_agent(self):
+        """纠错绝不能挡住正常指挥——那是主路径。"""
+        sender = self._run("继续改这个函数")
+        sender.assert_called_once()
+
+    def test_unguessable_slash_word_still_sent(self):
+        """猜不出来的就按原样放行，维持原有行为。"""
+        sender = self._run("/xyzzyplugh")
+        sender.assert_called_once()
+
+
+class AgentActionsCardTests(unittest.TestCase):
+    """选中一个 agent 后，能做什么应该是点出来的，不是打出来的。
+
+    /agents 原来只回纯文本，看完还得手打 /read 1——手机上正是最累的一步。
+    """
+
+    def setUp(self):
+        self.agents = make_agents(3)
+
+    def test_card_names_the_agent(self):
+        card = lk.build_agent_actions_card(self.agents[0])
+        blob = json.dumps(card, ensure_ascii=False)
+        self.assertIn("project", blob)
+        self.assertIn("opencode", blob)
+
+    def test_offers_read_and_send(self):
+        card = lk.build_agent_actions_card(self.agents[0])
+        codes = _action_codes_in(card)
+        self.assertIn(lk.ACTION_CODES["read"], codes)
+        self.assertIn(lk.ACTION_CODES["select_send"], codes)
+
+    def test_idle_agent_has_no_interrupt(self):
+        """空闲的 agent 没什么可中断，按钮不该出现。"""
+        idle = dict(self.agents[0], status="idle")
+        codes = _action_codes_in(lk.build_agent_actions_card(idle))
+        self.assertNotIn(lk.ACTION_CODES["interrupt"], codes)
+
+    def test_working_agent_can_be_interrupted(self):
+        working = dict(self.agents[0], status="working")
+        codes = _action_codes_in(lk.build_agent_actions_card(working))
+        self.assertIn(lk.ACTION_CODES["interrupt"], codes)
+
+    def test_blocked_agent_offers_trust(self):
+        blocked = dict(self.agents[0], status="blocked")
+        codes = _action_codes_in(lk.build_agent_actions_card(blocked))
+        self.assertIn(lk.ACTION_CODES["trust"], codes)
+
+    def test_idle_agent_has_no_trust(self):
+        """没在等审批就没有可批的东西。"""
+        idle = dict(self.agents[0], status="idle")
+        codes = _action_codes_in(lk.build_agent_actions_card(idle))
+        self.assertNotIn(lk.ACTION_CODES["trust"], codes)
+
+    def test_every_button_carries_a_pane_token(self):
+        """按钮不带 pane 就点不动——回归防线。"""
+        card = lk.build_agent_actions_card(dict(self.agents[0], status="blocked"))
+        for action in _actions_in(card):
+            with self.subTest(label=action["text"]["content"]):
+                self.assertIn("p", action["value"])
+
+
+def _actions_in(card):
+    out = []
+    for element in card.get("elements", []):
+        if element.get("tag") == "action":
+            out.extend(element.get("actions", []))
+    return out
+
+
+def _action_codes_in(card):
+    return {a["value"].get("a") for a in _actions_in(card)}
+
+
+class AgentsCardWiringTests(unittest.TestCase):
+    """/agents 的按钮要能点开那个 agent 的动作卡。"""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(2)
+
+    def _click(self, value):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, action=value)
+        asyncio.run(self.bot._handle_action(ctx))
+
+    def test_menu_action_is_registered(self):
+        self.assertIn("agent_menu", lk.ACTION_CODES)
+
+    def test_clicking_agent_opens_actions_card(self):
+        self._click(lk.action_value("agent_menu", "w1:p1"))
+        self.bot.api.send_card.assert_called_once()
+        blob = json.dumps(self.bot.api.send_card.call_args[0][1], ensure_ascii=False)
+        self.assertIn("看进展", blob)
+
+    def test_agents_command_replies_with_card(self):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text="/agents")
+        asyncio.run(self.bot._handle_text(ctx))
+        self.bot.api.send_card.assert_called_once()
+
+    def test_agents_card_buttons_open_menus(self):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text="/agents")
+        asyncio.run(self.bot._handle_text(ctx))
+        card = self.bot.api.send_card.call_args[0][1]
+        codes = _action_codes_in(card)
+        self.assertIn(lk.ACTION_CODES["agent_menu"], codes)
+
+    def test_no_agents_still_replies_text(self):
+        """一个 agent 都没有时别发空卡片。"""
+        self.bot.agents = []
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text="/agents")
+        asyncio.run(self.bot._handle_text(ctx))
+        self.bot.api.send_card.assert_not_called()
+        self.bot.api.send_text.assert_called_once()
+
+
+class AgentsOverviewTests(unittest.TestCase):
+    """/agents 既要能点，也要留住序号这条快路。
+
+    卡片按钮只有项目名，agent 一多就难分辨；序号还能配 /read 3 直达。
+    两者都要，不能拿一个换另一个。
+    """
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(3)
+
+    def _agents(self):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text="/agents")
+        asyncio.run(self.bot._handle_text(ctx))
+
+    def test_still_shows_numbered_list(self):
+        self._agents()
+        self.bot.api.send_text.assert_called_once()
+        said = self.bot.api.send_text.call_args[0][1]
+        self.assertIn("1.", said)
+
+    def test_also_sends_card(self):
+        self._agents()
+        self.bot.api.send_card.assert_called_once()
+
+    def test_numbers_match_match_agent(self):
+        """列表里的序号必须和 match_agent 的解析对得上。
+
+        picker 卡片用 sorted_agents，序号用 index_agents——两者顺序不一定
+        相同，所以序号绝不能按按钮位置去标。
+        """
+        ordered = lk.index_agents(self.bot.agents)
+        for position, agent in enumerate(ordered, start=1):
+            with self.subTest(number=position):
+                self.assertEqual(
+                    lk.match_agent(self.bot.agents, str(position))["pane_id"],
+                    agent["pane_id"])

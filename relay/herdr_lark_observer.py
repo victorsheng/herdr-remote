@@ -46,6 +46,12 @@ FINDINGS_PATH = os.environ.get(
 # 判过的 message_id 落盘，重启后不重复上报。
 SEEN_PATH = os.environ.get(
     "HERDR_OBSERVER_SEEN", os.path.join(CONFIG_DIR, "observer_seen.json"))
+# demo 的群↔pane 绑定。只读，用来判断「这条通知本来该不该发」：
+# herdr_lark 去掉主群回落后，没有群绑着的 pane 一律不推，observer 得跟上
+# 同一个口径，否则每次完成都判一次假漏发。路径与 herdr_lark.BINDING_PATH
+# 保持一致——同机同目录，读同一份文件最省事，也不必新开 IPC。
+LARK_BINDING_PATH = os.environ.get(
+    "HERDR_LARK_BINDING_PATH", os.path.join(CONFIG_DIR, "lark_bindings.json"))
 
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]
@@ -170,6 +176,37 @@ def card_is_degraded(content: dict) -> bool:
     """
     raw = json.dumps(content, ensure_ascii=False)
     return any(mark in raw for mark in _CARD_DEGRADED_MARKS)
+
+
+# herdr_lark.STATUS_LABELS 的值。build_pane_card 会把它们作为独立的文本元素
+# 放在卡片第一行，这是「输出展示卡片」的结构签名。
+# 与 herdr_lark.py 保持同步：那边加状态就往这里加。
+_PANE_CARD_LABELS = ("DONE", "WORKING", "IDLE", "NEEDS YOU")
+
+
+def card_is_output_only(content: dict) -> bool:
+    """这张卡片是不是「只展示输出」的那类，本来就不该有按钮。
+
+    herdr_lark.build_pane_card 生成的完成/进展卡片按设计不含 button——它只是
+    把 pane 输出贴出来看。拿「交互卡片都该有按钮」去要求它，就会刷假警报：
+    实测 66 条质检记录里 54 条都是这个形态。
+
+    判据用结构不用文案：状态标签（DONE / WORKING / …）作为独立文本元素出现，
+    是 build_pane_card 的签名。文案会改，这个结构不会。
+
+    审批卡片和选择卡片不在此列——它们必须有按钮，缺了就是真问题。
+    """
+    for row in (content or {}).get("elements") or []:
+        # 飞书降级返回把元素套成二维数组，真实卡片是一维；两种都走一遍。
+        cells = row if isinstance(row, list) else [row]
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            if cell.get("tag") != "text":
+                continue
+            if (cell.get("text") or "").strip() in _PANE_CARD_LABELS:
+                return True
+    return False
 
 
 def card_has_buttons(content: dict) -> bool:
@@ -367,10 +404,12 @@ class Observer:
     """把期望和实际对上账。"""
 
     def __init__(self, api: ObserverAPI, store: FindingStore, qc_chat: str = "",
-                 seen: "SeenStore | None" = None):
+                 seen: "SeenStore | None" = None, binding_path: str = None):
         self.api = api
         self.store = store
         self.qc_chat = qc_chat
+        # demo 的绑定表，每次判定时重读：用户 /read 换绑后不该等 observer 重启。
+        self.binding_path = binding_path or LARK_BINDING_PATH
         # 待核对的期望
         self.pending: list[Expectation] = []
         # pane_id -> 上一次看到的状态，用来认出「停下来了」
@@ -380,13 +419,47 @@ class Observer:
         # chat_id -> name
         self.chats: dict = {}
         self.stats = {"expect": 0, "matched": 0, "missing": 0,
-                      "content": 0, "card_missing": 0, "checked": 0}
+                      "content": 0, "card_missing": 0, "checked": 0,
+                      # 没绑群、本来就不该发的。这个数大不是坏事，但突然
+                      # 变大意味着有人的绑定被清掉了。
+                      "skipped_unbound": 0}
 
     # --- 期望侧：从 relay 事件产生 ---
+
+    def bound_panes(self) -> set:
+        """当前被某个群绑着的 pane。每次都重读文件。
+
+        缓存住的话，用户 /read 换绑后 observer 会拿着过期的绑定判一阵子，
+        而期望与实际错位正是最容易出假警报的地方。文件很小，重读的成本
+        远低于误报的代价。
+
+        读不到、格式不对都当「没有绑定」：质检工具不能因为一个坏文件挂掉。
+        反过来假设「都绑着」更糟——那会把所有静默的 pane 全判成漏发。
+        """
+        try:
+            with open(self.binding_path) as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            return set()
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("绑定表读不出，当作没有绑定: %s", scrub(exc))
+            return set()
+        if not isinstance(payload, dict):
+            log.warning("绑定表结构不对，当作没有绑定")
+            return set()
+        return {str(v) for v in payload.values() if isinstance(v, str)}
 
     def note_expectation(self, kind: str, agent: dict,
                          options: list | None = None) -> None:
         pane_id = agent.get("pane_id") or "?"
+        # 没有群绑着它，herdr_lark 就不会推（主群回落已去掉）。这里跟着同
+        # 一个口径，否则每次状态变化都判一次假漏发——实测 datapilot6 没绑
+        # 任何群，反复被判 missing。
+        if pane_id not in self.bound_panes():
+            log.info("跳过期望: %s %s (%s) 没有群绑着它",
+                     kind, agent.get("project") or "?", pane_id)
+            self.stats["skipped_unbound"] += 1
+            return
         exp = Expectation(
             kind=kind, pane_id=pane_id,
             project=agent.get("project") or agent.get("agent") or "?",
@@ -451,7 +524,10 @@ class Observer:
             problems = check_text(msg["text"])
         elif msg["msg_type"] == "interactive":
             # 降级返回看不到元素树，任何结论都是瞎猜——跳过，别造假警报。
-            if not card_is_degraded(msg["content"]):
+            # 输出展示卡片（DONE / WORKING 那类）按设计就没有按钮，也跳过：
+            # 它们占了群里绝大多数卡片，误判一次就刷一屏。
+            if (not card_is_degraded(msg["content"])
+                    and not card_is_output_only(msg["content"])):
                 if not card_has_buttons(msg["content"]):
                     problems.append({"rule": "card_no_buttons",
                                      "detail": "交互卡片里没有任何按钮，手机上点不了"})
@@ -544,7 +620,7 @@ class Observer:
         s = self.stats
         return (f"期望 {s['expect']} · 已满足 {s['matched']} · 漏发 {s['missing']} · "
                 f"缺卡片 {s['card_missing']} · 内容异常 {s['content']} · "
-                f"已检消息 {s['checked']}")
+                f"已检消息 {s['checked']} · 未绑跳过 {s['skipped_unbound']}")
 
 
 # --- 循环 ---

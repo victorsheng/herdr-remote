@@ -29,6 +29,27 @@ ob = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ob)
 
 
+class _EverythingBound(frozenset):
+    """任何 pane 都算「绑着」。"""
+
+    def __contains__(self, item):
+        return True
+
+
+_ALL_PANES = _EverythingBound()
+
+
+def make_obs(*args, **kwargs):
+    """构造 Observer，并默认「所有 pane 都绑着群」。
+
+    绝大多数测试关心的是对账与漏发判定，与绑定无关。绑定过滤是另一件事，
+    由 BindingAwarenessTests 专门盯着——那里用真实文件。
+    """
+    obs = ob.Observer(*args, **kwargs)
+    obs.bound_panes = lambda: _ALL_PANES
+    return obs
+
+
 class ScrubTests(unittest.TestCase):
     """密钥绝不能进日志或质检群。"""
 
@@ -163,7 +184,7 @@ class FinishTransitionTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore())
+        self.obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore())
 
     def _agent(self, status, pane="w1:p1"):
         return {"pane_id": pane, "project": "proj", "status": status}
@@ -199,7 +220,7 @@ class MatchingTests(unittest.TestCase):
     """对账：消息能划掉期望。"""
 
     def setUp(self):
-        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore())
+        self.obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore())
 
     def _msg(self, text="", msg_type="text", content=None):
         return {"message_id": "m1", "msg_type": msg_type,
@@ -237,7 +258,7 @@ class SweepTests(unittest.TestCase):
     """漏发判定：过了宽限期才算，且只算一次。"""
 
     def setUp(self):
-        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore())
+        self.obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore())
 
     def test_within_grace_not_reported(self):
         self.obs.note_expectation("finish", {"pane_id": "w1:p1", "project": "p"})
@@ -350,7 +371,7 @@ class SeenStoreTests(unittest.TestCase):
         否则启动时一次扫描就塞进 20×群数 个陈旧 id，把真正该记的挤出去。
         """
         seen = self._store()
-        obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(), seen=seen)
+        obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(), seen=seen)
         obs._check_message("oc_1", "herdr · p", {
             "message_id": "om_ancient", "msg_type": "text",
             "create_time": time.time() - ob.MAX_MESSAGE_AGE - 100,
@@ -361,7 +382,7 @@ class SeenStoreTests(unittest.TestCase):
     def test_same_message_reported_once_across_scans(self):
         """连扫两遍，同一条坏消息只报一次。"""
         seen = self._store()
-        obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(), seen=seen)
+        obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(), seen=seen)
         obs.report = unittest.mock.MagicMock()
         msg = {"message_id": "om_bad", "msg_type": "text",
                "create_time": time.time(), "sender": "app",
@@ -378,7 +399,7 @@ class ChatScopedMatchingTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(),
+        self.obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(),
                                seen=ob.SeenStore(os.path.join(_TMP, f"c-{time.time()}.json")))
 
     def _msg(self, text):
@@ -409,7 +430,7 @@ class SkipSelfTests(unittest.TestCase):
     def test_qc_chat_skipped_in_scan(self):
         api = unittest.mock.MagicMock()
         api.recent_messages.return_value = []
-        obs = ob.Observer(api, ob.FindingStore(), qc_chat="oc_qc")
+        obs = make_obs(api, ob.FindingStore(), qc_chat="oc_qc")
         obs.chats = {"oc_qc": "herdr · 质检", "oc_proj": "herdr · proj"}
         obs.scan_once()
         scanned = [c.args[0] for c in api.recent_messages.call_args_list]
@@ -422,7 +443,7 @@ class ReportTests(unittest.TestCase):
         """质检群发不出去，也不能把 observer 搞挂。"""
         api = unittest.mock.MagicMock()
         api.send_text.side_effect = RuntimeError("boom")
-        obs = ob.Observer(api, ob.FindingStore(), qc_chat="oc_qc")
+        obs = make_obs(api, ob.FindingStore(), qc_chat="oc_qc")
         obs.report({"verdict": "missing", "project": "p"})
 
     def test_missing_finding_shows_pane_and_kind(self):
@@ -454,3 +475,131 @@ class ReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class BindingAwarenessTests(unittest.TestCase):
+    """没有群绑着的 pane 本来就不该发通知，别报成漏发。
+
+    herdr_lark 去掉了主群回落：通知只发显式绑过的群，一个都没绑就不发。
+    observer 若还按「状态一变就该发」建期望，datapilot6 这种没绑过的
+    agent 每次干完活都会被判一次 missing——实测刷了一屏假警报。
+
+    判定口径必须跟着 chats_watching 走，否则对账系统性错位。
+    """
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"bind-{id(self)}.json")
+        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(),
+                               binding_path=self.path)
+
+    def _write(self, mapping):
+        with open(self.path, "w") as fh:
+            json.dump(mapping, fh)
+
+    def _finish(self, pane_id):
+        """跑一次 working → idle 的完成迁移。"""
+        self.obs.track([{"pane_id": pane_id, "status": "working", "project": "p"}])
+        self.obs.track([{"pane_id": pane_id, "status": "idle", "project": "p"}])
+
+    def test_bound_pane_still_expected(self):
+        """绑了的照常对账——主路径不能被削弱。"""
+        self._write({"oc_a": "w1:p1"})
+        self._finish("w1:p1")
+        self.assertEqual(len(self.obs.pending), 1)
+
+    def test_unbound_pane_creates_no_expectation(self):
+        self._write({"oc_a": "w1:p1"})
+        self._finish("w9:p1")          # 没有任何群绑 w9:p1
+        self.assertEqual(self.obs.pending, [])
+
+    def test_no_bindings_at_all_expects_nothing(self):
+        self._write({})
+        self._finish("w1:p1")
+        self.assertEqual(self.obs.pending, [])
+
+    def test_missing_binding_file_expects_nothing(self):
+        """绑定文件还不存在时别凭空造期望。"""
+        self._finish("w1:p1")
+        self.assertEqual(self.obs.pending, [])
+
+    def test_picks_up_new_binding_without_restart(self):
+        """用户 /read 换绑后，observer 不重启也要跟上。"""
+        self._write({})
+        self._finish("w1:p1")
+        self.assertEqual(self.obs.pending, [])
+        self._write({"oc_a": "w2:p1"})
+        self._finish("w2:p1")
+        self.assertEqual(len(self.obs.pending), 1)
+
+    def test_unreadable_bindings_do_not_crash(self):
+        """文件坏了就当没绑，不能让质检进程挂掉。"""
+        with open(self.path, "w") as fh:
+            fh.write("{not json")
+        self._finish("w1:p1")
+        self.assertEqual(self.obs.pending, [])
+
+
+class PaneCardHasNoButtonsTests(unittest.TestCase):
+    """输出展示卡片本来就没有按钮，不该判成死卡片。
+
+    实测：66 条质检记录里 54 条是 card_no_buttons，全部落在「✅ herdr-remote」
+    这类完成通知上。而 herdr_lark.build_pane_card 按设计就不含 button——
+    它只是把 pane 输出贴出来看，没有可点的东西。
+
+    规则原来的前提「交互卡片都该有按钮」是错的：只有审批/选择卡片才该有。
+    """
+
+    # 真实抓到的完成通知卡片（截短）
+    DONE_CARD = {"title": "✅ herdr-remote", "elements": [
+        [{"tag": "text", "text": "DONE"}, {"tag": "text", "text": " · claude"}],
+        [{"tag": "text", "text": "```\n跑完了，565 passed\n```"}]]}
+
+    # 真实抓到的选择卡片：这个才该有按钮
+    OPTIONS_CARD = {"title": "⌨︎ yqg-dw-datapilot6 正在等你选", "elements": [
+        [{"tag": "text", "text": "另外有两件事需要你定："}],
+        [{"tag": "text", "text": "1."}, {"tag": "text", "text": " 保留归档表\n"}],
+        [{"tag": "button", "text": "1", "type": "primary"},
+         {"tag": "button", "text": "2", "type": "default"}]]}
+
+    def test_done_card_is_output_only(self):
+        self.assertTrue(ob.card_is_output_only(self.DONE_CARD))
+
+    def test_options_card_is_not_output_only(self):
+        self.assertFalse(ob.card_is_output_only(self.OPTIONS_CARD))
+
+    def test_working_status_also_output_only(self):
+        card = {"title": "▶ p", "elements": [
+            [{"tag": "text", "text": "WORKING"}, {"tag": "text", "text": " · claude"}]]}
+        self.assertTrue(ob.card_is_output_only(card))
+
+    def test_plain_card_without_status_label_not_exempt(self):
+        """没有状态标签的卡片不在豁免范围，免得豁免开得过大。"""
+        card = {"title": "p", "elements": [
+            [{"tag": "text", "text": "随便一段文字"}]]}
+        self.assertFalse(ob.card_is_output_only(card))
+
+    def test_done_card_produces_no_finding(self):
+        """回归防线：完成卡片不能再刷 card_no_buttons。"""
+        obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(),
+                       seen=ob.SeenStore(os.path.join(_TMP, f"pc-{time.time()}.json")))
+        obs.report = unittest.mock.MagicMock()
+        obs._check_message("oc_1", "herdr · herdr-remote", {
+            "message_id": "om_done_card", "msg_type": "interactive",
+            "create_time": time.time(), "sender": "app",
+            "content": self.DONE_CARD, "text": ""}, time.time())
+        obs.report.assert_not_called()
+
+    def test_options_card_without_buttons_still_reported(self):
+        """真问题不能被这个豁免掩盖：该有按钮的卡片没按钮，仍要报。"""
+        broken = {"title": "⌨︎ p 正在等你选", "elements": [
+            [{"tag": "text", "text": "选一个："}],
+            [{"tag": "text", "text": "1."}, {"tag": "text", "text": " 方案甲\n"}]]}
+        self.assertFalse(ob.card_is_output_only(broken))
+        obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(),
+                       seen=ob.SeenStore(os.path.join(_TMP, f"pb-{time.time()}.json")))
+        obs.report = unittest.mock.MagicMock()
+        obs._check_message("oc_1", "herdr · p", {
+            "message_id": "om_broken_options", "msg_type": "interactive",
+            "create_time": time.time(), "sender": "app",
+            "content": broken, "text": ""}, time.time())
+        obs.report.assert_called_once()
