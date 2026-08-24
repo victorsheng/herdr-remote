@@ -788,6 +788,75 @@ STALE_VIEWPORT_MARK = "⚠ 终端当时处于回滚状态，以下内容可能�
 # `herdr call timed out` 全是 1200/1700 行。更糟的是超时的 lines 会被记进
 # pane_subs，push_subscribed_panes 每轮都用同一个必失败的行数重试，白烧
 # CPU 和 SSH 往返（日志里的成簇超时就是这么来的）。
+# 输入框里置灰的补全建议（按 Tab 接受）。
+#
+# 主抓屏走纯文本，置灰信息在那一层就丢了——`/rev` 和置灰的 `iew-changes`
+# 连成 `/review-changes`，分不出哪段是人打的。所以另走一次 --ansi 抓屏，
+# 靠颜色码切开。
+#
+# 刻意不改主抓屏：clean_pane、选项解析、选择器定位全都假设纯文本，改成带
+# 转义序列会牵一发动全身。独立通道拿建议，主链路一行不用动。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# 置灰用的几种码，实测同一屏里四种都出现过：dim、亮黑、256 色灰、RGB 灰。
+_DIM_RE = re.compile(r"\x1b\[(?:2|90|38;5;8|38;2;102;102;102)m")
+# 复位码：置灰段到这里结束。
+_RESET_RE = re.compile(r"\x1b\[0?m")
+# 输入行的提示符。只在这一行找建议——状态栏那些 `Context ███ 25%` 也是
+# 灰的，全屏找灰色会抓出一堆噪音。
+_PROMPT_MARK = "❯"
+
+
+# 建议挂在内容末尾时的前缀。手机上看得懂就行，别太长。
+SUGGESTION_MARK = "⇥ 建议（按 Tab 接受）："
+
+
+async def pane_input_suggestion(pane_id, remote=None) -> str:
+    """再抓一次带 ANSI 的屏，取输入框的置灰补全建议。
+
+    只要 visible 的最后几行：建议永远在输入框那一行，多抓没意义，而
+    `pane read` 是按行数线性变慢的（实测约 36ms/行）。
+
+    拿不到就返回空串——这是锦上添花的信息，不该让抓屏本身失败。
+    """
+    try:
+        raw = await run_herdr_async("pane", "read", pane_id, "--lines", "5",
+                                    "--source", "visible", "--ansi",
+                                    remote=remote)
+        return input_suggestion(raw)
+    except Exception:
+        return ""
+
+
+def input_suggestion(ansi_screen: str) -> str:
+    """从带 ANSI 的抓屏里取出输入框的置灰补全建议。没有就返回空串。
+
+    只认最后一个提示符行：一屏里可能留着历史提示符，当前输入永远在最后。
+    """
+    if not ansi_screen or "\x1b[" not in ansi_screen:
+        return ""          # 纯文本拿不到置灰信息，别瞎猜
+    lines = ansi_screen.replace("\r", "").splitlines()
+    for line in reversed(lines):
+        if _PROMPT_MARK not in line:
+            continue
+        # 提示符本身也是灰的，从它之后开始找。
+        after = line.split(_PROMPT_MARK, 1)[1]
+        for match in _DIM_RE.finditer(after):
+            # 建议一定跟在**已输入的文字**后面。真机误报：Claude Code 把
+            # 用户待发送的输入整行渲染成灰色（`❯ \x1b[2m再来一次…`），
+            # 不要求前缀的话会把它当成建议，卡片上显示「建议：再来一次…
+            # （按 Tab 接受）」——那是用户自己打的字，纯属误导。
+            typed = _ANSI_RE.sub("", after[:match.start()])
+            if not typed.strip():
+                continue
+            tail = after[match.end():]
+            stop = _RESET_RE.search(tail)
+            chunk = _ANSI_RE.sub("", tail[:stop.start()] if stop else tail)
+            if chunk.strip():
+                return chunk.strip()
+        return ""
+    return ""
+
+
 PANE_READ_MAX_LINES = 300
 
 
@@ -827,7 +896,17 @@ async def read_pane_async(pane_id, remote=None):
     content = "\n".join(lines[-20:])
     # 标注放在最前面：手机上往往只看得到开头几行。
     if await pane_scroll_offset(pane_id, remote=remote) > 0:
-        return f"{STALE_VIEWPORT_MARK}\n{content}" if content else STALE_VIEWPORT_MARK
+        content = (f"{STALE_VIEWPORT_MARK}\n{content}"
+                   if content else STALE_VIEWPORT_MARK)
+    # 输入框里置灰的补全建议。挂在末尾——它是补充信息，不该挤在正文前面。
+    # 失败一律当没有：抓屏是主路径，不能被这个可选信息拖垮。
+    try:
+        suggestion = await pane_input_suggestion(pane_id, remote=remote)
+    except Exception:
+        suggestion = ""
+    if suggestion:
+        content = f"{content}\n{SUGGESTION_MARK}{suggestion}" if content \
+            else f"{SUGGESTION_MARK}{suggestion}"
     return content
 
 
