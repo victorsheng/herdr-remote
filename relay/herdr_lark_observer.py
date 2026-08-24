@@ -204,11 +204,65 @@ def _card_button_labels(content: dict) -> list[str]:
     return out
 
 
+# 选项清单在一整段 lark_md 里时的行形态：`**2.** 乙方案`。
+# 要求整行以序号打头（^），正文里的编号列表（"改动如下：\n1. 修了 a"）
+# 也是这个形状，所以还得靠「至少两项 + 连续」才认，见 _inline_option_pairs。
+_INLINE_OPTION_RE = re.compile(r"^\s*\*{0,2}(\d+)[.．]\*{0,2}\s+(.+)$")
+
+
+def _inline_option_pairs(content: dict) -> list[tuple[str, str]]:
+    """从「一整段 markdown」形态里抽选项。
+
+    build_option_card 现造的卡片长这样（选项全在一个 div 里）：
+        {"tag":"div","text":{"tag":"lark_md","content":"**2.** 乙方案\n**3.** 丙方案"}}
+    而飞书 message.list 读回来会被拆成序号/文字交替的降级形态。两种都得认，
+    否则拿现造的卡片自检时静默返回空——所有规则跳过，看着"没问题"其实
+    是没检查。
+    """
+    best: list[tuple[str, str]] = []
+    for row in (content or {}).get("elements") or []:
+        cells = row if isinstance(row, list) else [row]
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            text = cell.get("text")
+            if isinstance(text, dict):
+                text = text.get("content")
+            if not isinstance(text, str) or "\n" not in text:
+                continue
+            pairs = []
+            for line in text.splitlines():
+                m = _INLINE_OPTION_RE.match(line)
+                if m:
+                    pairs.append((m.group(1), m.group(2).strip()))
+                elif pairs:
+                    pairs = []      # 中间插了非选项行，不是整段选项清单
+                    break
+            # 至少两项。**不要**在这里要求编号连续：跳号的选项清单正是
+            # option_number_gap 要抓的目标，在这里挡掉就永远报不出来。
+            # 防正文编号列表误报靠的是调用方——check_option_card 只在卡片
+            # 有数字按钮时才做序号校验，而散文里的编号列表不会配按钮。
+            if len(pairs) >= 2 and len(pairs) > len(best):
+                best = pairs
+    return best
+
+
+def _card_text_cells_have_index(content: dict) -> bool:
+    """卡片里有独立的纯序号元素吗——那是读回来的降级形态的特征。
+
+    这种形态本身足够特征化（正文不会被拆成 `2.` 一个独立元素），所以
+    不必再要求配数字按钮。
+    """
+    return any(_OPTION_INDEX_RE.match(c) for c in _card_text_cells(content))
+
+
 def parse_option_cells(content: dict) -> list[tuple[str, str]]:
     """从卡片里抽出 [(序号, 选项文字)]。不是选项卡就返回空。
 
-    build_option_card 把选项渲染成「序号元素 + 文字元素」交替出现，所以
-    认到一个纯序号元素，就把紧跟着的那个文本元素当它的选项文字。
+    两种形态都认：
+      - 读回来的降级形态：「序号元素 + 文字元素」交替，认到纯序号元素就
+        把紧跟着的那个文本元素当它的选项文字
+      - 现造的形态：选项全在一段 lark_md 里，逐行解析
     """
     cells = _card_text_cells(content)
     pairs = []
@@ -216,7 +270,7 @@ def parse_option_cells(content: dict) -> list[tuple[str, str]]:
         m = _OPTION_INDEX_RE.match(cell)
         if m and i + 1 < len(cells):
             pairs.append((m.group(1), cells[i + 1]))
-    return pairs
+    return pairs or _inline_option_pairs(content)
 
 
 def check_option_card(content: dict) -> list[dict]:
@@ -230,6 +284,13 @@ def check_option_card(content: dict) -> list[dict]:
     pairs = parse_option_cells(content)
     if not pairs:
         return []          # 不是选项卡（输出展示卡那类），这条规则不适用
+    numeric_buttons = [b for b in _card_button_labels(content)
+                       if b.strip().isdigit()]
+    # 一整段 markdown 里的编号行，光看形状分不出「选项清单」和「正文里的
+    # 编号列表」（"改动如下：1. 修了 a  2. 修了 b"）。用「有没有配数字按钮」
+    # 区分：选项卡一定有，散文不会有。
+    if not numeric_buttons and not _card_text_cells_have_index(content):
+        return []
 
     problems = []
     for index, text in pairs:
@@ -241,7 +302,7 @@ def check_option_card(content: dict) -> list[dict]:
             })
 
     # 按钮只放序号（见 herdr_lark.build_option_card），数字按钮应与选项一一对应。
-    numeric = [b for b in _card_button_labels(content) if b.strip().isdigit()]
+    numeric = numeric_buttons
     if numeric and len(numeric) != len(pairs):
         problems.append({
             "rule": "option_button_mismatch",

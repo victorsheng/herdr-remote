@@ -225,6 +225,69 @@ class OptionCardIntegrityTests(unittest.TestCase):
         self.assertNotIn("option_text_polluted", self._rules(card))
 
 
+class OptionCardFormShapesTests(unittest.TestCase):
+    """选项清单有两种形态，都得认得，否则整条规则静默失效。
+
+    发送时（build_option_card 现造的卡片）选项在**一整段 lark_md** 里：
+        {"tag":"div","text":{"tag":"lark_md","content":"**2.** 乙方案\\n**3.** 丙方案"}}
+
+    而飞书 message.list **读回来**时被拆成序号/文字交替的降级形态：
+        {"tag":"text","text":"2."}, {"tag":"text","text":" 乙方案\\n"}
+
+    只认后者的话，observer 扫群能用（读回来的），但拿现造的卡片自检就
+    静默返回空——所有基于选项的规则（污染、按钮数、序号）全部跳过，
+    看起来"没问题"其实是没检查。这是反向验证时抓出来的。
+    """
+
+    INLINE = {"elements": [
+        {"tag": "div", "text": {"tag": "lark_md",
+                                "content": "**2.** 乙方案\n**3.** 丙方案"}},
+        {"tag": "action", "actions": [
+            {"tag": "button", "text": {"tag": "plain_text", "content": "2"}},
+            {"tag": "button", "text": {"tag": "plain_text", "content": "3"}}]},
+    ]}
+
+    def test_inline_markdown_form_is_parsed(self):
+        self.assertEqual(ob.parse_option_cells(self.INLINE),
+                         [("2", "乙方案"), ("3", "丙方案")])
+
+    def test_inline_form_aligned_is_clean(self):
+        self.assertEqual(ob.check_option_card(self.INLINE), [])
+
+    def test_inline_form_mismatch_is_caught(self):
+        """本轮的漏检：现造卡片错位时必须报出来。"""
+        bad = json.loads(json.dumps(self.INLINE))
+        for act in bad["elements"][1]["actions"]:
+            act["text"]["content"] = str(int(act["text"]["content"]) - 1)
+        self.assertIn("option_number_mismatch",
+                      {p["rule"] for p in ob.check_option_card(bad)})
+
+    def test_inline_form_gap_is_caught(self):
+        bad = json.loads(json.dumps(self.INLINE))
+        bad["elements"][0]["text"]["content"] = "**1.** 甲\n**3.** 丙"
+        bad["elements"][1]["actions"] = [
+            {"tag": "button", "text": {"tag": "plain_text", "content": "1"}},
+            {"tag": "button", "text": {"tag": "plain_text", "content": "3"}}]
+        self.assertIn("option_number_gap",
+                      {p["rule"] for p in ob.check_option_card(bad)})
+
+    def test_inline_form_pollution_is_caught(self):
+        bad = json.loads(json.dumps(self.INLINE))
+        bad["elements"][0]["text"]["content"] = (
+            "**1.** 甲方案     ┌────────────┐\n**2.** 乙方案     │ 预览 │")
+        bad["elements"][1]["actions"] = [
+            {"tag": "button", "text": {"tag": "plain_text", "content": "1"}},
+            {"tag": "button", "text": {"tag": "plain_text", "content": "2"}}]
+        self.assertIn("option_text_polluted",
+                      {p["rule"] for p in ob.check_option_card(bad)})
+
+    def test_prose_numbers_are_not_options(self):
+        """正文里的编号列表不能被当成选项清单——那会到处误报。"""
+        card = {"elements": [{"tag": "div", "text": {"tag": "lark_md",
+                "content": "改动如下：\n1. 修了 a\n2. 修了 b\n然后跑了测试。"}}]}
+        self.assertEqual(ob.check_option_card(card), [])
+
+
 class OptionNumberOrderTests(unittest.TestCase):
     """选项序号必须连续递增，且和按钮一一对应，否则点了等于乱答。
 
