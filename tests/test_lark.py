@@ -3796,6 +3796,154 @@ class BlockedCardSplitDeliveryTests(unittest.TestCase):
         self.assertGreater(len(self.bot.pending), 1)
 
 
+class TypedDigitPushesNextGroupTests(unittest.TestCase):
+    """打数字答完一组，下一组也得自动推上来。
+
+    多步骤选项卡有两种答法，之前只有一种会推下一组：
+      - 点按钮   → _approve      → 调 _push_next_group  ✅
+      - 打数字   → _handle_free_text → 只 pop token      ❌ 卡住
+
+    症状：AskUserQuestion 问两组，用打字答完第一组后群里再没动静，
+    人以为坏了——其实 agent 还在等第二组。
+    """
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1, status="blocked")
+        self.pane = lk.index_agents(self.bot.agents)[0]["pane_id"]
+        self.bot.set_active("oc_1", self.pane, "project0")
+        self.bot.approval_tokens[self.pane] = "abcde"
+
+    def _press(self, text="2"):
+        ctx = lk.MessageContext(
+            chat_id="oc_1", message_id="om_1", sender_open_id="ou_u",
+            chat_type="p2p", mentioned_bot=True, text=text)
+        with unittest.mock.patch.object(
+                lk, "send_keys_to_relay", new=unittest.mock.AsyncMock()) as keys, \
+             unittest.mock.patch.object(
+                lk, "send_text_to_relay", new=unittest.mock.AsyncMock()), \
+             unittest.mock.patch.object(
+                self.bot, "_push_next_group",
+                new=unittest.mock.AsyncMock()) as push:
+            asyncio.run(self.bot._handle_text(ctx))
+        return keys, push
+
+    def test_digit_is_sent_as_key(self):
+        """主路径不能坏：数字仍要作为按键发出去。"""
+        keys, _ = self._press("2")
+        keys.assert_awaited_once()
+        self.assertEqual(keys.await_args[0][1], ["2"])
+
+    def test_digit_press_pushes_next_group(self):
+        """这是本次修的缺陷：打数字答完也要推下一组。"""
+        _, push = self._press("2")
+        push.assert_awaited_once()
+
+    def test_token_is_cleared_after_press(self):
+        """答过就清 token，免得同一张旧卡片被重复点。"""
+        self._press("2")
+        self.assertNotIn(self.pane, self.bot.approval_tokens)
+
+    def test_plain_text_does_not_push(self):
+        """普通文字不是答选项，别去读屏推卡片。"""
+        _, push = self._press("继续改这个函数")
+        push.assert_not_awaited()
+
+
+class MultiStepSplitRegressionTests(unittest.TestCase):
+    """多组选项 + 超长正文拆条，两个机制叠在一起不能互相破坏。
+
+    上一轮加拆条时只测了单组短正文，这组补上缺口：多步骤选项卡的按钮、
+    选项、当前组判定，在拆条路径下必须与不拆时完全一致。
+
+    多步骤的要害是「必须取最后一组」——顶部 tab 栏列出全部组，选项区只渲染
+    当前那一组。取错组的话，卡片显示的是已答过的旧组，点下去等于乱答。
+    """
+
+    REAL_SECOND_TAB = (
+        "❯ 请调用 AskUserQuestion 工具，在一次调用里同时问我两个问题。\n"
+        "───────────────────────────────────────────────\n"
+        "←  ☒ 方案  ☐ Agent  ✔ Submit  →\n\n"
+        "新 agent 用哪个？\n\n"
+        "❯ 1. 默认 claude\n     使用默认 claude agent\n"
+        "  2. 只起 codex\n     仅启动 codex agent\n"
+        "  3. 只开空 shell\n     仅开一个空的 shell 环境\n"
+        "  4. Type something.\n"
+        "───────────────────────────────────────────────\n"
+        "  5. Chat about this\n\n"
+        "Enter to select · Tab/Arrow keys to navigate · Esc to cancel")
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1)
+        self.bot.set_active("oc_1", "w0:p1", "project0")
+        self.sent = []
+        self.bot.reply_card = lambda chat_id, card: (
+            self.sent.append(card) or f"om_{len(self.sent)}")
+
+    def _notify(self, prompt):
+        self.sent.clear()
+        lk._notify_blocked(self.bot, {
+            "pane_id": "w0:p1", "agent": "claude", "project": "project0",
+            "prompt": prompt, "options": None,
+        })
+        return self.sent
+
+    @staticmethod
+    def _approval_keys(card):
+        return [a["value"].get("k") for el in card.get("elements", [])
+                for a in (el.get("actions") or [])
+                if a.get("value", {}).get("a") == lk.ACTION_CODES["approval"]]
+
+    def test_two_groups_short_prompt_uses_last_group(self):
+        cards = self._notify(MULTI_QUESTION)
+        body = json.dumps(cards[-1], ensure_ascii=False)
+        self.assertIn("只起 codex", body)          # 第二组
+        self.assertIn("新 agent 用哪个", body)
+
+    def test_two_groups_long_prompt_still_uses_last_group(self):
+        """拆条之后当前组判定不能变——按钮答的必须还是最后一组。"""
+        prompt = ("上文废话。" * 1300) + "\n" + MULTI_QUESTION
+        cards = self._notify(prompt)
+        self.assertGreater(len(cards), 1, "这么长该拆条")
+        body = json.dumps(cards[-1], ensure_ascii=False)
+        self.assertIn("只起 codex", body)
+        self.assertIn("新 agent 用哪个", body)
+
+    def test_long_prompt_keeps_all_three_buttons(self):
+        """选项数不能因为拆条而少——少一个就有答案点不到。"""
+        prompt = ("上文废话。" * 1300) + "\n" + MULTI_QUESTION
+        cards = self._notify(prompt)
+        self.assertEqual(self._approval_keys(cards[-1]), ["1", "2", "3"])
+
+    def test_buttons_never_appear_on_lead_cards(self):
+        """前置卡片一个审批按钮都不能有，否则两组序号并存。"""
+        prompt = ("上文废话。" * 1300) + "\n" + MULTI_QUESTION
+        cards = self._notify(prompt)
+        for card in cards[:-1]:
+            self.assertEqual(self._approval_keys(card), [])
+
+    def test_real_second_tab_pane_short(self):
+        """真实抓屏（第二个 tab 已激活）：选项必须解析得出。"""
+        cards = self._notify(lk.clean_pane(self.REAL_SECOND_TAB))
+        self.assertEqual(self._approval_keys(cards[-1]), ["1", "2", "3"])
+
+    def test_real_second_tab_pane_with_long_history(self):
+        """真实抓屏 + 长历史输出，走拆条路径后按钮仍齐。"""
+        prompt = lk.clean_pane(("历史输出。" * 1300) + "\n" + self.REAL_SECOND_TAB)
+        cards = self._notify(prompt)
+        self.assertGreater(len(cards), 1)
+        self.assertEqual(self._approval_keys(cards[-1]), ["1", "2", "3"])
+
+    def test_selector_not_duplicated_in_lead_cards(self):
+        """选择器只该被摘掉一次，不能在前置卡里又冒出来。"""
+        prompt = ("上文废话。" * 1300) + "\n" + self.REAL_SECOND_TAB
+        cards = self._notify(lk.clean_pane(prompt))
+        for card in cards[:-1]:
+            self.assertNotIn("Enter to select",
+                             json.dumps(card, ensure_ascii=False))
+
+
 class SelectorHintVariantTests(unittest.TestCase):
     """脚注多出一个没见过的短语，不能让整组选项跟着丢。
 

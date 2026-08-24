@@ -3266,6 +3266,10 @@ class LarkBot:
             self.audit(ctx.chat_id, "approve", agent, f"选项 {text.strip()}")
             self.approval_tokens.pop(pane_id, None)
             self.reply_text(ctx.chat_id, f"→ 已选 {text.strip()}（{project}）")
+            # 多步骤选项卡：答完一组还有下一组，得接着推。点按钮那条路径
+            # （_approve）一直有这一步，打数字这条漏了——AskUserQuestion 问
+            # 两组时，用打字答完第一组后群里再没动静，看着就像坏了。
+            await self._push_next_group(ctx.chat_id, pane_id)
             return
 
         await send_text_to_relay(pane_id, text)
