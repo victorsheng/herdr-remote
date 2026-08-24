@@ -1150,6 +1150,37 @@ def _strip_scroll_hint(line: str) -> str:
     return _SCROLL_HINT_RE.sub("", line)
 
 
+# AskUserQuestion 带 preview 时，终端把选项和预览面板**并排渲染成两列**：
+#     ❯ 1. 前文单发，最后一条带选项     ┌────────────────────────┐
+#          超出额度的上文拆成 N 条      │ 【卡片 1/3】上文前段…  │
+# 解析器按行切，右列的边框和别人的预览内容就混进了选项文字——实测 3 个选项
+# 只认出 2 个（有答案点不到），选项文字也面目全非。
+#
+# 判据分两半，都要满足才切：
+#   1. 框线出现在**大段空白**之后（≥3 空格）——preview 面板与左边的选项
+#      文字之间是填充空白，而表格的竖线间距通常只有 1-2 格
+#   2. 框线**左边那段本身不含框线字符**——表格行是 `│ a │ b │` 这种成对
+#      闭合的形态，左边一定已经出现过竖线；preview 的左列是纯文本
+# 只用条件 1 会把 `  │  #  │ 项 │` 这种表格切掉（实测吃掉了整张表的数据）。
+_PREVIEW_PANEL_RE = re.compile(r"\s{3,}[┌└│├].*$")
+_BOX_CHARS = "│┃┌┐└┘├┤┬┴┼─━"
+
+
+def strip_preview_panel(line: str) -> str:
+    """切掉右侧并排的 preview 面板，只留左边的选项文字。
+
+    表格行不动：它左边已经有竖线了，说明这是表格的一列而不是 preview 的
+    左边界。表格的边框由 _strip_table_pipes 负责。
+    """
+    match = _PREVIEW_PANEL_RE.search(line)
+    if not match:
+        return line
+    head = line[:match.start()]
+    if any(ch in head for ch in _BOX_CHARS):
+        return line          # 左边已有框线 → 这是表格，不是并排面板
+    return head
+
+
 def _strip_table_pipes(line: str) -> str:
     """去掉表格行的竖线，列之间留空格。
 
@@ -1178,6 +1209,7 @@ def clean_pane(text: str) -> str:
     lines = []
     for line in (text or "").splitlines():
         line = _strip_scroll_hint(line)
+        line = strip_preview_panel(line)
         if not line.strip() or _CHROME_RE.search(line):
             continue
         lines.append(_strip_table_pipes(line))

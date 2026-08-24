@@ -3850,6 +3850,78 @@ class TypedDigitPushesNextGroupTests(unittest.TestCase):
         push.assert_not_awaited()
 
 
+class PreviewPanelPollutionTests(unittest.TestCase):
+    """选项右边并排一个 preview 面板时，选项文字不能被面板内容污染。
+
+    AskUserQuestion 带 preview 时，终端把选项和预览面板**并排渲染成两列**：
+
+        ❯ 1. 前文单发，最后一条带选项     ┌────────────────────────┐
+             超出额度的上文拆成 N 条      │ 【卡片 1/3】上文前段…  │
+          2. 按钮卡在前，上文补在后       │ 【卡片 2/3】上文后段…  │
+
+    解析器按行切，就把右列的边框和别人的预览内容当成了选项文字。
+
+    实测后果（群里 21:34 那张卡，用户报「不好使」的就是它）：
+      - 选项文字面目全非，手机上看不出 1/2/3 是什么
+      - 更糟的是漏选项：3 个选项只解析出 2 个，有答案根本点不到
+
+    判据用「两个以上空格 + 竖线/框线」切掉右列——preview 面板一定在右边，
+    且与选项文字之间有大段空白填充。
+    """
+
+    REAL_PREVIEW_PANE = (
+        "←  ☐ 拆分方式  ☐ 数量上限  ✔ Submit  →\n"
+        "超长拆多条，正文怎么分配？\n\n"
+        "❯ 1. 前文单发，最后一条带选项     ┌────────────────────────┐\n"
+        "     超出额度的上文拆成 N 条      │ 【卡片 1/3】上文前段…  │\n"
+        "  2. 按钮卡在前，上文补在后       │ 【卡片 2/3】上文后段…  │\n"
+        "     先发带按钮的卡              │ 【卡片 3/3】           │\n"
+        "  3. 只发一条，上文放折叠区       │   问题：要继续吗？     │\n"
+        "     不拆条                      └────────────────────────┘\n"
+        "  4. Type something.\n"
+        "  5. Chat about this\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+    def _group(self):
+        return lk.current_option_group(
+            lk.detect_option_groups(lk.clean_pane(self.REAL_PREVIEW_PANE)))
+
+    def test_all_three_options_are_found(self):
+        """漏选项是最严重的：有答案点不到。"""
+        group = self._group()
+        self.assertIsNotNone(group)
+        self.assertEqual(len(group["options"]), 3, group["options"])
+
+    def test_option_text_has_no_panel_border(self):
+        for option in self._group()["options"]:
+            for ch in "│┌┐└┘─":
+                self.assertNotIn(ch, option, option)
+
+    def test_option_text_is_not_polluted_by_other_previews(self):
+        """选项 1 不该带上选项 2 的预览内容。"""
+        for option in self._group()["options"]:
+            self.assertNotIn("【卡片", option, option)
+            self.assertNotIn("问题：要继续吗", option, option)
+
+    def test_options_keep_their_real_labels(self):
+        options = self._group()["options"]
+        self.assertIn("前文单发", options[0])
+        self.assertIn("按钮卡在前", options[1])
+        self.assertIn("只发一条", options[2])
+
+    def test_question_is_clean(self):
+        self.assertEqual(self._group()["question"], "超长拆多条，正文怎么分配？")
+
+    def test_plain_table_output_is_untouched(self):
+        """正常的表格输出不能被这个规则误伤——它不是 preview 面板。
+
+        表格行的竖线由 _strip_table_pipes 处理，两者别打架。
+        """
+        text = "│ 列一 │ 列二 │\n│ a │ b │"
+        self.assertIn("列一", lk.clean_pane(text))
+        self.assertIn("列二", lk.clean_pane(text))
+
+
 class MultiStepSplitRegressionTests(unittest.TestCase):
     """多组选项 + 超长正文拆条，两个机制叠在一起不能互相破坏。
 
