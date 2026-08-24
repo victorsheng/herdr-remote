@@ -1081,6 +1081,24 @@ def follow_up_hint(project: str) -> str:
     return f"— 直接发消息即可继续指挥 {project}（/agents 换人）"
 
 
+# 终端右下角的滚动提示符，会被**拼在正文行尾**，中间垫一大段空格：
+#     5. Chat about this                       Jump to bottom (click) ↓
+# 所以 _CHROME_PATTERNS 那些 ^...$ 整行锚定的模式滤不掉它。
+# 用「前面有 2 个以上空格」区分装饰与正文：agent 真的在讨论这个提示符时
+# （比如本次修复的讨论过程），那串字出现在句子里、前面不会有大段空格。
+# 两种形态都要剪：
+#   拼在正文行尾  →  前面垫了 2 个以上空格
+#   独占一行      →  整行只有缩进 + 提示符
+# 都靠「提示符前面没有正文」来判定，所以 agent 正文里以这串字开头的句子
+# （比如本次修复的讨论）不受影响——那种情况前面是行首、后面紧跟中文。
+_SCROLL_HINT_RE = re.compile(r"(?:\s{2,}|^\s*)Jump to bottom \(click\)\s*↓\s*$")
+
+
+def _strip_scroll_hint(line: str) -> str:
+    """剪掉行尾拼接的终端滚动提示符，留下行首的真实内容。"""
+    return _SCROLL_HINT_RE.sub("", line)
+
+
 def _strip_table_pipes(line: str) -> str:
     """去掉表格行的竖线，列之间留空格。
 
@@ -1108,6 +1126,7 @@ def clean_pane(text: str) -> str:
     """
     lines = []
     for line in (text or "").splitlines():
+        line = _strip_scroll_hint(line)
         if not line.strip() or _CHROME_RE.search(line):
             continue
         lines.append(_strip_table_pipes(line))

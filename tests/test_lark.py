@@ -4320,6 +4320,57 @@ class SuggestCommandTests(unittest.TestCase):
         self.assertIsNone(lk.suggest_command("/Users/victor/code/foo.py"))
 
 
+class JumpToBottomHintTests(unittest.TestCase):
+    """`Jump to bottom (click) ↓` 是终端滚动提示符，不是 agent 的输出。
+
+    真实样本（群里 424 条消息命中 7 条），注意它**拼在正文行尾**、
+    不独占一行：
+
+        4. Type something.
+        5. Chat about this                       Jump to bottom (click) ↓
+
+    所以 _CHROME_PATTERNS 里那些 ^...$ 整行锚定的模式全都滤不掉它。
+    这里做的是行内剪除，且必须留下行首的真实内容。
+
+    注意：滤掉提示符只是去脏字符，不解决内容残缺——那由 relay 的
+    STALE_VIEWPORT_MARK 标注负责（见 test_relay_scroll_staleness.py）。
+    """
+
+    def test_hint_appended_to_content_line_is_trimmed(self):
+        """真实样本：提示符拼在选项行尾，内容要留下、提示符要走。"""
+        out = lk.clean_pane(
+            "  4. Type something.\n"
+            "  5. Chat about this                       Jump to bottom (click) ↓")
+        self.assertNotIn("Jump to bottom", out)
+        self.assertIn("Chat about this", out)
+        self.assertIn("Type something.", out)
+
+    def test_standalone_hint_line_is_dropped(self):
+        """独占一行时整行都不该留下。"""
+        out = lk.clean_pane("real output\n        Jump to bottom (click) ↓")
+        self.assertNotIn("Jump to bottom", out)
+        self.assertIn("real output", out)
+
+    def test_trailing_arrow_is_trimmed_too(self):
+        """↓ 是提示符的一部分，别把箭头孤零零留在行尾。"""
+        out = lk.clean_pane("  5. Chat about this        Jump to bottom (click) ↓")
+        self.assertNotIn("↓", out)
+        self.assertEqual(out.strip(), "5. Chat about this")
+
+    def test_content_mentioning_the_phrase_is_kept(self):
+        """agent 真的在讨论这个提示符时不能被吃掉——它是正文。
+
+        回归防线：本次修复的讨论过程本身就会在 pane 里出现这串字，
+        用「前面有大段空格」区分装饰与正文。
+        """
+        line = 'Jump to bottom (click) ↓ 有的时候消息会有这个，不该出现'
+        self.assertIn("Jump to bottom", lk.clean_pane(line))
+
+    def test_no_false_trim_on_normal_lines(self):
+        out = lk.clean_pane("  5. Chat about this")
+        self.assertEqual(out.strip(), "5. Chat about this")
+
+
 class ClearCommandTests(unittest.TestCase):
     """/clear 把字面量 "/clear" 发进 pane，清掉 agent 自己的上下文。
 

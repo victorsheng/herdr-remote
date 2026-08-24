@@ -773,11 +773,39 @@ async def get_all_agents_async():
     return _apply_workspace_labels(agents, workspace_label_cache)
 
 
+# 视口不在底部时抓到的内容不是最新的，给它挂个标注。
+# 症状是群里的消息末尾拼着终端的 `Jump to bottom (click) ↓` 提示符——
+# 那是「底部还有内容没抓到」的信号。只把提示符滤掉是错的：内容照样缺，
+# 而且再也看不出哪条不可信，所以这里明确标注出来。
+STALE_VIEWPORT_MARK = "⚠ 终端当时处于回滚状态，以下内容可能不是最新的"
+
+
+async def pane_scroll_offset(pane_id, remote=None) -> int:
+    """视口离底部多少行。0 = 在底部（内容是最新的）。
+
+    herdr 在 `pane get` 里一直返回 scroll.offset_from_bottom，用它判断比
+    正则匹配 UI 提示文案可靠——文案会随版本改，这个字段不会。
+
+    拿不到就返回 0（按「在底部」处理）：抓屏是主路径，不能因为多这一次
+    查询就失败，更不能凭空给正常内容挂上警告。
+    """
+    try:
+        raw = await run_herdr_async("pane", "get", pane_id, remote=remote)
+        pane = json.loads(raw).get("result", {}).get("pane", {})
+        return int(pane.get("scroll", {}).get("offset_from_bottom") or 0)
+    except Exception:
+        return 0
+
+
 async def read_pane_async(pane_id, remote=None):
     raw = await run_herdr_async("pane", "read", pane_id, "--lines", "50",
                                 "--source", "recent", remote=remote)
     lines = [l for l in raw.splitlines() if l.strip() and not CHROME_RE.search(l)]
-    return "\n".join(lines[-20:])
+    content = "\n".join(lines[-20:])
+    # 标注放在最前面：手机上往往只看得到开头几行。
+    if await pane_scroll_offset(pane_id, remote=remote) > 0:
+        return f"{STALE_VIEWPORT_MARK}\n{content}" if content else STALE_VIEWPORT_MARK
+    return content
 
 
 # 布局操作被 herdr 拒绝时的原因 → 面向用户的中文说明。
