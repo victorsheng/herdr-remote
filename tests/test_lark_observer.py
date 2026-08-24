@@ -115,6 +115,161 @@ class CardCheckTests(unittest.TestCase):
         self.assertFalse(ob.card_has_buttons({}))
 
 
+class OptionCardIntegrityTests(unittest.TestCase):
+    """选项卡的选项必须干净、齐全，且按钮和选项对得上。
+
+    真实故障（群里 2026-08-24 21:34 那张卡）：带 preview 的 AskUserQuestion
+    把选项和预览面板并排渲染成两列，解析器按行切，右列的边框和别人的预览
+    内容混进了选项文字：
+
+        1. 前文单发，最后一条带选项     ┌──────────────┐
+        2. 按钮卡在前，上文补在后       │ 【卡片 2/3】 │
+
+    手机上根本看不出 1/2/3 是什么。更严重的是同一原因会**吃掉选项**——
+    实测 3 个选项只解析出 2 个，有答案根本点不到，人只能盲选或放弃。
+
+    这两种都要报：污染是「看不懂」，数量不符是「点不到」。
+    """
+
+    # 群里那张真实污染卡片的元素结构（选项序号与文字交替出现）
+    POLLUTED = {"elements": [
+        [{"tag": "text", "text": "⏺ 两个发送点。"}],
+        [{"tag": "text", "text": "超长拆多条，正文怎么分配？"}],
+        [{"tag": "text", "text": "1."},
+         {"tag": "text", "text": " 前文单发，最后一条带选项     ┌────────────┐\n"},
+         {"tag": "text", "text": "2."},
+         {"tag": "text", "text": " 按钮卡在前，上文补在后       │ 【卡片 2/3】 │\n"},
+         {"tag": "text", "text": "3."},
+         {"tag": "text", "text": " 只发一条，上文放折叠区       │ 【卡片 3/3】 │"}],
+        [{"tag": "button", "text": "1"}, {"tag": "button", "text": "2"},
+         {"tag": "button", "text": "3"}],
+        [{"tag": "button", "text": "Open output & reply"}],
+    ]}
+
+    CLEAN = {"elements": [
+        [{"tag": "text", "text": "超长拆多条，正文怎么分配？"}],
+        [{"tag": "text", "text": "1."}, {"tag": "text", "text": " 前文单发\n"},
+         {"tag": "text", "text": "2."}, {"tag": "text", "text": " 按钮卡在前\n"},
+         {"tag": "text", "text": "3."}, {"tag": "text", "text": " 只发一条"}],
+        [{"tag": "button", "text": "1"}, {"tag": "button", "text": "2"},
+         {"tag": "button", "text": "3"}],
+    ]}
+
+    # 按钮少一个：有答案点不到
+    SHORT_BUTTONS = {"elements": [
+        [{"tag": "text", "text": "1."}, {"tag": "text", "text": " 甲\n"},
+         {"tag": "text", "text": "2."}, {"tag": "text", "text": " 乙\n"},
+         {"tag": "text", "text": "3."}, {"tag": "text", "text": " 丙"}],
+        [{"tag": "button", "text": "1"}, {"tag": "button", "text": "2"}],
+    ]}
+
+    def _rules(self, card):
+        return {p["rule"] for p in ob.check_option_card(card)}
+
+    def test_clean_card_has_no_problem(self):
+        """主路径：正常选项卡一个问题都不该报，否则又是刷屏。"""
+        self.assertEqual(ob.check_option_card(self.CLEAN), [])
+
+    def test_polluted_option_text_is_reported(self):
+        self.assertIn("option_text_polluted", self._rules(self.POLLUTED))
+
+    def test_pollution_detail_names_the_option(self):
+        """报告要能让人一眼看出是哪条选项坏了。
+
+        这张卡三条选项都被污染，所以三条都该报——报告里要带序号和原文
+        片段，光说「有选项坏了」没法定位。
+        """
+        problems = [p for p in ob.check_option_card(self.POLLUTED)
+                    if p["rule"] == "option_text_polluted"]
+        self.assertEqual(len(problems), 3, problems)
+        detail = problems[0]["detail"]
+        self.assertIn("选项 1", detail)
+        self.assertIn("前文单发", detail)     # 带上原文才能定位
+
+    def test_button_count_mismatch_is_reported(self):
+        self.assertIn("option_button_mismatch", self._rules(self.SHORT_BUTTONS))
+
+    def test_mismatch_detail_shows_both_counts(self):
+        problems = [p for p in ob.check_option_card(self.SHORT_BUTTONS)
+                    if p["rule"] == "option_button_mismatch"]
+        self.assertIn("3", problems[0]["detail"])
+        self.assertIn("2", problems[0]["detail"])
+
+    def test_non_option_card_is_skipped(self):
+        """输出展示卡片没有选项清单，不该被这条规则碰到。"""
+        card = {"elements": [[{"tag": "text", "text": "DONE"},
+                              {"tag": "text", "text": " · claude"}]]}
+        self.assertEqual(ob.check_option_card(card), [])
+
+    def test_degraded_card_is_skipped(self):
+        """降级内容看不到元素树，任何结论都是瞎猜——别造假警报。"""
+        degraded = {"elements": [[{"tag": "text",
+                                   "text": "请升级至最新版本客户端，以查看内容"}]]}
+        self.assertEqual(ob.check_option_card(degraded), [])
+
+    def test_empty_card_is_skipped(self):
+        self.assertEqual(ob.check_option_card({}), [])
+
+    def test_table_in_option_text_is_not_pollution(self):
+        """选项本身就在讲表格时不能误报——它是正文，不是并排面板。
+
+        判据是「框线前有大段空白」，表格的竖线紧贴内容，两者可区分。
+        """
+        card = {"elements": [
+            [{"tag": "text", "text": "1."},
+             {"tag": "text", "text": " 用 │ 分隔的表格\n"},
+             {"tag": "text", "text": "2."},
+             {"tag": "text", "text": " 用逗号分隔"}],
+            [{"tag": "button", "text": "1"}, {"tag": "button", "text": "2"}],
+        ]}
+        self.assertNotIn("option_text_polluted", self._rules(card))
+
+
+class OptionCardCheckWiringTests(unittest.TestCase):
+    """校验函数必须真的接进 _check_message，光有函数等于没加。"""
+
+    def _observer(self, tag):
+        obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(),
+                          seen=ob.SeenStore(
+                              os.path.join(_TMP, f"opt-{tag}-{time.time()}.json")))
+        obs.report = unittest.mock.MagicMock()
+        return obs
+
+    def _check(self, obs, content, mid):
+        obs._check_message("oc_1", "herdr · herdr-remote", {
+            "message_id": mid, "msg_type": "interactive",
+            "create_time": time.time(), "sender": "app",
+            "content": content, "text": ""}, time.time())
+
+    def test_polluted_card_is_reported(self):
+        obs = self._observer("polluted")
+        self._check(obs, OptionCardIntegrityTests.POLLUTED, "om_polluted")
+        obs.report.assert_called_once()
+        rules = {p["rule"] for p in obs.report.call_args[0][0]["problems"]}
+        self.assertIn("option_text_polluted", rules)
+
+    def test_button_mismatch_is_reported(self):
+        obs = self._observer("mismatch")
+        self._check(obs, OptionCardIntegrityTests.SHORT_BUTTONS, "om_mismatch")
+        obs.report.assert_called_once()
+        rules = {p["rule"] for p in obs.report.call_args[0][0]["problems"]}
+        self.assertIn("option_button_mismatch", rules)
+
+    def test_clean_option_card_is_not_reported(self):
+        """主路径：正常选项卡不上报，否则每张选项卡都刷一条。"""
+        obs = self._observer("clean")
+        self._check(obs, OptionCardIntegrityTests.CLEAN, "om_clean")
+        obs.report.assert_not_called()
+
+    def test_output_card_is_not_reported(self):
+        """DONE 那类展示卡没有选项清单，不该被这条规则碰到。"""
+        obs = self._observer("output")
+        self._check(obs, {"elements": [[{"tag": "text", "text": "DONE"},
+                                        {"tag": "text", "text": " · claude"}]]},
+                    "om_output")
+        obs.report.assert_not_called()
+
+
 class DegradedCardTests(unittest.TestCase):
     """飞书 message.list 对 schema 2.0 卡片只给降级内容。
 

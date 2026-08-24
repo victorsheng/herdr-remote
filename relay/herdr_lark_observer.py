@@ -152,6 +152,105 @@ def check_text(text: str) -> list[dict]:
     return problems
 
 
+# 选项卡的选项文字被并排的 preview 面板污染。真实故障（群里 21:34 那张卡）：
+# 带 preview 的 AskUserQuestion 把选项和预览面板渲染成两列，解析器按行切，
+# 右列的边框和别人的预览内容就混进了选项文字：
+#     1. 前文单发，最后一条带选项     ┌────────────┐
+#     2. 按钮卡在前，上文补在后       │ 【卡片 2/3】│
+# 手机上看不出 1/2/3 是什么；更严重的是同一原因会**吃掉选项**（实测 3 个
+# 只解析出 2 个），有答案根本点不到。
+#
+# 判据与 herdr_lark.strip_preview_panel 一致：框线出现在 ≥3 空格之后。
+# observer 不 import herdr_lark（刻意的进程隔离），所以这里留一份副本。
+# 与 herdr_lark.py 保持同步：那边改判据就往这里改。
+_PANEL_IN_OPTION_RE = re.compile(r"\s{3,}[┌└│├┐┘┤─━]")
+# 选项清单的行首序号：`1.` `2.` …（build_option_card 的渲染形态）
+_OPTION_INDEX_RE = re.compile(r"^\s*\*{0,2}(\d+)[.．]\*{0,2}\s*$")
+
+
+def _card_text_cells(content: dict) -> list[str]:
+    """把卡片里所有文本元素摊平成字符串列表，保持出现顺序。"""
+    out = []
+    for row in (content or {}).get("elements") or []:
+        cells = row if isinstance(row, list) else [row]
+        for cell in cells:
+            if not isinstance(cell, dict) or cell.get("tag") != "text":
+                continue
+            text = cell.get("text")
+            if isinstance(text, dict):
+                text = text.get("content")
+            out.append(str(text or ""))
+    return out
+
+
+def _card_button_labels(content: dict) -> list[str]:
+    out = []
+    for row in (content or {}).get("elements") or []:
+        cells = row if isinstance(row, list) else [row]
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            if cell.get("tag") == "button":
+                text = cell.get("text")
+                if isinstance(text, dict):
+                    text = text.get("content")
+                out.append(str(text or ""))
+            for act in cell.get("actions") or []:
+                if isinstance(act, dict) and act.get("tag") == "button":
+                    text = act.get("text")
+                    if isinstance(text, dict):
+                        text = text.get("content")
+                    out.append(str(text or ""))
+    return out
+
+
+def parse_option_cells(content: dict) -> list[tuple[str, str]]:
+    """从卡片里抽出 [(序号, 选项文字)]。不是选项卡就返回空。
+
+    build_option_card 把选项渲染成「序号元素 + 文字元素」交替出现，所以
+    认到一个纯序号元素，就把紧跟着的那个文本元素当它的选项文字。
+    """
+    cells = _card_text_cells(content)
+    pairs = []
+    for i, cell in enumerate(cells):
+        m = _OPTION_INDEX_RE.match(cell)
+        if m and i + 1 < len(cells):
+            pairs.append((m.group(1), cells[i + 1]))
+    return pairs
+
+
+def check_option_card(content: dict) -> list[dict]:
+    """校验选项卡：选项文字要干净，按钮数要和选项数对得上。
+
+    降级内容一律跳过——看不到真元素树，任何结论都是瞎猜，而假警报刷一屏
+    之后人就不看质检群了（card_no_buttons 已经踩过这个坑）。
+    """
+    if not content or card_is_degraded(content):
+        return []
+    pairs = parse_option_cells(content)
+    if not pairs:
+        return []          # 不是选项卡（输出展示卡那类），这条规则不适用
+
+    problems = []
+    for index, text in pairs:
+        if _PANEL_IN_OPTION_RE.search(text):
+            problems.append({
+                "rule": "option_text_polluted",
+                "detail": (f"选项 {index} 的文字里混进了并排 preview 面板的"
+                           f"边框：{text.strip()[:60]!r}"),
+            })
+
+    # 按钮只放序号（见 herdr_lark.build_option_card），数字按钮应与选项一一对应。
+    numeric = [b for b in _card_button_labels(content) if b.strip().isdigit()]
+    if numeric and len(numeric) != len(pairs):
+        problems.append({
+            "rule": "option_button_mismatch",
+            "detail": (f"正文列了 {len(pairs)} 个选项，却只有 {len(numeric)} 个"
+                       f"数字按钮——有答案点不到"),
+        })
+    return problems
+
+
 # 飞书 message.list 对 schema 2.0 卡片只返回渲染降级版，元素树拿不到：
 #   {"title": "...", "elements": [[{"tag":"img"...},
 #                                  {"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}
@@ -555,6 +654,10 @@ class Observer:
                 if not card_has_buttons(msg["content"]):
                     problems.append({"rule": "card_no_buttons",
                                      "detail": "交互卡片里没有任何按钮，手机上点不了"})
+            # 选项卡的选项完整性单独判：它和「有没有按钮」是两件事——选项卡
+            # 有按钮，但选项文字可能被并排的 preview 面板污染，或者按钮数
+            # 少于选项数（有答案点不到）。降级判断在函数内部做。
+            problems.extend(check_option_card(msg["content"]))
 
         if problems:
             self.stats["content"] += 1
