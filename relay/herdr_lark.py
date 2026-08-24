@@ -572,17 +572,28 @@ TOOL_BUTTONS = [(label, "default") for label in TOOL_BUTTON_LABELS]
 SUBAGENT_BUTTONS = [(label, "default") for label in SUBAGENT_BUTTON_LABELS]
 
 
-def truncate_prompt(text: str, limit: int = 400) -> str:
-    """超长时保留首尾，中间标注省略量。
+# 卡片正文额度。输出卡片（build_pane_card）和审批卡片共用同一个数，
+# 免得同一份内容在更需要看全的审批场景反而被砍得更狠。
+_CARD_BODY_LIMIT = 2400
+
+
+def truncate_prompt(text: str, limit: int = _CARD_BODY_LIMIT) -> str:
+    """超长时保留**末尾**，开头标一个记号。
 
     直接 text[:limit] 会把命令结尾切掉，而审批一条 rm -rf 时最该看清的恰恰
-    是末尾的路径。做法来自官方 Claude Code Channels 的权限中继。
+    是末尾的路径。
+
+    原先是「保首尾、中间挖空」（抄官方 Channels 的权限中继），实测中间那段
+    `⋯ 省略 N 字 ⋯` 恰好盖住问题和选项——审批要看的问题、选项、命令结尾
+    全在末尾，开头往往是已经翻过去的旧上文。改成保末尾，与 build_pane_card
+    的 body[-N:] 一致。
+
+    额度也从写死的 400 提到 _CARD_BODY_LIMIT：同一份内容在输出卡片有 2400，
+    在更需要看全的审批卡片却只有 400，是反的。
     """
     if len(text) <= limit:
         return text
-    keep = max(1, (limit - 20) // 2)
-    elided = len(text) - keep * 2
-    return f"{text[:keep]}\n⋯ 省略 {elided} 字 ⋯\n{text[-keep:]}"
+    return "⋯\n" + text[-limit:]
 
 
 def _approval_labels(options: list[str] | None) -> list[str]:
@@ -1176,9 +1187,6 @@ def status_glyph(status: str) -> str:
     return _STATUS_GLYPHS.get(status or "", _IDLE_GLYPH)
 
 
-_CARD_BODY_LIMIT = 2400
-
-
 def status_color(status: str) -> str:
     return _STATUS_COLORS.get(status, "grey")
 
@@ -1733,19 +1741,26 @@ _MAX_OPTIONS = 9
 # 那份文件跟着 Claude 版本远程更新，比照单次抓屏归纳可靠。照抓屏猜会漏变体
 # （最初就漏了 confirm、↑/↓、set as default 三种），漏一个，那个变体下的
 # 选择器就整组丢掉。加新变体时对着 manifest 抄，别自己想。
+# 原先要求「整行由已知短语拼满」，结果 Claude 加了一个 `n to add notes`
+# 就整行认不出——选择器留在正文里白占额度，选项还可能整组丢掉（实测）。
+#
+# 短语抄自 herdr 自己的检测 manifest（它判 blocked 用的就是这些）：
+#   ~/.local/state/herdr/agent-detection/remote/claude.toml → live_blocked_form
+# 那份文件跟着 Claude 版本远程更新，比照单次抓屏归纳可靠。加新变体时对着
+# manifest 抄，别自己想。
 _SELECTOR_HINT_PHRASES = [
     r"enter to (?:select|confirm|set as default)",
     r"(?:tab/)?arrows? (?:keys )?to navigate",
     r"(?:↑/↓|↑↓|arrows?) to navigate",
-    r"esc to cancel",
-    r"press enter[\w\s]*",
+    r"esc(?:ape)? to cancel",
+    r"^press enter(?:\s+to\s+\w+)?$",
 ]
-# 整行必须由这些短语（可用 · 串联）拼满才算提示行。不搜子串：正常输出里的
-# 「Enter the build directory」「navigate to the folder」不该被放过，否则
-# 历史旧选择器会被误认成活的。
-_SELECTOR_HINT_RE = re.compile(
-    r"^(?:[·•|\s]*(?:" + "|".join(_SELECTOR_HINT_PHRASES) + r"))+[·•|\s]*$",
-    re.I)
+_KNOWN_HINT_RE = re.compile("|".join(_SELECTOR_HINT_PHRASES), re.I)
+# 脚注里夹的未知短语（`n to add notes`、`s to skip`）长这样：<键> to <动作>。
+# 只在「整行已经确认是脚注」之后用它放行未知段，不单独作为判据——否则
+# 「navigate to the folder」这种正文会被当成脚注，正文从那行被切断。
+_HINT_SEGMENT_RE = re.compile(
+    r"^\s*[\w↑↓/+\-]+(?:\s+[\w/+\-]+){0,2}\s+to\s+[\w\s/-]+$", re.I)
 
 # AskUserQuestion 选择器自带的固定尾项，跟着每一组走，不是 agent 问你的内容。
 # 按下去会掉进自由输入框而不是选中什么，所以不该出现在卡片上。
@@ -1995,8 +2010,27 @@ def is_selector_hint(stripped: str) -> bool:
 
     提示行属于选择器自己，不是「选择器之后的正文」。把它当正文的话，
     _is_selector_tail 会判定选择器已翻篇，整组选项被丢弃。
+
+    判据照 herdr 的 manifest（claude.toml 的 live_blocked_form）：
+    确认短语 + 取消短语同时出现。此外要求每一段都长得像「x to y」的
+    操作提示，否则正常句子里凑巧同时出现这两个词就会被误判，正文会
+    从那行被切断。
     """
-    return bool(_SELECTOR_HINT_RE.match(strip_border(stripped or "")))
+    line = strip_border(stripped or "").strip()
+    if not line:
+        return False
+    segments = [s.strip() for s in re.split(r"[·•|]", line) if s.strip()]
+    if not segments:
+        return False
+    # 每一段要么是 manifest 认得的已知短语，要么是「<键> to <动作>」形状的
+    # 未知短语（`n to add notes`）。整行所有段都得过——只要有一段是普通
+    # 正文，这行就不是脚注，不能从这里切断正文。
+    if not all(_KNOWN_HINT_RE.search(s) or _HINT_SEGMENT_RE.match(s)
+               for s in segments):
+        return False
+    # 至少要有一段是 manifest 认得的：否则「navigate to the folder」这类
+    # 恰好符合「x to y」形状的正文会被误判成脚注。
+    return any(_KNOWN_HINT_RE.search(s) for s in segments)
 
 
 def is_tui_tail_option(text: str) -> bool:

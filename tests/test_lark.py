@@ -437,21 +437,44 @@ def option_text_in(card):
 
 
 class TruncateTests(unittest.TestCase):
-    """借鉴官方 Channels：命令结尾对审批者最要紧，不能被直接截掉。"""
+    """借鉴官方 Channels：命令结尾对审批者最要紧，不能被直接截掉。
+
+    2026-08 改为「保末尾」：原先保首尾、中间挖空，实测中间那段
+    `⋯ 省略 N 字 ⋯` 恰好盖住问题和选项——审批时最该看的就在末尾，
+    开头往往是已经翻过去的旧上文。与 build_pane_card 的 body[-N:] 一致。
+    """
 
     def test_short_text_untouched(self):
         self.assertEqual(lk.truncate_prompt("rm -rf ./build", 400), "rm -rf ./build")
 
-    def test_keeps_head_and_tail(self):
-        text = "START" + ("x" * 500) + "END"
+    def test_keeps_the_tail(self):
+        """末尾一个字都不能少——问题和选项在那里。"""
+        text = "START" + ("x" * 500) + "END-QUESTION"
         out = lk.truncate_prompt(text, 100)
-        self.assertTrue(out.startswith("START"))
-        self.assertTrue(out.endswith("END"))
+        self.assertTrue(out.endswith("END-QUESTION"), out[-30:])
 
-    def test_marks_elided_amount(self):
+    def test_drops_the_head_when_too_long(self):
+        text = "STALE-HEAD" + ("x" * 500) + "END"
+        self.assertNotIn("STALE-HEAD", lk.truncate_prompt(text, 100))
+
+    def test_marks_that_content_was_cut(self):
+        """得留个记号，不然看不出前面还有内容被砍了。"""
         out = lk.truncate_prompt("y" * 500, 100)
-        self.assertIn("省略", out)
         self.assertLess(len(out), 500)
+        self.assertTrue(out.startswith("⋯"), out[:20])
+
+    def test_respects_the_limit(self):
+        out = lk.truncate_prompt("y" * 5000, 400)
+        self.assertLessEqual(len(out), 400 + 4)
+
+    def test_default_limit_matches_card_body(self):
+        """审批卡片的额度不该只有输出卡片的六分之一。
+
+        回归防线：原先审批卡片写死 400，而 build_pane_card 用 2400，
+        同一份内容在审批场景反而被砍得更狠——恰恰是最需要看全的场景。
+        """
+        self.assertGreaterEqual(lk.truncate_prompt.__defaults__[0],
+                                lk._CARD_BODY_LIMIT)
 
 
 class BlockedCardTests(unittest.TestCase):
@@ -498,9 +521,16 @@ class BlockedCardTests(unittest.TestCase):
         self.assertIn(lk.ACTION_CODES["select_reply"], actions)
 
     def test_prompt_is_truncated(self):
-        card = lk.build_blocked_card("w1:p1", "a", "p", "z" * 2000, None, "abcde")
+        """超长必须截，但额度按 _CARD_BODY_LIMIT 算，不是写死的小数。
+
+        原先断言渲染后 < 2000（基于写死的 400 额度）。额度提到 2400 后
+        这个数字失去意义——实测 5696 字符的卡片飞书正常接收，所以这里改
+        为盯「确实截断了」而不是盯一个魔法数。
+        """
+        card = lk.build_blocked_card("w1:p1", "a", "p", "z" * 9000, None, "abcde")
         rendered = json.dumps(card, ensure_ascii=False)
-        self.assertLess(len(rendered), 2000)
+        self.assertLess(len(rendered), 9000)
+        self.assertIn("⋯", rendered)
 
 
 class AgentPickerCardTests(unittest.TestCase):
@@ -3642,6 +3672,76 @@ class BlockedCardReadabilityTests(unittest.TestCase):
             lk.TOOL_OPTIONS, "abcde")
         code = next(b for b in self._text_blocks(card) if b.startswith("```"))
         self.assertIn("rm -rf build", code)
+
+
+class SelectorHintVariantTests(unittest.TestCase):
+    """脚注多出一个没见过的短语，不能让整组选项跟着丢。
+
+    真实抓屏（用户反馈）：
+        Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
+    `n to add notes` 不在短语表里，而旧的匹配要求**整行由已知短语拼满**，
+    于是整行认不出 → 被当成正文 → strip_selector 失效 → 选择器留在正文里
+    白占 truncate_prompt 的额度，选项也可能整组丢掉。
+
+    herdr 自己的 manifest（claude.toml 的 live_blocked_form）用的是
+    `contains` 子串语义：只要含 esc to cancel + enter to select/confirm
+    就算。这里对齐它，未知短语一律容忍。
+    """
+
+    def test_known_footer_still_recognised(self):
+        self.assertTrue(lk.is_selector_hint(
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"))
+
+    def test_add_notes_variant_recognised(self):
+        """用户报的那一条。"""
+        self.assertTrue(lk.is_selector_hint(
+            "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel"))
+
+    def test_unknown_extra_phrases_tolerated(self):
+        """再多几个没见过的短语也得认——这是本次修复的要点。"""
+        self.assertTrue(lk.is_selector_hint(
+            "Enter to select · ↑/↓ to navigate · n to add notes · "
+            "s to skip · Esc to cancel"))
+
+    def test_tab_arrow_variant_still_recognised(self):
+        self.assertTrue(lk.is_selector_hint(
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"))
+
+    def test_enter_to_confirm_variant(self):
+        self.assertTrue(lk.is_selector_hint("Enter to confirm · Esc to cancel"))
+
+    def test_prose_is_not_a_footer(self):
+        """正常输出不能被误判成脚注，否则正文会被从那里切掉。
+
+        「不搜子串」原本就是为了防这个，放宽后仍须守住。
+        """
+        for line in ("Enter the build directory to continue",
+                     "navigate to the folder and press enter",
+                     "Esc key handling is broken in this version",
+                     "run npm test to cancel the watcher"):
+            self.assertFalse(lk.is_selector_hint(line), line)
+
+    def test_single_known_phrase_alone_is_still_a_hint(self):
+        """单个短语独占一行也得认——脚注会跨行。
+
+        我起初写的是反向断言（要求两半同时出现才算），跑测试才发现它跟
+        ManifestHintCoverageTests 冲突：那组测试防的是 f5b03e1 修过的真实
+        bug——脚注跨行时单行只有 `esc to cancel`，不认就整组选项丢失。
+        """
+        self.assertTrue(lk.is_selector_hint("Esc to cancel"))
+        self.assertTrue(lk.is_selector_hint("Enter to select"))
+
+    def test_strip_selector_removes_the_add_notes_selector(self):
+        """端到端：用户样本里的选择器必须被摘掉。"""
+        sample = ("上文正文在这里。\n"
+                  "  1. 先停下\n"
+                  "  2. 继续\n"
+                  "  Chat about this\n"
+                  "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel")
+        out = lk.strip_selector(sample)
+        self.assertIn("上文正文在这里。", out)
+        self.assertNotIn("Enter to select", out)
+        self.assertNotIn("add notes", out)
 
 
 class StripSelectorTests(unittest.TestCase):
