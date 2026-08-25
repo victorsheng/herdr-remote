@@ -4900,6 +4900,136 @@ class ApprovalKeysTests(unittest.TestCase):
         self.assertEqual(lk.approval_keys(3, multiselect=False), ["3"])
 
 
+class AgentStuckTests(unittest.TestCase):
+    """认出「工具被取消、agent 卡在没法交互的状态」。
+
+    真机复现（herder-lark-test）：AskUserQuestion 期间多按了一个 Enter，
+    工具被取消，屏幕上既没有选择器、也没有底部状态栏，输入也进不去。群里
+    的 _push_next_group 走到 `if not current: return` 静默退出——用户看到的
+    就是「最后提交环节取消了、再没收到卡片」，而且不知道能做什么。
+
+    三种状态靠「选择器 + 状态栏」两个维度区分（都是真机抓屏）：
+
+        等你选      选择器 有 / 状态栏 无
+        正常完成    选择器 无 / 状态栏 有
+        卡死        选择器 无 / 状态栏 无   ← 只有这种要报
+
+    实测 C-c 能救回来：屏幕打出 `User declined to answer questions`，工具
+    干净退出，状态栏回来，之后发消息 agent 正常回话。Escape 没用。
+    """
+
+    STUCK = """\
+   Haiku 4.5 · Claude Team · fintopia.tech   /release-notes for more
+       ~/code-github/herder-lark-test
+❯ 立刻调用 AskUserQuestion，一次问三组，别做别的事。
+  第一组 header『颜色』question『选个颜色？』选项 红色/蓝色。"""
+
+    IDLE = """\
+⏺ 已收集你的答案：
+ 分类   选择
+ 颜色   红色
+✻ Cogitated for 6s
+  ⏸ manual mode on · ← 1 agent"""
+
+    ASKING = """\
+←  ☐ 颜色  ☐ 动物  ☐ 水果  ✔ Submit  →
+选个颜色？
+❯ 1. 红色
+     红色
+  2. 蓝色
+     蓝色
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel"""
+
+    def test_stuck_screen_is_detected(self):
+        """没选择器也没状态栏——这就是卡死。"""
+        self.assertTrue(lk.looks_stuck(self.STUCK))
+
+    def test_idle_screen_is_not_stuck(self):
+        """正常完成后有状态栏，不能误报成卡死。"""
+        self.assertFalse(lk.looks_stuck(self.IDLE))
+
+    def test_asking_screen_is_not_stuck(self):
+        """正在等你选时也没状态栏，但有选择器——误报了就会去中断人家。"""
+        self.assertFalse(lk.looks_stuck(self.ASKING))
+
+    def test_review_page_is_not_stuck(self):
+        """Review 页是选择器的一种，同样不该报。"""
+        review = ("Review your answers\n ● 选个颜色？\n   → 红色\n"
+                  "Ready to submit your answers?\n❯ 1. Submit answers\n  2. Cancel")
+        self.assertFalse(lk.looks_stuck(review))
+
+    def test_empty_screen_is_not_stuck(self):
+        """空屏是读屏失败，判断不了状态；当成卡死会凭空中断 agent。"""
+        for blank in ("", "   ", "\n\n"):
+            with self.subTest(blank=repr(blank)):
+                self.assertFalse(lk.looks_stuck(blank))
+
+    def test_context_bar_counts_as_alive(self):
+        """状态栏有几种写法，Context 进度条也算。"""
+        self.assertFalse(lk.looks_stuck(
+            "⏺ done\n  Context ██░░░░░░░░ 16% │ Usage ░░░░░░░░░░ 4%"))
+
+    def test_esc_to_interrupt_counts_as_alive(self):
+        """working 时底部是 esc to interrupt，那也是活的。"""
+        self.assertFalse(lk.looks_stuck(
+            "⏺ 我来处理\n✻ Brewing… (esc to interrupt)"))
+
+
+class StuckCardTests(unittest.TestCase):
+    """卡死提示卡：得能一键中断，不然人还是不知道该干嘛。"""
+
+    def test_card_offers_interrupt(self):
+        card = lk.build_stuck_card("w1:p1", "demo")
+        blob = json.dumps(card, ensure_ascii=False)
+        self.assertIn(lk.ACTION_CODES["interrupt"], blob)
+
+    def test_card_mentions_project(self):
+        card = lk.build_stuck_card("w1:p1", "demo")
+        self.assertIn("demo", json.dumps(card, ensure_ascii=False))
+
+
+class PushNextGroupStuckTests(unittest.IsolatedAsyncioTestCase):
+    """答完之后 agent 卡死了，群里必须有动静。
+
+    原先 `if not current: return` 把「答完了」和「卡死了」一视同仁地静默
+    吞掉。后者才是用户报的那个「最后提交环节取消了、再没收到卡片」。
+    """
+
+    STUCK = ("❯ 立刻调用 AskUserQuestion，问三组。\n"
+             "⏺ 我立刻调用 AskUserQuestion。")
+    IDLE = "⏺ 已收集你的答案：\n  ⏸ manual mode on · ← 1 agent"
+
+    async def _run(self, screen):
+        bot = make_bot()
+        bot.agents = [{"pane_id": "w1:p1", "project": "demo",
+                       "agent": "claude", "status": "idle"}]
+        with unittest.mock.patch.object(
+                lk, "read_pane", new=unittest.mock.AsyncMock(return_value=screen)):
+            await bot._push_next_group("oc_1", "w1:p1")
+        return bot
+
+    async def test_stuck_pushes_card(self):
+        """卡死要推提示卡，不能静默。"""
+        bot = await self._run(self.STUCK)
+        bot.api.send_card.assert_called_once()
+
+    async def test_stuck_card_has_interrupt(self):
+        """卡上得有中断按钮——只说「卡住了」帮不上在手机上的人。"""
+        bot = await self._run(self.STUCK)
+        blob = json.dumps(bot.api.send_card.call_args[0], ensure_ascii=False)
+        self.assertIn(lk.ACTION_CODES["interrupt"], blob)
+
+    async def test_idle_stays_silent(self):
+        """正常答完不该推任何东西，否则每答完一轮都刷一张卡。"""
+        bot = await self._run(self.IDLE)
+        bot.api.send_card.assert_not_called()
+
+    async def test_read_failure_stays_silent(self):
+        """读屏失败判断不了状态，报「卡住了」是误报。"""
+        bot = await self._run("(no response)")
+        bot.api.send_card.assert_not_called()
+
+
 class MultiselectSubmitSplitTests(unittest.TestCase):
     """Tab 和 1 必须分两次发，中间等 Review 页渲染出来。
 

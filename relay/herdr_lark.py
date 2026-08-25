@@ -2106,6 +2106,69 @@ def build_review_submit_card(pane_id: str, project: str, generation: str,
     }
 
 
+# 底部状态栏。活着的 Claude Code 总会渲染其中之一——working 时是
+# `esc to interrupt`，空闲时是 `manual mode on` / `Context ██░░`。
+# 正在等你选的时候反而没有状态栏（选择器把它顶掉了），所以它不能单独
+# 当「活着」的判据，必须和「有没有选择器」一起看。
+_ALIVE_BAR_RE = re.compile(
+    r"esc to interrupt|manual mode|bypass permissions|shift\+tab to cycle|"
+    r"Context\s+[█░]|for shortcuts", re.I)
+
+
+def looks_stuck(content: str) -> bool:
+    """agent 是不是卡在了没法交互的状态。
+
+    真机复现：AskUserQuestion 期间多按一个 Enter，工具被取消，屏幕上既没有
+    选择器、也没有底部状态栏，打字也进不去。_push_next_group 走到
+    `if not current: return` 就静默退出了，群里再没动静——用户看到的是
+    「最后提交环节取消了、收不到卡片」，还不知道能做什么。
+
+    三种状态靠两个维度区分（都是真机抓屏）：
+
+        等你选      选择器 有 / 状态栏 无
+        正常完成    选择器 无 / 状态栏 有
+        卡死        选择器 无 / 状态栏 无   ← 只有这种要报
+
+    空屏返回 False：那是读屏失败，判断不了状态。当成卡死会凭空去中断一个
+    好好干活的 agent，比漏报糟得多。
+    """
+    body = (content or "").strip()
+    if not body:
+        return False
+    if _ALIVE_BAR_RE.search(body):
+        return False
+    # 选择器还在就不是卡死——包括 Review 页，它也是选择器的一种。
+    if is_review_page(body) or detect_option_groups(body):
+        return False
+    return True
+
+
+def build_stuck_card(pane_id: str, project: str) -> dict:
+    """卡死提示卡。
+
+    光发一句「卡住了」没用——人在手机上，救不了。实测 C-c 能救回来（屏幕
+    打出 `User declined to answer questions`，工具干净退出，状态栏回来），
+    所以把中断按钮直接放卡上。Escape 试过，没用。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text",
+                      "content": f"⚠️ {project} 卡住了"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content":
+                "选择器没了，输入也进不去——多半是刚才那个工具被取消了。\n"
+                "点下面的中断（Ctrl+C）能让它干净退出，然后就能接着发指令。"}},
+            {"tag": "action", "actions": [
+                _button("中断（Ctrl+C）", action_value("interrupt", pane_id),
+                        "danger"),
+            ]},
+        ],
+    }
+
+
 def approval_keys(key: str, *, multiselect: bool) -> list[str]:
     """点一个选项按钮要发的按键序列：只发数字，不补 Enter。
 
@@ -3748,10 +3811,18 @@ class LarkBot:
                 return
         groups = detect_option_groups(content)
         current = current_option_group(groups)
-        if not current:
-            return
         agent = find_agent(self.agents, pane_id) or {}
         project = agent.get("project") or "agent"
+        if not current:
+            # 没有下一组，通常是答完了——但也可能是工具被取消、agent 卡在
+            # 没法交互的状态。原先两种都静默 return，卡住的那种群里再没
+            # 动静，人只能干等。能认出来就推张卡，带上能救命的中断按钮。
+            if looks_stuck(content):
+                log.info("agent looks stuck after answering: %s", pane_id)
+                card_id = self.reply_card(
+                    chat_id, build_stuck_card(pane_id, project))
+                self.remember(chat_id, card_id, pane_id)
+            return
         generation = new_generation()
         self.approval_tokens[pane_id] = generation
         card_id = self.reply_card(chat_id, build_options_card(
