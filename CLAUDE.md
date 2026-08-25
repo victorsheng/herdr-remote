@@ -27,6 +27,7 @@ The relay (`relay/herdr_relay.py`) is the central hub: it polls herdr for agent 
 | `relay/herdr_relay.py` | WebSocket+HTTP relay server | Python (websockets, zeroconf) |
 | `relay/herdr_telegram.py` | Telegram bot client | Python (python-telegram-bot) |
 | `relay/herdr_tui.py` | Terminal TUI client | Python (textual) |
+| `relay/herdr_web.py` | 运维面板（只读，聚合群/绑定/agent/质检） | Python (stdlib http) |
 | `web/index.html` | Mobile/desktop web app (single file) | HTML/CSS/JS |
 | `demo-worker/` | Cloudflare Worker mock relay for demos | JS |
 | `herdi-mac/` | macOS menu bar app | Swift (SPM) |
@@ -49,6 +50,9 @@ HERDI_TG_TOKEN="..." HERDI_TG_CHAT_ID="..." uv run relay/herdr_telegram.py
 # Terminal TUI
 uv run relay/herdr_tui.py
 
+# 运维面板（http://127.0.0.1:8377，只读）
+uv run relay/herdr_web.py
+
 # Demo worker (Cloudflare)
 cd demo-worker && npx wrangler dev
 
@@ -68,6 +72,7 @@ cd herdi-ios && xcodegen generate
 | `HERDR_REMOTES` | Comma-separated SSH targets to poll |
 | `HERDR_BIN` | Path to herdr binary (default: `/opt/homebrew/bin/herdr`) |
 | `HERDR_RELAY` | Relay URL used by clients (default: `ws://127.0.0.1:8375`) |
+| `HERDR_WEB_PORT` | 运维面板端口（default: 8377，只监听回环） |
 
 ## Web App
 
