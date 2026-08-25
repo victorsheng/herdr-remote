@@ -1264,6 +1264,43 @@ def strip_preview_panel(line: str) -> str:
     return head
 
 
+# diff 行：缩进 + 行号 + +/-/空格 + 内容。行号是关键——正常 diff 行一定
+# 有，被终端软换行折出来的续行一定没有。
+_DIFF_NUMBERED_RE = re.compile(r"^\s*\d+\s*[+\-]?\s")
+# 续行：有 +/- 标记但没有行号。缩进深浅跟着行号位数变，不能拿它当判据。
+_DIFF_CONTINUATION_RE = re.compile(r"^\s{2,}[+\-](?!\s*$)")
+
+
+def merge_diff_wraps(lines: list[str]) -> list[str]:
+    """把被终端软换行折断的 diff 行合并回去。
+
+    终端宽度放不下时，一行 diff 被折成几段，续行没有行号、只留 +/- 标记：
+
+        12 -  核心口径「草稿优先…」…… 这样「A 与 C 改过
+           -（有草稿版）、B 未改过…」的链路在 B
+        13 -  处不会断开。
+
+    内容没丢，但碎成三截，还容易把「13 处不会断开」误读成独立的一行。
+    合并之后一行就是一行。
+
+    判据是「有 +/- 但没行号」。不能只看缩进——缩进深浅跟着行号位数变，
+    两位数和三位数行号的续行缩进就不一样。
+
+    开头就是续行（上文被读屏窗口截断）时原样留着：并不到哪去，但丢了
+    就少一段内容。
+    """
+    out: list[str] = []
+    for line in lines:
+        if (out and _DIFF_CONTINUATION_RE.match(line)
+                and not _DIFF_NUMBERED_RE.match(line.lstrip())
+                and _DIFF_NUMBERED_RE.match(out[-1].lstrip())):
+            # 续行的 +/- 是折行留下的痕迹，不是内容，去掉再接上。
+            out[-1] = out[-1].rstrip() + line.lstrip()[1:]
+            continue
+        out.append(line)
+    return out
+
+
 def _drop_panel_block(lines: list[str]) -> list[str]:
     """把 preview 面板占满整行的那些行整块去掉。
 
@@ -1351,7 +1388,10 @@ def clean_pane(text: str) -> str:
     不是装饰。
     """
     lines = []
-    raw_lines = _drop_panel_block((text or "").splitlines())
+    # 先合并软换行折断的 diff 行，再做别的——折断的续行没有行号，走到
+    # 后面会被当成独立行处理，合完再处理就都是完整行了。
+    raw_lines = _drop_panel_block(
+        merge_diff_wraps((text or "").splitlines()))
     for line in raw_lines:
         line = _strip_scroll_hint(line)
         line = strip_preview_panel(line)

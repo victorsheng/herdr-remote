@@ -4512,6 +4512,72 @@ class PreviewPanelPollutionTests(unittest.TestCase):
         self.assertIn("列二", lk.clean_pane(text))
 
 
+class DiffWrapTests(unittest.TestCase):
+    """diff 里被终端软换行折断的长行，要合并回去。
+
+    终端宽度放不下时，Claude Code 把一行 diff 折成几段。续行没有行号、
+    只留 +/- 标记，缩进也更深：
+
+        12 -  核心口径「草稿优先…」…… 这样「A 与 C 改过
+           -（有草稿版）、B 未改过…」的链路在 B
+        13 -  处不会断开。
+
+    内容没丢，但读起来碎成三截，还容易误以为「13 处不会断开」是独立的
+    一行。合并回去之后一行就是一行。
+
+    判据是「有 +/- 标记但没有行号」——正常 diff 行一定带行号，续行一定
+    不带。不能只看缩进：缩进深浅跟着行号位数变。
+    """
+
+    WRAPPED = ("      12 -  核心口径「草稿优先、缺失回落线上」，这样「A 与 C 改过\n"
+               "         -（有草稿版）、B 未改过（只有线上版）」的链路在 B\n"
+               "      13 -  处不会断开。")
+
+    def test_continuation_is_merged_back(self):
+        """续行并回上一行，三行变两行。"""
+        out = lk.merge_diff_wraps(self.WRAPPED.splitlines())
+        self.assertEqual(len(out), 2)
+
+    def test_merged_line_keeps_all_text(self):
+        """并归并，字一个不能少。"""
+        out = "\n".join(lk.merge_diff_wraps(self.WRAPPED.splitlines()))
+        for piece in ("核心口径", "有草稿版", "链路在 B"):
+            self.assertIn(piece, out)
+
+    def test_merged_line_keeps_line_number(self):
+        """合并后行号还在开头，不然对不上文件。"""
+        out = lk.merge_diff_wraps(self.WRAPPED.splitlines())
+        self.assertTrue(out[0].lstrip().startswith("12"))
+
+    def test_numbered_lines_are_not_merged(self):
+        """带行号的是独立行，不能被并掉——那会把两行代码揉成一行。"""
+        lines = ["      12 -  第一行", "      13 -  第二行"]
+        self.assertEqual(lk.merge_diff_wraps(lines), lines)
+
+    def test_plus_continuation_also_merged(self):
+        """新增行的续行同样要合并，+ 和 - 一视同仁。"""
+        lines = ["      12 +  新增的很长一行被折断了", "         +续在这里"]
+        out = lk.merge_diff_wraps(lines)
+        self.assertEqual(len(out), 1)
+        self.assertIn("续在这里", out[0])
+
+    def test_non_diff_lines_untouched(self):
+        """不是 diff 的行别碰——正文里以 - 开头的列表项很常见。"""
+        lines = ["⏺ 这是正文", "- 这是列表项", "- 这也是"]
+        self.assertEqual(lk.merge_diff_wraps(lines), lines)
+
+    def test_continuation_without_previous_line_survives(self):
+        """开头就是续行（上文被截断了）——没得并，但不能丢。"""
+        lines = ["         -（残缺的续行）"]
+        self.assertEqual(lk.merge_diff_wraps(lines), lines)
+
+    def test_clean_pane_merges_wraps(self):
+        """走完整条 clean_pane 也得合并——这才是用户看到的。"""
+        out = lk.clean_pane(self.WRAPPED)
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertIn("有草稿版", out.splitlines()[0])
+
+
 class SideBySideDiffTests(unittest.TestCase):
     """并排渲染的 diff 面板不能被拼成一行。
 
