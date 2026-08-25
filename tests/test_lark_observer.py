@@ -225,6 +225,56 @@ class OptionCardIntegrityTests(unittest.TestCase):
         self.assertNotIn("option_text_polluted", self._rules(card))
 
 
+class HiddenOptionLabelTests(unittest.TestCase):
+    """选项文字被 preview 面板遮住时，卡片上是占位符——这是信息缺失，要报。
+
+    herdr_lark 遇到「序号后面直接是面板」时会填一个占位符，保住编号和
+    按钮（不填的话整组选项会被连续性校验丢掉，人一个都点不到）。
+
+    但占位符意味着**那一项到底是什么，人看不到**。卡片本身「结构完整」，
+    所以别的规则都判干净——只有专门认这个占位符才发现得了。
+    """
+
+    @staticmethod
+    def _card(labels):
+        cells = []
+        for i, label in enumerate(labels, 1):
+            cells.append({"tag": "text", "text": f"{i}."})
+            cells.append({"tag": "text", "text": f" {label}\n"})
+        return {"elements": [
+            cells,
+            [{"tag": "button", "text": str(i)} for i in range(1, len(labels) + 1)],
+        ]}
+
+    def test_hidden_label_is_reported(self):
+        card = self._card(["甲", "乙", "（选项文字被预览面板遮住）"])
+        rules = {p["rule"] for p in ob.check_option_card(card)}
+        self.assertIn("option_label_hidden", rules)
+
+    def test_detail_names_the_option(self):
+        card = self._card(["甲", "乙", "（选项文字被预览面板遮住）"])
+        problems = [p for p in ob.check_option_card(card)
+                    if p["rule"] == "option_label_hidden"]
+        self.assertIn("3", problems[0]["detail"])
+
+    def test_normal_card_is_clean(self):
+        """主路径：没有占位符就别报。"""
+        self.assertEqual(ob.check_option_card(self._card(["甲", "乙", "丙"])), [])
+
+    def test_multiple_hidden_all_reported(self):
+        card = self._card(["甲", "（选项文字被预览面板遮住）",
+                           "（选项文字被预览面板遮住）"])
+        problems = [p for p in ob.check_option_card(card)
+                    if p["rule"] == "option_label_hidden"]
+        self.assertEqual(len(problems), 2)
+
+    def test_prose_mentioning_panel_is_not_flagged(self):
+        """正常选项里提到「预览面板」这几个字时不能误报。"""
+        card = self._card(["改进预览面板布局", "保持现状"])
+        rules = {p["rule"] for p in ob.check_option_card(card)}
+        self.assertNotIn("option_label_hidden", rules)
+
+
 class OptionCardFormShapesTests(unittest.TestCase):
     """选项清单有两种形态，都得认得，否则整条规则静默失效。
 

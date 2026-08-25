@@ -4169,6 +4169,90 @@ class LongMessageDeliveryTests(unittest.TestCase):
         self.assertNotIn("段", said)
 
 
+class PreviewPanelLeadingBorderTests(unittest.TestCase):
+    """preview 面板的内容顶到行首时，整行都是面板，不是选项文字。
+
+    真实卡片（群里 03:34 那张，用户报「信息不全」）：
+
+        1. 抓屏改带 --ansi              ┌────────────────────────┐
+        2. 只带出能靠文本认出的提示     │ 解析：已输入 "/rev"    │
+        3. │       建议   "iew-changes"               │
+
+    选项 3 自己的文字是空的（preview 面板比选项列表高，右列内容占满了
+    那一行），于是面板内容直接顶到序号后面。
+
+    strip_preview_panel 的判据是「框线前有大段空白」——那是为了跟表格
+    区分。但这里框线在行首，规则漏掉，后果是双份的：
+      - _strip_table_pipes 把竖线剥掉，preview 内容伪装成选项文字
+      - 编号连续性被打乱，**整组选项直接丢失**（实测 options 为 None）
+
+    比看起来更糟：卡片上一个按钮都没有，或者第 3 项显示成别人的预览内容。
+    """
+
+    REAL_CARD_PANE = (
+        "❯ 1. 抓屏改带 --ansi              ┌──────────────────────────────┐\n"
+        "  2. 只带出能靠文本认出的提示     │ 解析：已输入 \"/rev\"          │\n"
+        "  3. │       建议   \"iew-changes\"               │\n"
+        "  4. Type something.\n"
+        "  5. Chat about this\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+    def test_leading_border_is_stripped_in_context(self):
+        """框线顶到行首时整段都该剥掉。
+
+        必须带上文测：单看一行的话，`│ 建议 "x" │` 跟表格行
+        `│ 内容 │` 形态完全一样，分不出来。靠的是「上一行右边挂着面板」
+        这个上下文。
+        """
+        block = ("  1. 甲选项                    ┌──────────────┐\n"
+                 ' │       建议   "iew-changes"               │')
+        self.assertNotIn("iew-changes", lk.clean_pane(block))
+        self.assertIn("甲选项", lk.clean_pane(block))
+
+    def test_continuation_line_is_stripped_in_context(self):
+        """preview 跨行续行也一样，整行都是面板内容。"""
+        block = ("问题在这里                     ┌──────────────┐\n"
+                 "│ --ansi），置灰信息在这一层就丢了。")
+        out = lk.clean_pane(block)
+        self.assertNotIn("置灰信息", out)
+        self.assertIn("问题在这里", out)
+
+    def test_option_text_before_border_survives(self):
+        """行首有真选项文字时只剥右边，别把内容一起吃了。"""
+        line = " 抓屏改带 --ansi              ┌──────────────┐"
+        self.assertEqual(lk.strip_preview_panel(line).strip(), "抓屏改带 --ansi")
+
+    def test_table_row_is_untouched(self):
+        """表格行的竖线也在行首，但它不是 preview——别误伤。
+
+        区别：表格行的竖线是**成对闭合**的列分隔（`│ a │ b │`），
+        preview 续行是单侧起始。
+        """
+        line = "│ 列一 │ 列二 │"
+        self.assertIn("列一", lk.clean_pane(line))
+        self.assertIn("列二", lk.clean_pane(line))
+
+    def test_all_three_options_survive(self):
+        """端到端：三个选项一个都不能少。"""
+        group = lk.current_option_group(
+            lk.detect_option_groups(lk.clean_pane(self.REAL_CARD_PANE)))
+        self.assertIsNotNone(group, "整组选项丢失了")
+        self.assertEqual(len(group["options"]), 3, group["options"])
+
+    def test_third_option_is_not_preview_content(self):
+        """选项 3 不能显示成 preview 里的内容。"""
+        group = lk.current_option_group(
+            lk.detect_option_groups(lk.clean_pane(self.REAL_CARD_PANE)))
+        self.assertNotIn("iew-changes", group["options"][2])
+        self.assertNotIn("建议", group["options"][2])
+
+    def test_surviving_options_keep_their_text(self):
+        group = lk.current_option_group(
+            lk.detect_option_groups(lk.clean_pane(self.REAL_CARD_PANE)))
+        self.assertIn("抓屏改带", group["options"][0])
+        self.assertIn("只带出", group["options"][1])
+
+
 class PreviewPanelPollutionTests(unittest.TestCase):
     """选项右边并排一个 preview 面板时，选项文字不能被面板内容污染。
 

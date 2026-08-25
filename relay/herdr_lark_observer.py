@@ -164,6 +164,10 @@ def check_text(text: str) -> list[dict]:
 # observer 不 import herdr_lark（刻意的进程隔离），所以这里留一份副本。
 # 与 herdr_lark.py 保持同步：那边改判据就往这里改。
 _PANEL_IN_OPTION_RE = re.compile(r"\s{3,}[┌└│├┐┘┤─━]")
+# herdr_lark 的 PANEL_HIDDEN_LABEL：选项文字被 preview 面板完全遮住时的
+# 占位符。整串精确匹配，不搜子串——正常选项里提到「预览面板」这几个字
+# 不该被误报。与 herdr_lark.py 保持同步：那边改文案就往这里改。
+_HIDDEN_LABEL = "（选项文字被预览面板遮住）"
 # 选项清单的行首序号：`1.` `2.` …（build_option_card 的渲染形态）
 _OPTION_INDEX_RE = re.compile(r"^\s*\*{0,2}(\d+)[.．]\*{0,2}\s*$")
 
@@ -294,6 +298,12 @@ def check_option_card(content: dict) -> list[dict]:
 
     problems = []
     for index, text in pairs:
+        if text.strip() == _HIDDEN_LABEL:
+            problems.append({
+                "rule": "option_label_hidden",
+                "detail": (f"选项 {index} 的文字被并排 preview 面板完全遮住，"
+                           f"卡片上只剩占位符——这一项是什么人看不到"),
+            })
         if _PANEL_IN_OPTION_RE.search(text):
             problems.append({
                 "rule": "option_text_polluted",

@@ -1205,13 +1205,37 @@ def _strip_scroll_hint(line: str) -> str:
 # 只用条件 1 会把 `  │  #  │ 项 │` 这种表格切掉（实测吃掉了整张表的数据）。
 _PREVIEW_PANEL_RE = re.compile(r"\s{3,}[┌└│├].*$")
 _BOX_CHARS = "│┃┌┐└┘├┤┬┴┼─━"
+# 框线顶到行首（前面没有正文）。两种情况都会这样：
+#   选项自己没文字，preview 右列占满整行  →  `  3. │  建议 "iew-changes"  │`
+#   preview 内容跨行续行                  →  `│ --ansi），置灰信息…`
+# 实测后果比「文字被污染」更糟：_strip_table_pipes 把竖线剥掉后，preview
+# 内容伪装成了选项文字，编号连续性被打乱，**整组选项直接丢失**。
+_LEADING_PANEL_RE = re.compile(r"^\s*[┌└│├┐┘┤].*$")
+# 序号还在、但序号后面直接是面板：`  3. │  建议 "iew-changes"  │`
+# 选项自己没文字时会这样。序号要留（否则编号断档整组丢），面板要剥。
+_INDEX_THEN_PANEL_RE = re.compile(r"^(\s*\d+[.．]\s*)[┌└│├┐┘┤].*$")
+# 选项文字被 preview 面板完全遮住时的占位符。宁可显示「看不到」，也不能
+# 让这一项消失——消失了人就少一个答案可点，而且编号会跟屏幕错开。
+PANEL_HIDDEN_LABEL = "（选项文字被预览面板遮住）"
+
+
+def _is_table_row(stripped: str) -> bool:
+    """这行是表格而不是 preview 面板。
+
+    表格是**成对闭合的多列**：`│ a │ b │` 至少三根竖线（两列要三根）。
+    preview 面板是单侧起始的一整段，最多首尾两根。用这个区分，比数空格
+    可靠——两者的竖线都可能顶在行首。
+    """
+    return (stripped.startswith("│") and stripped.endswith("│")
+            and stripped.count("│") >= 3)
 
 
 def strip_preview_panel(line: str) -> str:
     """切掉右侧并排的 preview 面板，只留左边的选项文字。
 
-    表格行不动：它左边已经有竖线了，说明这是表格的一列而不是 preview 的
-    左边界。表格的边框由 _strip_table_pipes 负责。
+    只管「左边有正文、右边是面板」这一种。面板内容顶到行首的情况没法
+    逐行判断（跟表格行 `│ 内容 │` 长得一样），交给 _drop_panel_block
+    按整块处理。
     """
     match = _PREVIEW_PANEL_RE.search(line)
     if not match:
@@ -1220,6 +1244,49 @@ def strip_preview_panel(line: str) -> str:
     if any(ch in head for ch in _BOX_CHARS):
         return line          # 左边已有框线 → 这是表格，不是并排面板
     return head
+
+
+def _drop_panel_block(lines: list[str]) -> list[str]:
+    """把 preview 面板占满整行的那些行整块去掉。
+
+    逐行判断做不到：面板内容顶到行首时（`│  建议 "x"  │`）跟表格行
+    (`│ 内容 │`) 形态完全一样。但**上下文**能分开——preview 面板一定
+    跟在「右边挂着面板」的行后面，是同一个面板的延续；孤立的
+    `│ 内容 │` 前面没有那种行。
+
+    真实故障（群里 03:34 那张卡）：选项 3 自己没文字，面板右列占满整行，
+    竖线被 _strip_table_pipes 剥掉后 preview 内容伪装成了选项文字，编号
+    连续性被打乱，**整组选项直接丢失**。
+    """
+    out, in_panel = [], False
+    for line in lines:
+        # 右边挂着面板 → 面板开始（或仍在面板区内）
+        if _PREVIEW_PANEL_RE.search(line):
+            head = line[:_PREVIEW_PANEL_RE.search(line).start()]
+            if not any(ch in head for ch in _BOX_CHARS):
+                in_panel = True
+                out.append(line)
+                continue
+        if in_panel:
+            # 序号后面直接跟面板：选项自己没文字。留下序号（编号断档会让
+            # 整组被连续性校验丢掉），把面板那段剥掉。
+            indexed = _INDEX_THEN_PANEL_RE.match(line)
+            if indexed:
+                # 只留序号的话 _OPTION_RE 匹配不上（它要求序号后有内容），
+                # 这一项会被当成不存在，编号断档 → 整组被连续性校验丢掉。
+                # 填个占位符：文字确实拿不到（终端里就被面板遮住了），但
+                # 编号和按钮必须保住，否则人少一个答案可点。
+                out.append(f"{indexed.group(1).rstrip()} {PANEL_HIDDEN_LABEL}")
+                continue
+            if _LEADING_PANEL_RE.match(line):
+                # 面板区内、整行以框线打头 → 是面板内容，丢掉
+                if "┘" in line or "└" in line:
+                    in_panel = False      # 面板底边，到此为止
+                continue
+        if line.strip() and not _LEADING_PANEL_RE.match(line):
+            in_panel = False          # 遇到正常正文，面板结束
+        out.append(line)
+    return out
 
 
 def _strip_table_pipes(line: str) -> str:
@@ -1248,7 +1315,8 @@ def clean_pane(text: str) -> str:
     不是装饰。
     """
     lines = []
-    for line in (text or "").splitlines():
+    raw_lines = _drop_panel_block((text or "").splitlines())
+    for line in raw_lines:
         line = _strip_scroll_hint(line)
         line = strip_preview_panel(line)
         if not line.strip() or _CHROME_RE.search(line):
