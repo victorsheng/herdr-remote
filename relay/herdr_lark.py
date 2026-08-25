@@ -2107,18 +2107,27 @@ def build_review_submit_card(pane_id: str, project: str, generation: str,
 
 
 def approval_keys(key: str, *, multiselect: bool) -> list[str]:
-    """点一个选项按钮要发的按键序列。
+    """点一个选项按钮要发的按键序列：只发数字，不补 Enter。
 
-    单选框按数字只是把光标移过去并高亮，**不提交**——还得 Enter 才算选定。
-    只发数字的话，人在飞书上点了按钮、屏幕上看着也确实选中了，agent 却一直
-    卡在那儿不动（实测：选了 1，没给我打回车）。
+    曾经给单选补过 Enter，理由是「数字只移光标、不提交」。那个观察在当时
+    的 TUI 上成立，现在（实测 Claude Code v2.1.243）已经不成立了，而且补
+    Enter 会造成两种**静默**的错答：
 
-    多选框相反：数字键是切换勾选，补 Enter 会把才勾了一项的答案交上去，
-    人还没勾完就被交卷。多选的提交走 multiselect_submit_steps（Tab → 等 → 1）。
+      多组 AskUserQuestion —— 数字键按下即答完并自动前进到下一组，多出来的
+      Enter 又推进一格。三组问题答第一组后直接跳到第三组，第二组从没被问过；
+      再点一次，整个工具被取消，agent 停在没有输入框的死状态。用户看到的是
+      「最后提交环节被取消了、收不到确认卡片」。
 
-    Enter 必须用这个拼写：relay 的 SAFE_KEYS 只认它，发别名会被整条拒绝。
+      单组 AskUserQuestion / 工具审批框 —— 数字键本身就提交，Enter 落到了
+      下一个界面上，等于替 agent 多按了一下。
+
+    三种场景都实测过（见 tests 里的对照记录）：只发数字，全部正常。多选走
+    multiselect_submit_steps（Tab → 等 → 1），与这里无关。
+
+    multiselect 参数保留：多选的语义（数字=切换勾选）跟单选本就不同，调用方
+    仍按它决定要不要走 _refresh_multiselect，签名不动免得调用方跟着改。
     """
-    return [str(key)] if multiselect else [str(key), "Enter"]
+    return [str(key)]
 
 
 # Tab 切到 Review 页之后，等它渲染出来再按 1。

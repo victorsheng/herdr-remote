@@ -4866,25 +4866,38 @@ class OptionLabelTruncationTests(unittest.TestCase):
 
 
 class ApprovalKeysTests(unittest.TestCase):
-    """单选要补回车，多选不能补。
+    """点选项只发数字，任何情况下都不补 Enter。
 
-    实测：单选框按数字只是把光标移到那一项并高亮，**不提交**——还得按
-    Enter 才算选定。只发数字的话，人在飞书上点了按钮、屏幕上看着也选中了，
-    agent 却一直卡在那儿不动（实测：选了 1，没给我打回车）。
+    曾经给单选补过 Enter（「数字只移光标、不提交」）。那个观察在旧 TUI 上
+    成立，v2.1.243 上已经不成立，而且补 Enter 会造成静默错答。三种场景在
+    真机上逐一对照过（herder-lark-test，干净 pane，每种一个）：
 
-    多选框相反：数字键是切换勾选，补 Enter 会把才勾了一项的答案提交出去，
-    人还没勾完就被交卷了。所以两者必须分开。
+      多组 AskUserQuestion，发 ["1"]      → 颜色→动物→水果→Review，答案全对
+      多组 AskUserQuestion，发 ["1","Enter"] → 答完颜色直接跳到水果（动物被
+          跳过），再点一次整个工具被取消，agent 停在没有输入框的死状态
+      单组 AskUserQuestion，发 ["1"]      → `User answered … → 红色`，正常
+      工具审批框，发 ["1"]                → 命令正常执行完
+
+    多出来的 Enter 之所以有害：数字键按下即答完并自动前进，Enter 又推进一格。
     """
 
-    def test_single_select_appends_enter(self):
-        self.assertEqual(lk.approval_keys("1", multiselect=False), ["1", "Enter"])
+    def test_single_select_sends_digit_only(self):
+        """单选补 Enter 会多推进一格，把下一组跳过去。"""
+        self.assertEqual(lk.approval_keys("1", multiselect=False), ["1"])
 
     def test_multiselect_sends_digit_only(self):
         self.assertEqual(lk.approval_keys("2", multiselect=True), ["2"])
 
-    def test_keys_are_relay_safe(self):
-        """Enter 得用 relay SAFE_KEYS 认得的名字，发别名会被整条拒绝。"""
-        self.assertIn("Enter", lk.approval_keys("1", multiselect=False))
+    def test_never_sends_enter(self):
+        """两种模式都不许出现 Enter——它正是跳组和取消工具的原因。"""
+        for multiselect in (True, False):
+            with self.subTest(multiselect=multiselect):
+                self.assertNotIn(
+                    "Enter", lk.approval_keys("1", multiselect=multiselect))
+
+    def test_key_is_stringified(self):
+        """按键得是字符串：relay 的白名单按字符串比，发 int 会被拒。"""
+        self.assertEqual(lk.approval_keys(3, multiselect=False), ["3"])
 
 
 class MultiselectSubmitSplitTests(unittest.TestCase):
