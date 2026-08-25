@@ -3850,6 +3850,146 @@ class TypedDigitPushesNextGroupTests(unittest.TestCase):
         push.assert_not_awaited()
 
 
+class ReviewSubmitCardTests(unittest.TestCase):
+    """全答完停在 Review 页时，要推一张提交卡——否则第三步永远卡住。
+
+    真机复现（用户："卡在了第三步答案提交上面"）：两组单选都答完后，
+    Claude Code 停在这里等人确认：
+
+        ←  ☒ 第一组  ☒ 第二组  ✔ Submit  →
+        Review your answers
+         ● 第一组：选择一个选项？   → A1
+         ● 第二组：选择一个选项？   → B1
+        Ready to submit your answers?
+        ❯ 1. Submit answers
+          2. Cancel
+
+    答案没提交，pane 一直 blocked。而代码在三处都刻意跳过 Review 页
+    （第 6 轮加的保护，怕人误点「替 agent 乱答」），群里一张卡都没有。
+
+    保护本身是对的——不能把 `1. Submit answers / 2. Cancel` 当普通选项
+    原样推出去，手机上就两个英文按钮，看不出答了什么。所以推一张**专用
+    提交卡**：把答案汇总列出来，按钮写明「提交 / 取消」。
+    """
+
+    REVIEW = ("←  ☒ 第一组  ☒ 第二组  ✔ Submit  →\n"
+              "Review your answers\n"
+              " ● 第一组：选择一个选项？\n"
+              "   → A1\n"
+              " ● 第二组：选择一个选项？\n"
+              "   → B1\n"
+              "Ready to submit your answers?\n"
+              "❯ 1. Submit answers\n"
+              "  2. Cancel")
+
+    REVIEW_UNANSWERED = ("←  ☒ 第一组  ☐ 第二组  ✔ Submit  →\n"
+                         "Review your answers\n"
+                         "⚠ You have not answered all questions\n"
+                         " ● 第一组：选择一个选项？\n"
+                         "   → A1\n"
+                         "Ready to submit your answers?\n"
+                         "❯ 1. Submit answers\n"
+                         "  2. Cancel")
+
+    def test_parses_the_answers(self):
+        self.assertEqual(lk.review_answers(self.REVIEW),
+                         [("第一组：选择一个选项？", "A1"),
+                          ("第二组：选择一个选项？", "B1")])
+
+    def test_no_answers_on_a_normal_screen(self):
+        self.assertEqual(lk.review_answers("选一个？\n  1. 甲\n  2. 乙"), [])
+
+    def test_card_lists_every_answer(self):
+        card = lk.build_review_submit_card("w1:p1", "proj", "abcde", self.REVIEW)
+        body = json.dumps(card, ensure_ascii=False)
+        self.assertIn("A1", body)
+        self.assertIn("B1", body)
+        self.assertIn("第一组", body)
+
+    def test_card_has_submit_and_cancel(self):
+        card = lk.build_review_submit_card("w1:p1", "proj", "abcde", self.REVIEW)
+        acts = [a for el in card.get("elements", [])
+                for a in (el.get("actions") or [])]
+        keys = [a["value"].get("k") for a in acts
+                if a["value"].get("a") == lk.ACTION_CODES["approval"]]
+        self.assertEqual(keys, ["1", "2"])
+
+    def test_buttons_are_labelled_in_chinese(self):
+        """手机上要看得懂——不能只写 Submit answers / Cancel。"""
+        card = lk.build_review_submit_card("w1:p1", "proj", "abcde", self.REVIEW)
+        body = json.dumps(card, ensure_ascii=False)
+        self.assertIn("提交", body)
+        self.assertIn("取消", body)
+
+    def test_card_is_marked_as_review(self):
+        """标题要点明这是最后一步，不是又一组问题。"""
+        card = lk.build_review_submit_card("w1:p1", "proj", "abcde", self.REVIEW)
+        self.assertIn("提交", json.dumps(card, ensure_ascii=False))
+
+
+class PushReviewSubmitTests(unittest.TestCase):
+    """_push_next_group 在全答完的 Review 页要推提交卡。"""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1)
+        self.pane = lk.index_agents(self.bot.agents)[0]["pane_id"]
+        self.bot.set_active("oc_1", self.pane, "project0")
+        self.cards = []
+        self.bot.reply_card = lambda chat_id, card: (
+            self.cards.append(card) or "om_x")
+
+    def _run(self, screens):
+        reads = unittest.mock.AsyncMock(side_effect=screens)
+        keys = unittest.mock.AsyncMock()
+        with unittest.mock.patch.object(lk, "read_pane", new=reads), \
+             unittest.mock.patch.object(lk, "send_keys_to_relay", new=keys):
+            asyncio.run(self.bot._push_next_group("oc_1", self.pane))
+        return keys
+
+    def test_pushes_submit_card_when_all_answered(self):
+        """核心：全答完就推提交卡，别再干等着。"""
+        self._run([ReviewSubmitCardTests.REVIEW])
+        self.assertEqual(len(self.cards), 1)
+        body = json.dumps(self.cards[0], ensure_ascii=False)
+        self.assertIn("提交", body)
+        self.assertIn("A1", body)
+
+    def test_does_not_press_keys_when_all_answered(self):
+        """全答完时别乱按 Left——那会把 Review 页翻走。"""
+        keys = self._run([ReviewSubmitCardTests.REVIEW])
+        keys.assert_not_awaited()
+
+    def test_unanswered_still_tabs_to_the_group(self):
+        """回归防线：还有没答的组时，仍然是切过去而不是推提交卡。"""
+        keys = self._run([
+            ReviewSubmitCardTests.REVIEW_UNANSWERED,
+            "第二组：选择一个选项？\n  1. B1\n  2. B2\n"
+            "Enter to select · Esc to cancel",
+        ])
+        keys.assert_awaited()
+        self.assertEqual(keys.await_args[0][1], ["Left"])
+        body = json.dumps(self.cards[0], ensure_ascii=False)
+        self.assertIn("B1", body)
+
+    def test_raw_review_options_are_never_pushed(self):
+        """回归防线：绝不能把 Submit answers / Cancel 当普通选项推出去。
+
+        那是第 6 轮加保护的原因——手机上就两个英文按钮，看不出答了什么，
+        点下去等于替 agent 乱答。
+        """
+        self._run([ReviewSubmitCardTests.REVIEW])
+        body = json.dumps(self.cards[0], ensure_ascii=False)
+        self.assertNotIn("Submit answers", body)
+
+    def test_normal_next_group_unaffected(self):
+        """主路径：直接读到下一组时照旧推选项卡。"""
+        self._run(["第二组：选择一个选项？\n  1. B1\n  2. B2\n"
+                   "Enter to select · Esc to cancel"])
+        self.assertEqual(len(self.cards), 1)
+        self.assertIn("B1", json.dumps(self.cards[0], ensure_ascii=False))
+
+
 class UnansweredGroupsOnReviewTests(unittest.TestCase):
     """Review 页上还有未答的组时，要 Tab 切过去，不能就这么放弃。
 
@@ -3960,15 +4100,24 @@ class PushNextGroupTabsToUnansweredTests(unittest.TestCase):
         self.assertIn("第二组", body)
 
     def test_no_tab_when_all_answered(self):
-        """全答完了就别乱按 Tab——那会把 Review 页翻走。"""
+        """全答完了就别乱按 Left——那会把 Review 页翻走。"""
         keys = self._run([UnansweredGroupsOnReviewTests.REVIEW_ALL_ANSWERED])
         keys.assert_not_awaited()
-        self.assertEqual(self.cards, [])
 
     def test_never_pushes_the_review_page_itself(self):
-        """回归防线：Submit answers / Cancel 绝不能被推成选项卡。"""
+        """回归防线：Submit answers / Cancel 绝不能被当普通选项推出去。
+
+        原先这条断言「一张卡都不推」。那个期望后来被证明是错的——全答完
+        停在 Review 页时不推卡，第三步（提交）就永远卡住，用户报过。
+        现在推的是**专用提交卡**（答案汇总 + 中文按钮），所以断言改成
+        「推了卡，但里面不能有 Submit answers 这种原始选项文案」。
+        """
         self._run([UnansweredGroupsOnReviewTests.REVIEW_ALL_ANSWERED])
-        self.assertEqual(self.cards, [])
+        self.assertEqual(len(self.cards), 1)
+        body = json.dumps(self.cards[0], ensure_ascii=False)
+        self.assertNotIn("Submit answers", body)
+        self.assertNotIn("Cancel", body)
+        self.assertIn("提交", body)
 
     def test_gives_up_when_key_lands_nowhere(self):
         """切换键按下后仍是 Review 页就停手，别无限按下去。"""

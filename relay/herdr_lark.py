@@ -2044,6 +2044,63 @@ def review_has_unanswered(text: str) -> bool:
     return unanswered_tab_count(body) > 0 or bool(_UNANSWERED_WARN_RE.search(body))
 
 
+# Review 页里的答案汇总。真实抓屏：
+#      ● 第一组：选择一个选项？
+#        → A1
+_REVIEW_QUESTION_RE = re.compile(r"^\s*●\s*(.+?)\s*$")
+_REVIEW_ANSWER_RE = re.compile(r"^\s*→\s*(.+?)\s*$")
+
+
+def review_answers(text: str) -> list[tuple[str, str]]:
+    """从 Review 页里抽出 [(问题, 答案)]。不是 Review 页就返回空。"""
+    pairs, pending = [], None
+    for line in (text or "").splitlines():
+        question = _REVIEW_QUESTION_RE.match(line)
+        if question:
+            pending = question.group(1)
+            continue
+        answer = _REVIEW_ANSWER_RE.match(line)
+        if answer and pending:
+            pairs.append((pending, answer.group(1)))
+            pending = None
+    return pairs
+
+
+def build_review_submit_card(pane_id: str, project: str, generation: str,
+                             content: str) -> dict:
+    """全答完后的提交卡。
+
+    不能把 Review 页原样当选项卡推：手机上就 `1. Submit answers /
+    2. Cancel` 两个英文按钮，看不出自己答了什么，点下去等于替 agent 乱答
+    ——那正是当初刻意跳过 Review 页的原因。
+
+    所以专门做一张：答案汇总列出来，按钮写明「提交 / 取消」。按键仍是
+    屏幕上的 1 和 2，跟 Review 页一一对应。
+    """
+    answers = review_answers(content)
+    if answers:
+        summary = "\n".join(f"**{q}**\n　→ {a}" for q, a in answers)
+    else:
+        summary = "（没解析出答案汇总，请在终端确认）"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "green",
+            "title": {"tag": "plain_text",
+                      "content": f"✅ {project} 全部答完，等你提交"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": summary}},
+            {"tag": "action", "actions": [
+                _button("✔ 提交答案", action_value(
+                    "approval", pane_id, g=generation, k="1"), "primary"),
+                _button("取消", action_value(
+                    "approval", pane_id, g=generation, k="2"), "danger"),
+            ]},
+        ],
+    }
+
+
 def approval_keys(key: str, *, multiselect: bool) -> list[str]:
     """点一个选项按钮要发的按键序列。
 
@@ -3617,6 +3674,15 @@ class LarkBot:
             # 未答那组。真机实测：Tab 按下去屏幕不动，Left 立刻切过去。
             # 只试一次：按完仍是 Review 页就停手，免得无限按下去。
             if not review_has_unanswered(content):
+                # 全答完、停在 Review 页——第三步（提交）就卡在这里。
+                # 推一张专用提交卡，别让人干等着。
+                agent = find_agent(self.agents, pane_id) or {}
+                generation = new_generation()
+                self.approval_tokens[pane_id] = generation
+                card_id = self.reply_card(chat_id, build_review_submit_card(
+                    pane_id, agent.get("project") or "agent",
+                    generation, content))
+                self.remember(chat_id, card_id, pane_id)
                 return
             try:
                 await send_keys_to_relay(pane_id, ["Left"])
