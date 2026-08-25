@@ -3198,6 +3198,44 @@ class SpacesNoAutoSendTests(unittest.TestCase):
         self.assertIsNone(bot.active_pane("oc_new"))
 
 
+class ObserverInviteTests(unittest.TestCase):
+    """建群时要把 observer 拉进去。
+
+    实际问题：/spaces 建的新群没带 observer，observer 只巡检自己所在的
+    群，于是这个群的质检静默关掉了——没有报错，看着一切正常。
+    """
+
+    def test_invite_uses_app_id_not_open_id(self):
+        """机器人必须按 app_id 加：open_id 跨应用会被拒。"""
+        bot = make_bot()
+        with unittest.mock.patch.object(lk, "OBSERVER_APP_ID", "cli_obs"):
+            bot.invite_observer("oc_new")
+        bot.api.add_bot_to_chat.assert_called_once_with("oc_new", "cli_obs")
+
+    def test_no_observer_configured_is_skipped(self):
+        """没配 observer 就别去调——空 app_id 只会换来一个报错。"""
+        bot = make_bot()
+        with unittest.mock.patch.object(lk, "OBSERVER_APP_ID", ""):
+            bot.invite_observer("oc_new")
+        bot.api.add_bot_to_chat.assert_not_called()
+
+    def test_invite_failure_does_not_raise(self):
+        """拉不进去也不能打断建群：群可用，只是少了质检。"""
+        bot = make_bot()
+        bot.api.add_bot_to_chat.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.object(lk, "OBSERVER_APP_ID", "cli_obs"):
+            bot.invite_observer("oc_new")   # 不抛就算过
+
+    def test_invite_failure_is_logged(self):
+        """必须留下日志，否则「没被质检」这件事永远发现不了。"""
+        bot = make_bot()
+        bot.api.add_bot_to_chat.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.object(lk, "OBSERVER_APP_ID", "cli_obs"):
+            with self.assertLogs(lk.log, level="WARNING") as cm:
+                bot.invite_observer("oc_new")
+        self.assertTrue(any("observer" in line for line in cm.output))
+
+
 class DigitSafetyTests(unittest.TestCase):
     """纯数字只在 agent 真的在等选择时才当按键。"""
 

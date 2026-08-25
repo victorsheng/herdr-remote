@@ -46,6 +46,11 @@ BINDING_PATH = os.environ.get(
 CHATS_PATH = os.environ.get(
     "HERDR_LARK_CHATS_PATH", os.path.join(CONFIG_DIR, "lark_chats.json"))
 
+# observer 应用的 app_id。/spaces 建群时顺手把它拉进去——observer 只能巡检
+# 自己所在的群，漏拉一个群等于那个群的质检静默关掉，而这种缺失不会报错。
+# 空值表示没部署 observer，跳过即可。
+OBSERVER_APP_ID = os.environ.get("HERDR_LARK_OBSERVER_APP_ID", "").strip()
+
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
 # 不带 token 的变体，用于展示与日志；带 token 的原串绝不外泄。
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]
@@ -2737,6 +2742,26 @@ class LarkAPI:
             raise RuntimeError(f"建群失败: {response.msg}")
         return getattr(response.data, "chat_id", "")
 
+    def add_bot_to_chat(self, chat_id: str, app_id: str) -> None:
+        """把另一个应用的机器人拉进群。
+
+        机器人不能用 open_id 加——open_id 是按应用隔离的，主应用拿到的
+        observer open_id 在 im 接口那边会被判为 "open_id cross app"。
+        按 app_id 加才是机器人的正路。
+        """
+        from lark_oapi.api.im.v1 import (CreateChatMembersRequest,
+                                         CreateChatMembersRequestBody)
+        request = (CreateChatMembersRequest.builder()
+                   .chat_id(chat_id)
+                   .member_id_type("app_id")
+                   .request_body(CreateChatMembersRequestBody.builder()
+                                 .id_list([app_id])
+                                 .build())
+                   .build())
+        response = self.client.im.v1.chat_members.create(request)
+        if not response.success():
+            raise RuntimeError(f"拉机器人进群失败: {response.msg}")
+
     def chat_member_count(self, chat_id: str) -> int:
         from lark_oapi.api.im.v1 import GetChatMembersRequest
         request = (GetChatMembersRequest.builder()
@@ -2910,6 +2935,22 @@ class LarkBot:
             log.info("Pruned %d stale binding(s): %s", len(dropped), sorted(dropped))
             self._active = cleaned
             self.bindings.replace(cleaned)
+
+    def invite_observer(self, chat_id: str) -> None:
+        """把 observer 机器人拉进新群。
+
+        失败只记日志、不打断建群：群本身是可用的，缺 observer 只是少了
+        质检——比建群整个失败要好得多。但必须记，否则这个群会永远处于
+        「看着正常、其实没人检查」的状态。
+        """
+        if not OBSERVER_APP_ID:
+            return
+        try:
+            self.api.add_bot_to_chat(chat_id, OBSERVER_APP_ID)
+            log.info("observer 已加入新群 %s", chat_id)
+        except Exception as exc:
+            log.warning("observer 未能加入 %s: %s —— 该群不会被质检",
+                        chat_id, scrub(exc))
 
     def stage_binding(self, chat_id: str, pane_id: str) -> None:
         """预绑定，等用户在群里确认后才生效。"""
@@ -3283,6 +3324,7 @@ class LarkBot:
             made += 1
             self.chat_ids.add(chat_id)
             self.chat_store.add(chat_id)
+            self.invite_observer(chat_id)
             # 只做预绑定：用户进群看到提示、确认之后才生效。
             self.stage_binding(chat_id, item["pane_id"])
 
