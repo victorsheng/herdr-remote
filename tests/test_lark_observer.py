@@ -976,5 +976,235 @@ class PaneCardHasNoButtonsTests(unittest.TestCase):
         obs.report.assert_called_once()
 
 
+# 拿 herdr_lark 真造的卡片做断言，不再手写形状。手写的那些
+# {"tag":"text","text":"DONE"} 是 API 降级返回的样子，build_pane_card 从来
+# 不产生它——正是靠着手写形状，card_is_output_only 匹配不上真卡片这个 bug
+# 才在 100 个通过的测试底下活了下来。
+_LARK_PATH = os.path.join(os.path.dirname(__file__), "..", "relay", "herdr_lark.py")
+_lk_spec = importlib.util.spec_from_file_location("lk_for_observer_tests", _LARK_PATH)
+lk = importlib.util.module_from_spec(_lk_spec)
+_lk_spec.loader.exec_module(lk)
+
+
+class RealPaneCardTests(unittest.TestCase):
+    """拿 herdr_lark.build_pane_card 真造的卡片校验豁免。
+
+    实测过的坑：observer 的判据按 tag=="text" 的独立元素做全串相等，而真
+    卡片把状态标签放在 div/lark_md 里、裹着 <font>、后面还跟 " · claude"。
+    于是**每一种状态**的 pane 卡片都被判成「交互卡片没按钮」——线上 115 条
+    card_no_buttons 就是它。手写形状的测试全绿，因为测的不是真卡片。
+    """
+
+    def test_every_status_pane_card_is_exempt(self):
+        for status in ("done", "working", "idle", "blocked", "unknown"):
+            card = lk.build_pane_card("proj", "claude", status, "一些输出")
+            with self.subTest(status=status):
+                self.assertTrue(
+                    ob.card_is_output_only(card),
+                    f"{status} 的 pane 卡片没被豁免，会误报 card_no_buttons")
+
+    def test_real_pane_card_produces_no_finding(self):
+        """端到端：真 pane 卡片不能再刷 card_no_buttons。"""
+        for status in ("done", "working", "idle", "blocked"):
+            obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(),
+                           seen=ob.SeenStore(
+                               os.path.join(_TMP, f"real-{status}.json")))
+            obs.report = unittest.mock.MagicMock()
+            obs._check_message("oc_1", "🟢 proj", {
+                "message_id": f"om_real_{status}", "msg_type": "interactive",
+                "create_time": time.time(), "sender": "app",
+                "content": lk.build_pane_card("proj", "claude", status, "out"),
+                "text": ""}, time.time())
+            with self.subTest(status=status):
+                obs.report.assert_not_called()
+
+    def test_real_interactive_cards_are_not_exempt(self):
+        """豁免不能开过大：真审批/选项卡必须仍被要求有按钮。"""
+        blocked = lk.build_blocked_card("w1:p1", "claude", "proj",
+                                        "要继续吗?", ["是", "否"], "g1")
+        options = lk.build_option_card("w1:p1", "proj", ["甲", "乙"], "g1",
+                                       question="选哪个")
+        for name, card in (("blocked", blocked), ("option", options)):
+            with self.subTest(card=name):
+                self.assertFalse(ob.card_is_output_only(card))
+                self.assertTrue(ob.card_has_buttons(card))
+
+    def test_label_table_matches_herdr_lark(self):
+        """标签表漂移就是静默失效，必须锁住。
+
+        曾经 observer 写着不存在的 "NEEDS YOU"，真有的 "BLOCKED" 反倒漏了。
+        """
+        self.assertEqual(set(ob._PANE_CARD_LABELS),
+                         set(lk.STATUS_LABELS.values()))
+
+    def test_label_must_be_at_line_start(self):
+        """输出正文里出现 DONE 不该让该有按钮的卡片蒙混过关。"""
+        card = {"elements": [{"tag": "div", "text": {
+            "tag": "lark_md", "content": "构建结果：ALL DONE 了"}}]}
+        self.assertFalse(ob.card_is_output_only(card))
+
+
+class UnmonitoredChatTests(unittest.TestCase):
+    """绑定表里有、observer 却不在群里 —— 静默的质检失效。
+
+    真实故障：datapilot6（w1R:p1）的群建在「建群自动拉 observer」之前，
+    绑定表里有它，observer 不在群里。于是那个群的消息永远扫不到，期望永远
+    划不掉，连报 70 条假 missing/card_missing。真正的问题是「这个群没在
+    质检」，报成「消息漏发」把人指向了完全错的方向。
+    """
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"unmon-{time.time()}.json")
+        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(),
+                               seen=ob.SeenStore(self.path + ".seen"),
+                               binding_path=self.path)
+        self.obs.report = unittest.mock.MagicMock()
+
+    def _write(self, table):
+        with open(self.path, "w") as fh:
+            json.dump(table, fh)
+
+    def _finish(self, pane):
+        self.obs.note_expectation("finish", {"pane_id": pane, "project": "P"})
+
+    def test_pane_in_invisible_chat_expects_nothing(self):
+        """群不可见就不该等它的消息——那是必然的假漏发。"""
+        self._write({"oc_invisible": "w1:p1"})
+        self.obs.chats = {"oc_other": "🟢 别的群"}
+        self._finish("w1:p1")
+        self.assertEqual(self.obs.pending, [])
+
+    def test_pane_in_visible_chat_still_expected(self):
+        """可见的群照常对账，别把质检整个关掉。"""
+        self._write({"oc_seen": "w1:p1"})
+        self.obs.chats = {"oc_seen": "🟢 P"}
+        self._finish("w1:p1")
+        self.assertEqual(len(self.obs.pending), 1)
+
+    def test_invisible_chat_is_reported_once(self):
+        """静默失效要显式报出来，且只报一次，不刷屏。"""
+        self._write({"oc_invisible": "w1:p1"})
+        self.obs.chats = {"oc_other": "🟢 别的群"}
+        self.obs.report_unmonitored()
+        self.obs.report_unmonitored()
+        self.assertEqual(self.obs.report.call_count, 1)
+        record = self.obs.report.call_args[0][0]
+        self.assertEqual(record["verdict"], "unmonitored_chat")
+        self.assertEqual(record["pane_id"], "w1:p1")
+
+    def test_visible_chat_is_not_reported(self):
+        self._write({"oc_seen": "w1:p1"})
+        self.obs.chats = {"oc_seen": "🟢 P"}
+        self.obs.report_unmonitored()
+        self.obs.report.assert_not_called()
+
+    def test_no_chat_list_yet_does_not_narrow_scope(self):
+        """群列表还没拉到时不能收窄口径，否则质检静默停摆。"""
+        self._write({"oc_a": "w1:p1"})
+        self.obs.chats = {}
+        self._finish("w1:p1")
+        self.assertEqual(len(self.obs.pending), 1)
+        self.obs.report_unmonitored()
+        self.obs.report.assert_not_called()
+
+    def test_finding_renders_without_chat_name(self):
+        """observer 不在群里就拿不到群名，渲染不能崩也不能只剩问号。"""
+        text = ob.format_finding({"verdict": "unmonitored_chat",
+                                  "chat_id": "oc_x", "pane_id": "w1:p1",
+                                  "note": "拉 observer 进群"})
+        self.assertIn("oc_x", text)
+        self.assertIn("w1:p1", text)
+
+
+class MatchDoesNotCrossPanesTests(unittest.TestCase):
+    """重名 agent 的两个群不能互相划掉期望。
+
+    herdr_lark.chat_title_for 专门加了 [w1R] 这类标记来区分两个同名项目的
+    群，说明重名是设计内的常态。只按项目名对账的话，「[w1R] datapilot6」群
+    里的消息会划掉 w29:p1 的期望——谁在 pending 里排前面就划谁。一边被假报
+    漏发，另一边的真漏发被悄悄吃掉。
+    """
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"cross-{time.time()}.json")
+        with open(self.path, "w") as fh:
+            json.dump({"oc_w1R": "w1R:p1", "oc_w29": "w29:p1"}, fh)
+        self.obs = ob.Observer(unittest.mock.MagicMock(), ob.FindingStore(),
+                               seen=ob.SeenStore(self.path + ".seen"),
+                               binding_path=self.path)
+
+    def _msg(self):
+        return {"msg_type": "text", "message_id": "om_1",
+                "content": {"text": "✅ datapilot6 停下来了"}}
+
+    def _pending(self, *panes):
+        return [ob.Expectation(kind="finish", pane_id=p, project="datapilot6",
+                              born=time.time()) for p in panes]
+
+    def test_message_only_satisfies_its_own_pane(self):
+        self.obs.pending = self._pending("w1R:p1", "w29:p1")
+        self.obs._match("oc_w1R", "🟡 [w1R] datapilot6", self._msg())
+        by_pane = {e.pane_id: e.matched for e in self.obs.pending}
+        self.assertTrue(by_pane["w1R:p1"])
+        self.assertFalse(by_pane["w29:p1"], "w1R 群的消息划掉了 w29 的期望")
+
+    def test_order_in_pending_does_not_decide(self):
+        """反序排列结果必须一样——原来的实现在这里会划错。"""
+        self.obs.pending = self._pending("w29:p1", "w1R:p1")
+        self.obs._match("oc_w1R", "🟡 [w1R] datapilot6", self._msg())
+        by_pane = {e.pane_id: e.matched for e in self.obs.pending}
+        self.assertTrue(by_pane["w1R:p1"])
+        self.assertFalse(by_pane["w29:p1"], "谁排前面就划谁，串台了")
+
+    def test_unknown_chat_falls_back_to_project_name(self):
+        """绑定表里查不到这个群时，回落到按项目名匹配，别一刀切不认。"""
+        self.obs.pending = self._pending("wX:p1")
+        self.obs._match("oc_unknown", "🟡 datapilot6", self._msg())
+        self.assertTrue(self.obs.pending[0].matched)
+
+
+class SeenDoesNotBlockReconcileTests(unittest.TestCase):
+    """去重只该挡内容校验，不能挡对账。
+
+    期望来自 relay 的 ws 帧，消息来自飞书轮询，两条路各有延迟。先扫到消息
+    就把它记进 seen 然后 return 的话，稍后到达的那个期望永远划不掉——白等
+    一个宽限期，然后报一条假 missing。
+    """
+
+    def setUp(self):
+        self.obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(),
+                            seen=ob.SeenStore(
+                                os.path.join(_TMP, f"seen-{time.time()}.json")))
+        self.msg = {"message_id": "om_early", "msg_type": "text",
+                    "create_time": time.time(), "sender": "app",
+                    "content": {"text": "✅ P 停下来了"},
+                    "text": "✅ P 停下来了"}
+
+    def test_expectation_arriving_after_message_still_matches(self):
+        now = time.time()
+        # 第一轮：消息先到，此时还没有期望
+        self.obs._check_message("oc_A", "🟡 P", self.msg, now)
+        self.obs.pending.append(ob.Expectation(
+            kind="finish", pane_id="p1", project="P", born=now))
+        # 第二轮：同一条消息又被扫到，seen 挡内容校验但仍要对账
+        self.obs._check_message("oc_A", "🟡 P", self.msg, now)
+        self.assertTrue(self.obs.pending[0].matched,
+                        "消息被 seen 吃掉，后到的期望永远划不掉 → 假 missing")
+
+    def test_content_is_still_only_checked_once(self):
+        """对账放行了，内容校验仍然只做一次，不能重复刷同一条问题。"""
+        obs = make_obs(unittest.mock.MagicMock(), ob.FindingStore(),
+                       seen=ob.SeenStore(
+                           os.path.join(_TMP, f"once-{time.time()}.json")))
+        obs.report = unittest.mock.MagicMock()
+        bad = {"message_id": "om_bad", "msg_type": "text",
+               "create_time": time.time(), "sender": "app",
+               "content": {"text": "   "}, "text": "   "}
+        now = time.time()
+        obs._check_message("oc_A", "🟡 P", bad, now)
+        obs._check_message("oc_A", "🟡 P", bad, now)
+        self.assertEqual(obs.report.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

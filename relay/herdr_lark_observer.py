@@ -370,10 +370,17 @@ def card_is_degraded(content: dict) -> bool:
     return any(mark in raw for mark in _CARD_DEGRADED_MARKS)
 
 
-# herdr_lark.STATUS_LABELS 的值。build_pane_card 会把它们作为独立的文本元素
-# 放在卡片第一行，这是「输出展示卡片」的结构签名。
+# herdr_lark.STATUS_LABELS 的值。build_pane_card 把它放在卡片第一个 div 里，
+# 形如 "<font color='green'>DONE</font> · claude"，这是「输出展示卡片」的签名。
 # 与 herdr_lark.py 保持同步：那边加状态就往这里加。
-_PANE_CARD_LABELS = ("DONE", "WORKING", "IDLE", "NEEDS YOU")
+#
+# 曾经这里写的是 ("DONE","WORKING","IDLE","NEEDS YOU") ——「NEEDS YOU」在
+# herdr_lark 里根本不存在，而真有的「BLOCKED」反倒漏了。更要紧的是判据
+# 找错了地方：按 tag=="text" 的独立元素做全串相等，而真卡片的标签是包在
+# div/lark_md 里、还裹着 <font> 和 " · claude" 后缀，于是**一个都匹配不上**，
+# 所有 pane 卡片都被判成「交互卡片没按钮」。线上 115 条 card_no_buttons
+# 就是它，只不过后来被 card_is_degraded 挡在前面，看着像修好了。
+_PANE_CARD_LABELS = ("DONE", "WORKING", "IDLE", "BLOCKED")
 
 # herdr_lark.py 的 _STATUS_GLYPHS 的值 + UNBOUND_CHAT_NAME。
 # observer 是独立进程、不 import herdr_lark，所以这里留一份副本。
@@ -400,6 +407,12 @@ def is_project_chat(name: str) -> bool:
     return any(name.startswith(g) for g in _PROJECT_CHAT_GLYPHS)
 
 
+# 状态标签行的形状：可能裹着 <font>，后面跟 " · <agent 名>"。
+# 只认**行首**的标签，免得输出正文里出现 "DONE" 就把审批卡豁免掉。
+_PANE_LABEL_RE = re.compile(
+    r"^\s*(?:<font[^>]*>)?\s*(" + "|".join(_PANE_CARD_LABELS) + r")\b")
+
+
 def card_is_output_only(content: dict) -> bool:
     """这张卡片是不是「只展示输出」的那类，本来就不该有按钮。
 
@@ -407,8 +420,14 @@ def card_is_output_only(content: dict) -> bool:
     把 pane 输出贴出来看。拿「交互卡片都该有按钮」去要求它，就会刷假警报：
     实测 66 条质检记录里 54 条都是这个形态。
 
-    判据用结构不用文案：状态标签（DONE / WORKING / …）作为独立文本元素出现，
-    是 build_pane_card 的签名。文案会改，这个结构不会。
+    判据用结构不用文案：状态标签开头的那一行是 build_pane_card 的签名。
+    真实卡片长这样（标签在 div 的 lark_md 里，裹着颜色、带 agent 后缀）：
+        {"tag":"div","text":{"tag":"lark_md",
+         "content":"<font color='green'>DONE</font> · claude"}}
+    所以既要看 div/lark_md 的 content，也要容忍 <font> 包裹和后缀；只比
+    「整个文本元素 == DONE」是匹配不上任何真卡片的。
+
+    只认行首的标签：输出正文里出现 "DONE" 不该让审批卡蒙混过关。
 
     审批卡片和选择卡片不在此列——它们必须有按钮，缺了就是真问题。
     """
@@ -418,9 +437,12 @@ def card_is_output_only(content: dict) -> bool:
         for cell in cells:
             if not isinstance(cell, dict):
                 continue
-            if cell.get("tag") != "text":
+            text = cell.get("text")
+            if isinstance(text, dict):
+                text = text.get("content")
+            if not isinstance(text, str):
                 continue
-            if (cell.get("text") or "").strip() in _PANE_CARD_LABELS:
+            if _PANE_LABEL_RE.match(text):
                 return True
     return False
 
@@ -590,11 +612,14 @@ class ObserverAPI:
 def format_finding(record: dict) -> str:
     """一条质检结论，发到质检群的样子。
 
-    两类结论字段不一样，别硬套一个模板：
-      漏发/缺卡片 —— 有 pane/project/等了多久，没有具体消息
-      内容异常   —— 有群名/消息样本，没有 pane（是从消息反查的）
+    几类结论字段不一样，别硬套一个模板：
+      漏发/缺卡片   —— 有 pane/project/等了多久，没有具体消息
+      内容异常     —— 有群名/消息样本，没有 pane（是从消息反查的）
+      群没在质检   —— 只有 chat_id 和它绑的 pane，连群名都拿不到
+                      （observer 不在群里，list_chats 里就没有它）
     """
-    icons = {"missing": "🚨", "content": "⚠️", "card_missing": "🔘", "ok": "✅"}
+    icons = {"missing": "🚨", "content": "⚠️", "card_missing": "🔘",
+             "unmonitored_chat": "👁", "ok": "✅"}
     verdict = record.get("verdict", "?")
     icon = icons.get(verdict, "·")
 
@@ -602,6 +627,9 @@ def format_finding(record: dict) -> str:
         head = (f"{icon} {verdict}  {record.get('project') or '?'} "
                 f"({record.get('pane_id') or '?'})")
         lines = [head, f"   期望: {record.get('kind') or '?'}"]
+    elif verdict == "unmonitored_chat":
+        head = f"{icon} {verdict}  {record.get('chat_id') or '?'}"
+        lines = [head, f"   绑着: {record.get('pane_id') or '?'}"]
     else:
         head = f"{icon} {verdict}  {record.get('chat') or '?'}"
         lines = [head]
@@ -634,45 +662,88 @@ class Observer:
         self.seen_messages = seen if seen is not None else SeenStore()
         # chat_id -> name
         self.chats: dict = {}
+        # 已经报过「observer 不在群里」的群，避免每轮重复刷
+        self._warned_chats: set = set()
         self.stats = {"expect": 0, "matched": 0, "missing": 0,
                       "content": 0, "card_missing": 0, "checked": 0,
+                      # 绑定表里有、observer 看不见的群。>0 就意味着有群
+                      # 在「看着正常、其实没人检查」的状态。
+                      "unmonitored": 0,
                       # 没绑群、本来就不该发的。这个数大不是坏事，但突然
                       # 变大意味着有人的绑定被清掉了。
                       "skipped_unbound": 0}
 
     # --- 期望侧：从 relay 事件产生 ---
 
-    def bound_panes(self) -> set:
-        """当前被某个群绑着的 pane。每次都重读文件。
+    def bindings(self) -> dict:
+        """绑定表 {chat_id: pane_id}。每次都重读文件。
 
-        缓存住的话，用户 /read 换绑后 observer 会拿着过期的绑定判一阵子，
-        而期望与实际错位正是最容易出假警报的地方。文件很小，重读的成本
-        远低于误报的代价。
-
-        读不到、格式不对都当「没有绑定」：质检工具不能因为一个坏文件挂掉。
+        读不到、格式不对都当「空表」：质检工具不能因为一个坏文件挂掉。
         反过来假设「都绑着」更糟——那会把所有静默的 pane 全判成漏发。
         """
         try:
             with open(self.binding_path) as fh:
                 payload = json.load(fh)
         except FileNotFoundError:
-            return set()
+            return {}
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("绑定表读不出，当作没有绑定: %s", scrub(exc))
-            return set()
+            return {}
         if not isinstance(payload, dict):
             log.warning("绑定表结构不对，当作没有绑定")
-            return set()
-        return {str(v) for v in payload.values() if isinstance(v, str)}
+            return {}
+        return {str(k): str(v) for k, v in payload.items()
+                if isinstance(v, str)}
+
+    def monitored_panes(self) -> set:
+        """observer **看得见的群**所绑的 pane。
+
+        这是判断「该不该等一条消息」的正确口径，比 bound_panes() 严格。
+        observer 是独立的第二个飞书应用，只能读自己所在的群；绑定表里的群
+        如果没把 observer 拉进去（老群漏拉、有人把它移出去），那个群的消息
+        永远扫不到，期望就永远划不掉——每次 finish/blocked 都判一次假漏发。
+
+        实际踩过：datapilot6（w1R:p1）的群建在「建群自动拉 observer」之前，
+        绑定表里有、observer 不在群里，于是连报 70 条假 missing/card_missing。
+        真正的问题是「这个群没在质检」，靠 unmonitored_bindings() 单独报。
+        """
+        visible = set(self.chats or {})
+        # 群列表还没拉到时不要收窄口径：那会把所有 pane 判成「不该等」，
+        # 质检静默停摆。宁可沿用宽口径，多报也比不报好。
+        if not visible:
+            return self.bound_panes()
+        return {pane for chat, pane in self.bindings().items()
+                if chat in visible}
+
+    def unmonitored_bindings(self) -> dict:
+        """绑定表里有、但 observer 看不见的群 {chat_id: pane_id}。
+
+        这种缺失是静默的：群看着一切正常，质检其实关着。必须显式报出来，
+        否则它只会伪装成一堆看不懂的 missing。
+        """
+        visible = set(self.chats or {})
+        if not visible:
+            return {}
+        return {chat: pane for chat, pane in self.bindings().items()
+                if chat not in visible}
+
+    def bound_panes(self) -> set:
+        """绑定表里被某个群绑着的 pane，不管 observer 看不看得见那个群。
+
+        判「该不该发」用这个；判「该不该等」要用更严的 monitored_panes()。
+        """
+        return set(self.bindings().values())
 
     def note_expectation(self, kind: str, agent: dict,
                          options: list | None = None) -> None:
         pane_id = agent.get("pane_id") or "?"
-        # 没有群绑着它，herdr_lark 就不会推（主群回落已去掉）。这里跟着同
-        # 一个口径，否则每次状态变化都判一次假漏发——实测 datapilot6 没绑
-        # 任何群，反复被判 missing。
-        if pane_id not in self.bound_panes():
-            log.info("跳过期望: %s %s (%s) 没有群绑着它",
+        # 只等**我们扫得到的群**里该出现的消息。两种情况都要跳过：
+        #   没有群绑着它 —— herdr_lark 根本不推（主群回落已去掉）
+        #   绑的群 observer 不在里面 —— 推了也扫不到，等于永远划不掉
+        # 后者靠 report_unmonitored() 单独报，不能混在 missing 里：那会把
+        # 「这个群没在质检」伪装成几十条「消息漏发」，方向完全错。
+        if pane_id not in self.monitored_panes():
+            log.info("跳过期望: %s %s (%s) 没有被质检的群绑着它",
                      kind, agent.get("project") or "?", pane_id)
             self.stats["skipped_unbound"] += 1
             return
@@ -712,6 +783,9 @@ class Observer:
         """扫一遍群消息，把期望划掉，同时对每条新消息做内容校验。"""
         if not self.chats:
             return
+        # 先自检：绑定表里有没有 observer 进不去的群。放在对账之前，这样
+        # 「质检没覆盖到」会先于它引发的一堆 missing 出现在质检群里。
+        self.report_unmonitored()
         now = time.time()
         for chat_id, name in self.chats.items():
             if chat_id == self.qc_chat:
@@ -731,8 +805,17 @@ class Observer:
         # 去重表塞满 20×群数 个陈旧 id，把真正该记的挤出去。
         if msg["create_time"] and now - msg["create_time"] > MAX_MESSAGE_AGE:
             return
-        if not self.seen_messages.add(mid):
-            return          # 判过了
+
+        # 去重只挡**内容校验**，不能挡对账。一条消息的内容判一次就够了，
+        # 但它能满足的期望可能还没产生：期望来自 relay 的 ws 帧，消息来自
+        # 飞书轮询，两条路各有延迟，谁先到都可能。先扫到消息就把它记进
+        # seen、然后 return 的话，稍后到达的那个期望永远划不掉——白等一个
+        # 宽限期，然后报一条假 missing。
+        fresh = self.seen_messages.add(mid)
+        if not fresh:
+            # 判过内容了，但仍要参与对账
+            self._match(chat_id, name, msg)
+            return
 
         self.stats["checked"] += 1
         problems = []
@@ -767,26 +850,38 @@ class Observer:
     def _match(self, chat_id: str, name: str, msg: dict) -> None:
         """把消息和待核对的期望配上。
 
-        只认**群名里点名了这个项目**的群：一个群绑一个 agent，群名就是
-        「herdr · <项目>」。不校验群的话，A 群的消息会划掉 B 群 agent 的
-        期望，把真实漏发掩盖成「已满足」。
+        群必须对得上，否则 A 群的消息会划掉 B 群 agent 的期望，把真实漏发
+        掩盖成「已满足」。对群有两道判据，优先用精确的那个：
 
-        群内再按项目名匹配消息。这不是精确匹配（pane 输出里可能偶然出现
-        项目名），但方向是安全的：宁可放过，不要造假漏发。
+          绑定表 —— chat_id 直接查出这个群绑着哪个 pane，和 exp.pane_id
+                    比。这是 herdr_lark 决定「往哪发」用的同一份真相，
+                    所以是精确的。
+          群名   —— 绑定表里查不到这个群时的回落，按项目名。
+
+        为什么不能只按项目名：重名 agent 是设计内的常态（herdr_lark 的
+        chat_title_for 专门加了 [w1R] 这类标记来区分两个同名项目的群）。
+        只比项目名的话，「🟡 [w1R] datapilot6」群里的消息会划掉 w29:p1 的
+        期望——两个 pane 的项目名一模一样，谁在 pending 里排前面就划谁。
+        结果是一边被假报漏发，另一边的真漏发被悄悄吃掉。
+
+        群内再按项目名匹配消息内容。这不是精确匹配（pane 输出里可能偶然
+        出现项目名），但方向是安全的：宁可放过，不要造假漏发。
         """
         if not self._chat_covers(name, chat_id):
             return
+        # 这个群绑着哪个 pane。查得到就用它做精确判据，查不到回落到群名。
+        chat_pane = self.bindings().get(str(chat_id))
         blob = json.dumps(msg["content"], ensure_ascii=False)
         for exp in self.pending:
             if exp.matched:
                 continue
             if not exp.project:
                 continue
-            # 两个条件都要满足：
-            #   群要对得上——A 群的消息不能划掉 B 群 agent 的期望
-            #   消息内容里要点到这个项目——群名对但内容说的是别的事，不算
-            if exp.project not in name:
-                continue
+            if chat_pane is not None:
+                if exp.pane_id != chat_pane:
+                    continue      # 这个群不是发给它的
+            elif exp.project not in name:
+                continue          # 回落：群名里没点到这个项目
             if exp.project not in blob:
                 continue
             if exp.expect_card and msg["msg_type"] != "interactive":
@@ -819,6 +914,31 @@ class Observer:
             })
         self.pending = keep
 
+    # --- 自检 ---
+
+    def report_unmonitored(self) -> None:
+        """绑定表里有、observer 却看不见的群，每个报一次。
+
+        这类故障是静默的：群看着一切正常，卡片也确实发出去了，但没有任何
+        人在检查它。唯一的外在表现是一堆看不懂的 missing——那正是我们要
+        避免的误导。所以显式报出来，并说清楚该怎么修。
+
+        每个群只报一次（记在 _warned_chats 里）：这是配置问题，不是每轮
+        都值得刷一条的事件；重复刷屏和不报一样会让人不看质检群。
+        """
+        for chat, pane in sorted(self.unmonitored_bindings().items()):
+            if chat in self._warned_chats:
+                continue
+            self._warned_chats.add(chat)
+            self.stats["unmonitored"] += 1
+            self.report({
+                "verdict": "unmonitored_chat",
+                "chat_id": chat, "pane_id": pane,
+                "note": ("绑定表说这个群绑着 %s，但 observer 不在群里——"
+                         "该群的消息扫不到，质检对它是静默关闭的。"
+                         "把 observer 机器人拉进群即可。" % pane),
+            })
+
     # --- 输出 ---
 
     def report(self, record: dict) -> None:
@@ -836,7 +956,8 @@ class Observer:
         s = self.stats
         return (f"期望 {s['expect']} · 已满足 {s['matched']} · 漏发 {s['missing']} · "
                 f"缺卡片 {s['card_missing']} · 内容异常 {s['content']} · "
-                f"已检消息 {s['checked']} · 未绑跳过 {s['skipped_unbound']}")
+                f"已检消息 {s['checked']} · 未绑跳过 {s['skipped_unbound']} · "
+                f"未被质检的群 {s['unmonitored']}")
 
 
 # --- 循环 ---
