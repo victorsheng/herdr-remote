@@ -1235,12 +1235,23 @@ def _is_table_row(stripped: str) -> bool:
             and stripped.count("│") >= 3)
 
 
+# 并排 diff 的右列：一根竖线之后跟着「行号 + 可选的 +/- + 代码」。
+# preview 面板的右列是散文或框线，不会长这样。用它把两者分开——面板要
+# 切掉（渲染装饰），diff 右列要留下（那是真内容，用户等着看加了哪行）。
+_DIFF_SECOND_COLUMN_RE = re.compile(r"^[│┃]\s*\d+\s*[+\-]?\s*\S")
+
+
 def strip_preview_panel(line: str) -> str:
     """切掉右侧并排的 preview 面板，只留左边的选项文字。
 
     只管「左边有正文、右边是面板」这一种。面板内容顶到行首的情况没法
     逐行判断（跟表格行 `│ 内容 │` 长得一样），交给 _drop_panel_block
     按整块处理。
+
+    但右边不一定是面板：宽终端下 diff 也是并排两列，中间一根 │ 隔开，
+    右列是「行号 + 代码」。那是内容不是装饰，切掉的话用户对着一句
+    「Added 1 line」根本找不到加的是哪行——比粘在一起更糟。所以先认一下
+    右段的形态，是 diff 就整行留给 _strip_table_pipes 去拆。
     """
     match = _PREVIEW_PANEL_RE.search(line)
     if not match:
@@ -1248,6 +1259,8 @@ def strip_preview_panel(line: str) -> str:
     head = line[:match.start()]
     if any(ch in head for ch in _BOX_CHARS):
         return line          # 左边已有框线 → 这是表格，不是并排面板
+    if _DIFF_SECOND_COLUMN_RE.match(line[match.start():].lstrip()):
+        return line          # 右边是 diff 的第二列 → 内容，留着
     return head
 
 
@@ -1295,13 +1308,31 @@ def _drop_panel_block(lines: list[str]) -> list[str]:
 
 
 def _strip_table_pipes(line: str) -> str:
-    """去掉表格行的竖线，列之间留空格。
+    """去掉表格行的竖线；并排的 diff 两列则拆成两行。
 
-    行首尾的 │ 在手机上纯占地方；列分隔换成空格，内容才不会挤成一坨。
+    行首尾的 │ 在手机上纯占地方；表格的列分隔换成空格，内容才不会挤成
+    一坨。但**不能无条件替换**：宽终端下 Claude Code 把 diff 渲染成左右
+    两列、中间一根 │ 隔开，替换成空格后两列就粘成了一行——
+
+        13  import java.util.HashMap;      14 +import java.util.HashSet;
+
+    行号错乱、两条 import 挤在一起，diff 根本没法读（用户报的「格式不对」）。
+
+    靠列数分辨：`│ a │ b │` 那种成对闭合的多列才是表格（_is_table_row），
+    压平；只有一根竖线的是并排面板，按它切成两行。这个判据比数空格可靠
+    ——两者的竖线都可能顶在行首。
     """
     if "│" not in line and "┃" not in line:
         return line
     stripped = line.strip()
+    if not _is_table_row(stripped):
+        # 单根竖线 = 并排的两列，切开各占一行。行号得跟着自己那段代码走。
+        # 缩进要留：diff 在卡片里走代码块，靠缩进对齐读，左列顶到行首而
+        # 右列还缩进着的话，同一段 diff 的行号参差不齐，比粘连更晃眼。
+        parts = [p.rstrip() for p in re.split(r"[│┃]", line)]
+        parts = [p for p in parts if p.strip()]
+        if len(parts) > 1:
+            return "\n".join(parts)
     for ch in ("│", "┃"):
         if stripped.startswith(ch):
             stripped = stripped[1:]

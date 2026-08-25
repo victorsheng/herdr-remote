@@ -4512,6 +4512,94 @@ class PreviewPanelPollutionTests(unittest.TestCase):
         self.assertIn("列二", lk.clean_pane(text))
 
 
+class SideBySideDiffTests(unittest.TestCase):
+    """并排渲染的 diff 面板不能被拼成一行。
+
+    宽终端下 Claude Code 把 diff 渲染成左右两列，中间一根 │ 隔开。
+    _strip_table_pipes 无条件把 │ 换成三个空格，两列就粘成了一行：
+
+        13  import java.util.HashMap;      14 +import java.util.HashSet;
+
+    用户看到的就是「格式不对」——行号错乱、两条 import 挤在一起，diff
+    根本读不了。真表格必须照旧剥竖线（那是为了手机窄屏），所以判据是
+    列数：`│ a │ b │` 那种成对闭合的多列才是表格。
+    """
+
+    SIDE_BY_SIDE = ("      13  import java.util.HashMap;   │"
+                    "      14 +import java.util.HashSet;")
+
+    def test_side_by_side_becomes_two_lines(self):
+        """两列内容要拆成两行，不能粘在一起。"""
+        out = lk._strip_table_pipes(self.SIDE_BY_SIDE)
+        self.assertIn("\n", out)
+
+    def test_both_columns_survive(self):
+        """拆开归拆开，内容一个都不能少。"""
+        out = lk._strip_table_pipes(self.SIDE_BY_SIDE)
+        self.assertIn("import java.util.HashMap;", out)
+        self.assertIn("import java.util.HashSet;", out)
+
+    def test_line_numbers_stay_with_their_code(self):
+        """行号得跟着自己那行代码走，串了比粘在一起更难查。"""
+        out = lk._strip_table_pipes(self.SIDE_BY_SIDE)
+        first, second = out.splitlines()[:2]
+        self.assertIn("13", first)
+        self.assertIn("HashMap", first)
+        self.assertIn("14", second)
+        self.assertIn("HashSet", second)
+
+    def test_real_table_still_flattened(self):
+        """真表格照旧压平——手机窄屏上竖线纯占地方。"""
+        out = lk._strip_table_pipes("│ 列一 │ 列二 │")
+        self.assertNotIn("\n", out)
+        self.assertIn("列一", out)
+        self.assertIn("列二", out)
+
+    def test_clean_pane_keeps_diff_lines_separate(self):
+        """走完整条 clean_pane 也得是分开的——这才是用户实际看到的。"""
+        screen = ("⏺ Update(Demo.java)\n"
+                  "  ⎿  Added 1 line\n" + self.SIDE_BY_SIDE)
+        out = lk.clean_pane(screen)
+        hashmap_line = [l for l in out.splitlines() if "HashMap" in l]
+        self.assertEqual(len(hashmap_line), 1)
+        self.assertNotIn("HashSet", hashmap_line[0])
+
+    def test_clean_pane_keeps_the_added_line(self):
+        """右列是新增的那行代码，不能当预览面板丢掉。
+
+        丢掉比粘连更糟：粘连还能看出加了什么，丢了就完全看不到——
+        用户对着一个「Added 1 line」却找不到加的是哪行。
+        """
+        screen = ("⏺ Update(Demo.java)\n"
+                  "  ⎿  Added 1 line\n" + self.SIDE_BY_SIDE)
+        out = lk.clean_pane(screen)
+        self.assertIn("HashSet", out)
+
+    def test_preview_panel_still_stripped(self):
+        """真的 preview 面板照旧要切掉——它是渲染装饰，不是内容。"""
+        screen = ('❯ 1. 抓屏改带 --ansi              ┌────────────────────┐\n'
+                  '  2. 只带出能认出的提示           │ 解析：已输入 "/rev" │')
+        out = lk.clean_pane(screen)
+        self.assertNotIn("解析：已输入", out)
+        self.assertIn("抓屏改带", out)
+
+    def test_no_pipe_line_untouched(self):
+        """没有竖线的行原样返回，别在这条路径上多做事。"""
+        plain = "      13  import java.util.HashMap;"
+        self.assertEqual(lk._strip_table_pipes(plain), plain)
+
+    def test_left_column_keeps_indent(self):
+        """拆开后左列的缩进要留着。
+
+        diff 在卡片里走代码块，靠缩进对齐读。左列顶到行首、右列还带着
+        6 格缩进的话，同一段 diff 里行号参差不齐，比粘连时更晃眼。
+        """
+        out = lk._strip_table_pipes(self.SIDE_BY_SIDE)
+        first, second = out.splitlines()[:2]
+        self.assertEqual(first[:6], "      ")
+        self.assertEqual(second[:6], "      ")
+
+
 class MultiStepSplitRegressionTests(unittest.TestCase):
     """多组选项 + 超长正文拆条，两个机制叠在一起不能互相破坏。
 
