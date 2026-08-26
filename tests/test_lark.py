@@ -2503,6 +2503,122 @@ class GitPickerTests(unittest.TestCase):
         self.assertEqual(lk.CODE_ACTIONS[value["a"]], "git")
 
 
+class BranchTrackingTests(unittest.TestCase):
+    """本地与远端差了几个提交。
+
+    数据一直都在——`git status --porcelain -b` 的分支行本来就带
+    `[ahead 2]` / `[behind 1]` / `[ahead 3, behind 1]`，relay 也把整行
+    原样放进 branch 字段了。之前 short_branch 把它一起切掉了。
+
+    「未推送的提交」和「未提交的文件」是两件事，文案上必须分清：
+    前者已经 commit 只是没 push，后者连 commit 都没有。
+    """
+
+    def test_parses_ahead(self):
+        t = lk.parse_tracking("feat/x...origin/feat/x [ahead 2]")
+        self.assertEqual((t["ahead"], t["behind"]), (2, 0))
+
+    def test_parses_behind(self):
+        t = lk.parse_tracking("main...origin/main [behind 3]")
+        self.assertEqual((t["ahead"], t["behind"]), (0, 3))
+
+    def test_parses_diverged(self):
+        """两边都动过——最需要提醒的情况。"""
+        t = lk.parse_tracking("main...origin/main [ahead 3, behind 1]")
+        self.assertEqual((t["ahead"], t["behind"]), (3, 1))
+
+    def test_in_sync_has_no_markers(self):
+        t = lk.parse_tracking("main...origin/main")
+        self.assertEqual((t["ahead"], t["behind"]), (0, 0))
+        self.assertEqual(t["upstream"], "origin/main")
+
+    def test_no_upstream_at_all(self):
+        """本地新分支还没 push 过，没有上游可比。"""
+        t = lk.parse_tracking("feat/new")
+        self.assertEqual(t["upstream"], "")
+        self.assertEqual((t["ahead"], t["behind"]), (0, 0))
+
+    def test_detached_head(self):
+        t = lk.parse_tracking("HEAD (no branch)")
+        self.assertEqual(t["branch"], "HEAD (no branch)")
+        self.assertEqual(t["upstream"], "")
+
+    def test_branch_name_extracted(self):
+        t = lk.parse_tracking("feat/x...origin/feat/x [ahead 2]")
+        self.assertEqual(t["branch"], "feat/x")
+
+    def test_garbage_does_not_crash(self):
+        for junk in ("", None, "## weird", "[ahead notanumber]"):
+            t = lk.parse_tracking(junk)
+            self.assertIsInstance(t["ahead"], int)
+
+
+class TrackingTextTests(unittest.TestCase):
+    """ahead/behind 渲染成中文，且不与「未提交」混淆。"""
+
+    def test_ahead_says_unpushed(self):
+        text = lk.format_tracking({"branch": "feat/x", "upstream": "origin/feat/x",
+                                   "ahead": 2, "behind": 0})
+        self.assertIn("2", text)
+        self.assertIn("未推送", text)
+
+    def test_behind_says_behind(self):
+        text = lk.format_tracking({"branch": "main", "upstream": "origin/main",
+                                   "ahead": 0, "behind": 3})
+        self.assertIn("3", text)
+        self.assertIn("落后", text)
+
+    def test_diverged_shows_both(self):
+        text = lk.format_tracking({"branch": "main", "upstream": "origin/main",
+                                   "ahead": 3, "behind": 1})
+        self.assertIn("3", text)
+        self.assertIn("1", text)
+
+    def test_in_sync_is_stated(self):
+        text = lk.format_tracking({"branch": "main", "upstream": "origin/main",
+                                   "ahead": 0, "behind": 0})
+        self.assertIn("同步", text)
+
+    def test_no_upstream_is_flagged(self):
+        """没有上游要说出来——不然看着像「已同步」，其实一次都没推过。"""
+        text = lk.format_tracking({"branch": "feat/new", "upstream": "",
+                                   "ahead": 0, "behind": 0})
+        self.assertIn("未推送", text)
+
+    def test_does_not_say_uncommitted(self):
+        """ahead 是已 commit 未 push，不能写成「未提交」。"""
+        text = lk.format_tracking({"branch": "f", "upstream": "origin/f",
+                                   "ahead": 2, "behind": 0})
+        self.assertNotIn("未提交", text)
+
+
+class GitStatusWithTrackingTests(unittest.TestCase):
+    """/git 的完整输出要同时有 ahead/behind 和未提交文件。"""
+
+    def test_shows_ahead_and_files(self):
+        text = lk.format_git_status({
+            "ok": True, "clean": False,
+            "branch": "feat/x...origin/feat/x [ahead 2]",
+            "files": [{"status": "M", "path": "a.py"}]})
+        self.assertIn("未推送", text)
+        self.assertIn("a.py", text)
+        self.assertIn("未提交", text)
+
+    def test_clean_tree_still_shows_ahead(self):
+        """工作区干净但有未推送的提交——这正是最容易忘的状态。"""
+        text = lk.format_git_status({
+            "ok": True, "clean": True,
+            "branch": "feat/x...origin/feat/x [ahead 2]", "files": []})
+        self.assertIn("未推送", text)
+        self.assertIn("干净", text)
+
+    def test_fully_clean_and_synced(self):
+        text = lk.format_git_status({
+            "ok": True, "clean": True,
+            "branch": "main...origin/main", "files": []})
+        self.assertIn("同步", text)
+
+
 class ChatDescriptionTests(unittest.TestCase):
     """群描述里维护 space 的额外信息（分支、路径、agent 类型）。
 
@@ -2544,6 +2660,12 @@ class ChatDescriptionTests(unittest.TestCase):
         """本地是常态，不必占一行。"""
         text = lk.format_chat_description(self.agent(host="local"), branch="main")
         self.assertNotIn("local", text)
+
+    def test_ahead_marker_in_description(self):
+        """群信息页一眼能看到「有 2 个提交没推」，比只看分支名有用。"""
+        text = lk.format_chat_description(self.agent(), branch="feat/x ↑2")
+        self.assertIn("feat/x", text)
+        self.assertIn("2", text)
 
     def test_within_lark_limit(self):
         """飞书群描述有长度上限，超了整个更新会失败。"""
@@ -2672,6 +2794,22 @@ class SyncChatDescriptionTests(unittest.TestCase):
         self.run_sync(bot, [], 1000.0)
         self.run_sync(bot, [], 1031.0)
         self.assertEqual(self.calls, [])
+
+    def test_description_includes_ahead_marker(self):
+        """描述里带上未推送计数——数据本来就在 branch 行里，白扔了可惜。"""
+        bot = self.bot()
+        with unittest.mock.patch.object(
+                lk, "fetch_git_status",
+                new=unittest.mock.AsyncMock(return_value={
+                    "ok": True,
+                    "branch": "feat/x...origin/feat/x [ahead 2]"})):
+            asyncio.run(lk._sync_chat_descriptions(bot, self.agents(), 1000.0))
+            asyncio.run(lk._sync_chat_descriptions(bot, self.agents(), 1031.0))
+        self.assertEqual(len(self.calls), 1)
+        desc = self.calls[0][1]
+        self.assertIn("feat/x", desc)
+        self.assertIn("2", desc)
+        self.assertNotIn("origin/feat/x", desc)   # 上游名是噪音
 
     def test_git_failure_yields_description_without_branch(self):
         """查不到分支时照样写描述，只是不带分支——路径信息仍然有用。"""

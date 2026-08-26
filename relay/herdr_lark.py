@@ -4232,6 +4232,71 @@ def short_branch(branch: str) -> str:
     return (branch or "").split("...")[0].strip()
 
 
+_TRACK_RE = re.compile(r"\b(ahead|behind)\s+(\d+)")
+
+
+def parse_tracking(branch_line: str | None) -> dict:
+    """拆开 porcelain 的分支行。
+
+    形如 `feat/x...origin/feat/x [ahead 3, behind 1]`。这段信息 relay 早就
+    原样带回来了（_parse_git_porcelain 存的是整行），不需要额外查 git。
+
+    没有上游时（本地新分支从没 push 过）upstream 为空——这和「已同步」是
+    两种完全不同的状态，调用方要能区分。
+    """
+    line = (branch_line or "").strip()
+    head, _, rest = line.partition("...")
+    upstream = ""
+    if rest:
+        # `origin/x [ahead 2]` —— 上游名到第一个空格为止
+        upstream = rest.split(" ", 1)[0].strip()
+    counts = {"ahead": 0, "behind": 0}
+    for kind, num in _TRACK_RE.findall(line):
+        try:
+            counts[kind] = int(num)
+        except ValueError:
+            pass
+    return {"branch": head.strip() or line, "upstream": upstream, **counts}
+
+
+def format_tracking(track: dict) -> str:
+    """把 ahead/behind 说成人话。
+
+    刻意不用「未提交」这个词：ahead 是已经 commit、只是没 push，与未提交的
+    文件是两件事，混在一起会让人以为改动还没存下来。
+    """
+    ahead = track.get("ahead") or 0
+    behind = track.get("behind") or 0
+    if not track.get("upstream"):
+        # 没有上游 ≠ 已同步。一次都没推过的分支必须说出来。
+        return "无上游分支（未推送过）"
+    if ahead and behind:
+        return f"已分叉：{ahead} 个未推送，落后 {behind} 个"
+    if ahead:
+        return f"{ahead} 个提交未推送"
+    if behind:
+        return f"落后远端 {behind} 个提交"
+    return "与远端同步"
+
+
+def tracking_badge(track: dict) -> str:
+    """群描述用的紧凑标记：`↑2`、`↓1`、`↑3↓1`、`↑?`（无上游）。
+
+    描述有 100 字上限且要塞分支/类型/路径，所以这里不用「N 个提交未推送」
+    那种完整措辞，只留符号和数字。
+    """
+    if not track.get("upstream"):
+        return "↑?"
+    ahead = track.get("ahead") or 0
+    behind = track.get("behind") or 0
+    parts = []
+    if ahead:
+        parts.append(f"↑{ahead}")
+    if behind:
+        parts.append(f"↓{behind}")
+    return "".join(parts)
+
+
 def format_git_status(payload: dict | None) -> str:
     """把 relay 的 git_status 响应渲染成群里能看的文本。
 
@@ -4243,9 +4308,13 @@ def format_git_status(payload: dict | None) -> str:
     if not payload.get("ok"):
         return f"git 失败: {payload.get('message') or '未知原因'}"
 
-    branch = short_branch(payload.get("branch", ""))
+    track = parse_tracking(payload.get("branch", ""))
+    branch = track["branch"]
     files = payload.get("files") or []
     head = f"⎇ {branch}" if branch else "⎇ (游离 HEAD)"
+    # 未推送的提交要和未提交的文件并列显示：工作区干净但有 ahead 是最容易
+    # 忘的状态，只说「干净」会让人以为活都交出去了。
+    head = f"{head}\n↕ {format_tracking(track)}"
     if payload.get("clean") or not files:
         return f"{head}\n工作区干净，没有未提交的改动。"
 
@@ -4478,7 +4547,12 @@ async def _sync_chat_descriptions(bot: "LarkBot", agents: list[dict],
             # 先记账再查：查失败也别让下一帧立刻重试。
             bot.branches.put(pane_id, "", now)
             payload = await fetch_git_status(pane_id)
-            branch = short_branch(payload.get("branch", "")) if payload.get("ok") else ""
+            branch = ""
+            if payload.get("ok"):
+                track = parse_tracking(payload.get("branch", ""))
+                badge = tracking_badge(track)
+                # 分支名后跟紧凑标记，缓存整串——描述要的就是这个成品。
+                branch = f"{track['branch']} {badge}".strip() if badge else track["branch"]
             bot.branches.put(pane_id, branch, now)
         target = format_chat_description(agent, branch or "")
         if not target:

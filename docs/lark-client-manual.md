@@ -122,13 +122,32 @@ relay 仍然只监听 localhost，飞书客户端只是它的一个本地客户�
 open_id 按应用隔离，同一个人在不同应用下的 open_id 不一样。填错了的表现同样是
 「装死」，所以入站日志会打 `sender=`，照着日志抄即可。
 
+### `/git` 的输出
+
+```
+herdr-remote
+⎇ feat/lark-client
+↕ 2 个提交未推送
+未提交 2 个文件：
+  M  relay/herdr_lark.py
+  M  tests/test_lark.py
+```
+
+**未推送的提交**和**未提交的文件**是两件事，所以分两行显示：前者已经 commit
+只是没 push，后者连 commit 都没有。工作区干净但有 `ahead` 是最容易忘的状态——
+只说「干净」会让人以为活都交出去了。
+
 ### 群描述里维护 space 的额外信息
 
 群信息页的描述会自动同步成 `⎇ 分支 · agent 类型 · @远程主机 · 路径`，例如：
 
 ```
-⎇ feat/lark-client · claude · /Users/victor/code-github/herdr-remote
+⎇ feat/lark-client ↑2 · claude · /Users/victor/code-github/herdr-remote
 ```
+
+`↑2` 是**未推送的提交数**，`↓1` 是落后远端的数量，`↑?` 表示这个分支还没有上游
+（一次都没 push 过）。这段数据不需要额外查 git —— `git status --porcelain -b`
+的分支行本来就带 `[ahead 2]`，relay 早就原样带回来了。
 
 **为什么不是群公告**：飞书的群公告是独立的 docx，`im/v1/chats` 返回的字段里
 根本没有公告项，API 改不了。群描述是唯一能写的地方。
@@ -263,7 +282,7 @@ uv run relay/herdr_usage.py --detail  # 加缓存明细与耗时
 | `/start` 或 `/help` | 面板概览 + agent 选择卡片 |
 | `/agents` | 列出全部 agent，**带稳定序号**，行首图标表状态；并附一张可点的卡片 |
 | `/status` | relay 连接状态与 agent 计数 |
-| `/git [序号]` | 分支 + 未提交的文件列表；不带序号用本群绑的 agent |
+| `/git [序号]` | 分支、与远端的 ahead/behind、未提交的文件列表；不带序号用本群绑的 agent |
 | `/read <序号>` | 读终端输出（200 行，清理后约 40 行） |
 | `/reply <序号>` | 同 `/read`，并提示可直接回复 |
 | `/send <序号> <内容>` | 发文本给指定 agent |
