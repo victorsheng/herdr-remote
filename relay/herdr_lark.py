@@ -2391,7 +2391,13 @@ def _locate_selector(text: str) -> tuple[list[str], int, int] | None:
     两处各判一次的话，「什么算选择器」会慢慢长歪：一边认得的变体另一边不
     认得，卡片上就会出现「按钮有这项、正文里还重复一遍」的错位。
     """
-    lines = (text or "").splitlines()
+    # 先剥并排 preview 面板。strip_preview_panel 只挂在 clean_pane 上，而
+    # blocked 的 prompt 是 relay 直接推来的、没经过清洗（见 _notify_blocked），
+    # 于是右列的框线混进了选项文字——实测选项变成
+    # `补一行豁免（推荐）           ┌────────`，框线挤掉真正要判断的字。
+    # 放在这里而不是各调用方：_locate_selector 是所有解析路径的公共入口，
+    # 而 strip_preview_panel 是幂等的，显示路径重复剥一次结果不变。
+    lines = [strip_preview_panel(l) for l in (text or "").splitlines()]
     if not lines:
         return None
 

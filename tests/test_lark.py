@@ -2825,6 +2825,95 @@ class SyncChatDescriptionTests(unittest.TestCase):
         self.assertNotIn("⎇", self.calls[0][1])
 
 
+class BlockedPromptPanelTests(unittest.TestCase):
+    """blocked 的 prompt 没走 clean_pane，并排 preview 面板会混进选项文字。
+
+    真实故障（质检 option_text_polluted，datapilot6）：卡片上三个选项长这样
+        '补一行豁免（推荐）           ┌────────────────────'
+        '改豁免规则按模块而非目录     │ checkstyle-suppressions.xml 加一行:'
+        'Phase 8 门禁跳过 dao 模块    │'
+
+    strip_preview_panel 本身是对的，问题在调用位置：它只挂在 clean_pane 上
+    （/read 那条显示路径），而 _notify_blocked 直接拿 relay 推来的 prompt 去
+    detect_option_groups，绕过了整个清洗。
+
+    污染不只是难看：选项文字要参与 option_label 截断和卡片渲染，框线挤掉的
+    是真正需要判断的字，人得盲选。
+    """
+
+    PROMPT = ("Do you want to proceed?\n"
+              "❯ 1. 补一行豁免（推荐）           ┌──────────────────────────\n"
+              "  2. 改豁免规则按模块而非目录     │ checkstyle-suppressions.xml 加一行:\n"
+              "  3. Phase 8 门禁跳过 dao 模块    │")
+    BOX = set("│┃┌┐└┘├┤┬┴┼─━")
+
+    def options(self, text):
+        group = lk.current_option_group(lk.detect_option_groups(text))
+        return (group or {}).get("options") or []
+
+    def test_options_have_no_box_chars(self):
+        opts = self.options(self.PROMPT)
+        self.assertEqual(len(opts), 3)
+        for i, opt in enumerate(opts, 1):
+            with self.subTest(option=i):
+                self.assertFalse(self.BOX & set(opt), f"选项 {i} 仍含框线: {opt!r}")
+
+    def test_option_text_preserved(self):
+        """剥面板不能把选项文字一起吃掉。"""
+        opts = self.options(self.PROMPT)
+        self.assertIn("补一行豁免", opts[0])
+        self.assertIn("改豁免规则", opts[1])
+        self.assertIn("Phase 8", opts[2])
+
+    def test_all_three_options_survive(self):
+        """污染最坏的后果是整组丢失——编号断档会让校验丢掉这一组。"""
+        self.assertEqual(len(self.options(self.PROMPT)), 3)
+
+    def test_blocked_card_is_clean(self):
+        """observer 读的是卡片，卡片里也不能有面板框线。"""
+        card = lk.build_blocked_card("w1:p1", "claude", "proj",
+                                     self.PROMPT, None, "abcde")
+        blob = json.dumps(card, ensure_ascii=False)
+        for ch in "┌└├┐┘┤":
+            self.assertNotIn(ch, blob)
+
+    def test_table_rows_still_parse(self):
+        """别把表格当面板切了——表格是成对闭合的多列，是真内容。"""
+        prompt = ("选一个\n"
+                  "  1. 保留表格 │ a │ b │\n"
+                  "  2. 删掉表格")
+        opts = self.options(prompt)
+        self.assertEqual(len(opts), 2)
+        self.assertIn("a", opts[0])
+
+    def test_strip_selector_line_indices_stay_valid(self):
+        """剥面板不能打乱 strip_selector 的下标换算。
+
+        _locate_selector 返回的 tail 是剥过的，而 strip_selector 用
+        len(lines) - len(tail) + start 换算回**原文**下标。剥面板只改行内容、
+        不增删行，所以换算仍然成立——这条测试把这个前提钉住，以后有人改成
+        「顺手丢掉空行」就会在这里炸。
+        """
+        prompt = ("前面的正文           ┌─────────\n"
+                  "第二行正文           │ preview 内容\n"
+                  "选一个：\n"
+                  "  1. 甲           │ xx\n"
+                  "  2. 乙")
+        body = lk.strip_selector(prompt)
+        self.assertIn("前面的正文", body)
+        self.assertIn("选一个：", body)
+        self.assertNotIn("1. 甲", body)     # 选项已摘掉
+        self.assertNotIn("2. 乙", body)
+
+    def test_display_path_unchanged(self):
+        """clean_pane 那条路已经剥过面板，再剥一次结果必须一致（幂等）。"""
+        cleaned = lk.clean_pane(self.PROMPT)
+        opts = self.options(cleaned)
+        self.assertEqual(len(opts), 3)
+        for opt in opts:
+            self.assertFalse(self.BOX & set(opt))
+
+
 class MultiChatIsolationTests(unittest.TestCase):
     """两个群各绑各的 agent，互不串台。"""
 
