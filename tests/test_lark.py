@@ -2424,6 +2424,269 @@ class AdoptChatTests(unittest.TestCase):
         self.assertEqual(self.invited, [])
 
 
+class GitStatusFormatTests(unittest.TestCase):
+    """/git —— 分支 + 未提交文件。
+
+    relay 已经有 git_status 协议（返回 branch/files/clean），这里只负责把它
+    渲染成手机上能看的样子，不重复实现 git。
+    """
+
+    def test_clean_tree_says_so(self):
+        text = lk.format_git_status({
+            "ok": True, "clean": True, "branch": "main", "files": []})
+        self.assertIn("main", text)
+        self.assertIn("干净", text)
+
+    def test_lists_changed_files_with_status(self):
+        text = lk.format_git_status({
+            "ok": True, "clean": False, "branch": "feat/x...origin/feat/x",
+            "files": [{"status": "M", "path": "a.py"},
+                      {"status": "??", "path": "b.py"}]})
+        self.assertIn("a.py", text)
+        self.assertIn("b.py", text)
+        self.assertIn("M", text)
+
+    def test_strips_upstream_from_branch(self):
+        """`feat/x...origin/feat/x` 在手机上太长，只留本地分支名。"""
+        text = lk.format_git_status({
+            "ok": True, "clean": True,
+            "branch": "feat/x...origin/feat/x", "files": []})
+        self.assertIn("feat/x", text)
+        self.assertNotIn("origin/feat/x", text)
+
+    def test_error_surfaces_message(self):
+        text = lk.format_git_status({"ok": False, "message": "not a git repository"})
+        self.assertIn("not a git repository", text)
+
+    def test_missing_payload_does_not_crash(self):
+        """relay 没回或回了残缺结构时，给一句话而不是抛异常。"""
+        self.assertIsInstance(lk.format_git_status(None), str)
+        self.assertIsInstance(lk.format_git_status({}), str)
+
+    def test_file_list_is_capped(self):
+        """几百个未提交文件会把手机屏幕刷爆，截断并说明还有多少。"""
+        files = [{"status": "M", "path": f"f{i}.py"} for i in range(200)]
+        text = lk.format_git_status(
+            {"ok": True, "clean": False, "branch": "main", "files": files})
+        self.assertLess(len(text.splitlines()), 60)
+        self.assertIn("200", text)
+
+    def test_counts_shown(self):
+        text = lk.format_git_status({
+            "ok": True, "clean": False, "branch": "main",
+            "files": [{"status": "M", "path": "a.py"},
+                      {"status": "M", "path": "b.py"}]})
+        self.assertIn("2", text)
+
+
+class GitPickerTests(unittest.TestCase):
+    """/git 的选择器按钮必须是可点的。
+
+    action_value 用 ACTION_CODES[action] 直接下标，未注册的 action 会当场
+    抛 KeyError——表现是发 /git 时机器人报错，而不是「按钮点了没反应」。
+    """
+
+    def test_git_action_is_registered(self):
+        self.assertIn("git", lk.ACTION_CODES)
+
+    def test_git_code_is_unique(self):
+        """编码撞车会让两个动作互相解析成对方。"""
+        codes = list(lk.ACTION_CODES.values())
+        self.assertEqual(len(codes), len(set(codes)))
+
+    def test_git_picker_card_builds(self):
+        card = lk.build_agent_picker_card("git", make_agents(2))
+        self.assertTrue(buttons_in(card))
+
+    def test_git_action_round_trips(self):
+        value = lk.action_value("git", "w1:p1")
+        self.assertEqual(lk.CODE_ACTIONS[value["a"]], "git")
+
+
+class ChatDescriptionTests(unittest.TestCase):
+    """群描述里维护 space 的额外信息（分支、路径、agent 类型）。
+
+    群公告是 docx、API 改不了（实测 im/v1/chats 没有公告字段），可写的是
+    群描述，它显示在群信息页。
+
+    改描述和改群名一样会在群里留系统消息，所以必须复用同一套节流——
+    relay 每 2 秒推一次状态，不节流的话状态抖几下就刷一屏。
+    """
+
+    def agent(self, **kw):
+        base = dict(pane_id="w1:p1", project="proj", agent="claude",
+                    status="working", cwd="/work/proj", host="local")
+        base.update(kw)
+        return base
+
+    def test_includes_branch_and_path(self):
+        text = lk.format_chat_description(self.agent(), branch="feat/x")
+        self.assertIn("feat/x", text)
+        self.assertIn("/work/proj", text)
+
+    def test_includes_agent_kind(self):
+        text = lk.format_chat_description(self.agent(agent="cursor"), branch="")
+        self.assertIn("cursor", text)
+
+    def test_no_branch_yet_is_omitted_not_faked(self):
+        """分支还没查到时不要编一个——留空比显示错的好。"""
+        text = lk.format_chat_description(self.agent(), branch="")
+        self.assertNotIn("None", text)
+        self.assertNotIn("分支:", text)
+
+    def test_remote_host_shown(self):
+        """远程 agent 要标出主机，否则以为在本地。"""
+        text = lk.format_chat_description(
+            self.agent(host="build-box"), branch="main")
+        self.assertIn("build-box", text)
+
+    def test_local_host_not_noise(self):
+        """本地是常态，不必占一行。"""
+        text = lk.format_chat_description(self.agent(host="local"), branch="main")
+        self.assertNotIn("local", text)
+
+    def test_within_lark_limit(self):
+        """飞书群描述有长度上限，超了整个更新会失败。"""
+        long_agent = self.agent(cwd="/" + "x" * 400, project="p" * 200)
+        text = lk.format_chat_description(long_agent, branch="b" * 200)
+        self.assertLessEqual(len(text), 100)
+
+    def test_throttle_reused_for_description(self):
+        """描述沿用 ChatRenamer 的节流：同一内容不重复提交。"""
+        th = lk.ChatRenamer()
+        first = th.decide("oc_1", "分支 main", "working", now=1000.0)
+        self.assertIsNone(first)  # 防抖，第一次只记账
+        second = th.decide("oc_1", "分支 main", "working", now=1000.0 + 31)
+        self.assertEqual(second, "分支 main")
+        again = th.decide("oc_1", "分支 main", "working", now=1000.0 + 200)
+        self.assertIsNone(again)  # 没变就不再提交
+
+
+class BranchCacheTests(unittest.TestCase):
+    """分支要缓存。
+
+    描述同步挂在状态循环上，而 relay 每 2 秒推一帧。每帧对每个群查一次
+    git 的话，一个 agent 一天就是四万次 git 调用——远程 agent 还要走 SSH。
+    分支变化的频率远低于状态变化，缓存住、按间隔过期才合理。
+    """
+
+    def test_first_call_is_a_miss(self):
+        cache = lk.BranchCache(ttl=60)
+        self.assertIsNone(cache.get("w1:p1", now=1000.0))
+
+    def test_returns_cached_value(self):
+        cache = lk.BranchCache(ttl=60)
+        cache.put("w1:p1", "main", now=1000.0)
+        self.assertEqual(cache.get("w1:p1", now=1030.0), "main")
+
+    def test_expires_after_ttl(self):
+        cache = lk.BranchCache(ttl=60)
+        cache.put("w1:p1", "main", now=1000.0)
+        self.assertIsNone(cache.get("w1:p1", now=1061.0))
+
+    def test_due_gates_refresh(self):
+        """没到期就不该再查——这正是省掉四万次调用的那道闸。"""
+        cache = lk.BranchCache(ttl=60)
+        self.assertTrue(cache.due("w1:p1", now=1000.0))
+        cache.put("w1:p1", "main", now=1000.0)
+        self.assertFalse(cache.due("w1:p1", now=1030.0))
+        self.assertTrue(cache.due("w1:p1", now=1061.0))
+
+    def test_empty_branch_still_caches(self):
+        """查失败（非 git 仓库）也要记账，否则每帧都去重试。"""
+        cache = lk.BranchCache(ttl=60)
+        cache.put("w1:p1", "", now=1000.0)
+        self.assertFalse(cache.due("w1:p1", now=1030.0))
+
+    def test_forget_drops_entry(self):
+        cache = lk.BranchCache(ttl=60)
+        cache.put("w1:p1", "main", now=1000.0)
+        cache.forget("w1:p1")
+        self.assertTrue(cache.due("w1:p1", now=1000.0))
+
+
+class SyncChatDescriptionTests(unittest.TestCase):
+    """描述同步整条链路：查分支 -> 排版 -> 节流 -> 调 API。"""
+
+    def bot(self):
+        bot = lk.LarkBot.__new__(lk.LarkBot)
+        bot._active = {"oc_1": "w1:p1"}
+        bot.describer = lk.ChatRenamer()
+        bot.branches = lk.BranchCache()
+        self.calls = []
+        bot.api = types.SimpleNamespace(
+            set_chat_description=lambda c, d: self.calls.append((c, d)))
+        return bot
+
+    def agents(self):
+        return [{"pane_id": "w1:p1", "project": "proj", "agent": "claude",
+                 "status": "working", "cwd": "/work/proj", "host": "local"}]
+
+    def run_sync(self, bot, agents, now):
+        with unittest.mock.patch.object(
+                lk, "fetch_git_status",
+                new=unittest.mock.AsyncMock(
+                    return_value={"ok": True, "branch": "feat/x"})):
+            asyncio.run(lk._sync_chat_descriptions(bot, agents, now))
+
+    def test_writes_description_after_debounce(self):
+        bot = self.bot()
+        self.run_sync(bot, self.agents(), 1000.0)
+        self.assertEqual(self.calls, [])       # 防抖，第一帧只记账
+        self.run_sync(bot, self.agents(), 1031.0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("feat/x", self.calls[0][1])
+
+    def test_unchanged_description_not_rewritten(self):
+        """内容没变就别再调——每次调用都在群里留一条系统消息。"""
+        bot = self.bot()
+        self.run_sync(bot, self.agents(), 1000.0)
+        self.run_sync(bot, self.agents(), 1031.0)
+        self.run_sync(bot, self.agents(), 1200.0)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_branch_fetched_once_within_ttl(self):
+        """TTL 内只查一次 git，否则 2 秒一帧会打爆 relay。"""
+        bot = self.bot()
+        fake = unittest.mock.AsyncMock(
+            return_value={"ok": True, "branch": "feat/x"})
+        with unittest.mock.patch.object(lk, "fetch_git_status", new=fake):
+            for t in (1000.0, 1002.0, 1004.0, 1006.0):
+                asyncio.run(lk._sync_chat_descriptions(bot, self.agents(), t))
+        self.assertEqual(fake.await_count, 1)
+
+    def test_api_failure_does_not_raise(self):
+        """改描述失败不能把状态循环带崩——描述是展示，不是功能前提。"""
+        bot = self.bot()
+
+        def boom(chat_id, desc):
+            raise RuntimeError("no permission")
+
+        bot.api = types.SimpleNamespace(set_chat_description=boom)
+        self.run_sync(bot, self.agents(), 1000.0)
+        self.run_sync(bot, self.agents(), 1031.0)   # 不抛就算过
+
+    def test_pane_absent_this_frame_skipped(self):
+        """这一帧没带这个 pane 就跳过，不要拿旧数据覆盖。"""
+        bot = self.bot()
+        self.run_sync(bot, [], 1000.0)
+        self.run_sync(bot, [], 1031.0)
+        self.assertEqual(self.calls, [])
+
+    def test_git_failure_yields_description_without_branch(self):
+        """查不到分支时照样写描述，只是不带分支——路径信息仍然有用。"""
+        bot = self.bot()
+        with unittest.mock.patch.object(
+                lk, "fetch_git_status",
+                new=unittest.mock.AsyncMock(
+                    return_value={"ok": False, "message": "not a git repo"})):
+            asyncio.run(lk._sync_chat_descriptions(bot, self.agents(), 1000.0))
+            asyncio.run(lk._sync_chat_descriptions(bot, self.agents(), 1031.0))
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("/work/proj", self.calls[0][1])
+        self.assertNotIn("⎇", self.calls[0][1])
+
+
 class MultiChatIsolationTests(unittest.TestCase):
     """两个群各绑各的 agent，互不串台。"""
 

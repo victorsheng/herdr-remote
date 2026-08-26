@@ -89,6 +89,7 @@ ACTION_CODES = {
     "submit": "u",
     "page": "g",
     "agent_menu": "m",
+    "git": "v",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
 
@@ -561,6 +562,31 @@ async def read_pane(pane_id: str, lines: int = READ_LINES) -> str:
     except Exception as exc:
         return f"(error reading pane: {scrub(exc)})"
     return "(no response)"
+
+
+async def fetch_git_status(pane_id: str) -> dict:
+    """向 relay 要这个 pane 的 git 状态。
+
+    relay 那边按 pane_id 解析 cwd 和 SSH remote，所以远程 agent 也能查——
+    这里不碰 git，也不需要知道代码在哪台机器上。
+
+    失败返回 {"ok": False, "message": ...}，与 relay 的错误结构一致，
+    调用方只处理一种形状。
+    """
+    try:
+        async with ws_connect(RELAY_WS) as ws:
+            await ws.send(json.dumps({
+                "type": "git_status", "pane_id": pane_id, "mode": "worktree",
+            }))
+            # 可能先撞上 agents 广播，往后多读几条找 git_status。
+            for _ in range(5):
+                raw = await asyncio.wait_for(ws.recv(), timeout=READ_TIMEOUT_S)
+                msg = json.loads(raw)
+                if msg.get("type") == "git_status":
+                    return msg
+    except Exception as exc:
+        return {"ok": False, "message": scrub(str(exc))}
+    return {"ok": False, "message": "relay 没有响应"}
 
 
 def is_pane_read_error(content: str) -> bool:
@@ -2619,6 +2645,7 @@ COMMAND_HELP = [
     {"group": "看", "name": "agents", "args": "", "desc": "列出全部 agent"},
     {"group": "看", "name": "read", "args": "<序号>", "desc": "看它最近在干什么"},
     {"group": "看", "name": "watch", "args": "[序号]", "desc": "跟随输出，stop 停止"},
+    {"group": "看", "name": "git", "args": "[序号]", "desc": "分支 + 未提交的文件"},
     {"group": "看", "name": "status", "args": "", "desc": "连接状态"},
     {"group": "看", "name": "digest", "args": "", "desc": "今日活动统计"},
     {"group": "看", "name": "usage", "args": "", "desc": "Claude 用量（5h 窗 + 本周）"},
@@ -2967,6 +2994,22 @@ class LarkAPI:
         if not response.success():
             raise RuntimeError(f"改群名失败: {response.msg}")
 
+    def set_chat_description(self, chat_id: str, description: str) -> None:
+        """改群描述。
+
+        群公告是 docx 类型、API 改不了（im/v1/chats 返回的字段里没有公告），
+        描述是唯一能写的地方，显示在群信息页。
+        """
+        from lark_oapi.api.im.v1 import UpdateChatRequest, UpdateChatRequestBody
+        request = (UpdateChatRequest.builder()
+                   .chat_id(chat_id)
+                   .request_body(UpdateChatRequestBody.builder()
+                                 .description(description).build())
+                   .build())
+        response = self.client.im.v1.chat.update(request)
+        if not response.success():
+            raise RuntimeError(f"改群描述失败: {response.msg}")
+
     def create_stream_card(self, card_json: dict) -> str:
         """建一张可流式更新的卡片实体，返回 card_id。"""
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
@@ -3069,6 +3112,10 @@ class LarkBot:
         self._solo_groups: dict[str, bool] = {}
         # 群名改名节流器。启动时的群名基线在 main() 里填（要打 API）。
         self.renamer = ChatRenamer()
+        # 群描述独立节流：与群名各算各的防抖，否则一个改了另一个被压住。
+        self.describer = ChatRenamer()
+        # 分支带 TTL 缓存：描述同步挂在 2 秒一帧的状态循环上。
+        self.branches = BranchCache()
         # 每个会话「当前正在跟哪个 agent 说话」。读完就设上，
         # 之后直接发文本即可继续指挥，不用每句都带序号。
         # 落盘：重启后不用重新 /read 一遍。
@@ -3372,6 +3419,10 @@ class LarkBot:
             self.reply_text(ctx.chat_id, "No agents connected.")
             return
 
+        if command == "git":
+            await self._handle_git(ctx, rest)
+            return
+
         if command in ("read", "reply", "send", "trust", "interrupt", "clear"):
             await self._handle_agent_command(ctx, command, rest)
 
@@ -3462,6 +3513,36 @@ class LarkBot:
         agent = find_agent(self.agents, pane_id) or {}
         self._start_watch(chat_id, pane_id, project,
                           agent.get("agent", ""), self.autowatch.limit)
+
+    async def _handle_git(self, ctx: MessageContext, rest: str) -> None:
+        """/git [序号] —— 分支 + 未提交的文件。
+
+        不带序号时用本群绑的 agent：一群一 agent 是常态，每次还要报序号
+        纯属多余。本群没绑又没给序号，才让人挑。
+        """
+        agent = None
+        query = rest.strip()
+        if query:
+            agent = match_agent(self.agents, query)
+            if agent is None:
+                self.reply_text(ctx.chat_id, f"没有匹配 '{query}' 的 agent。")
+                return
+        else:
+            pane_id = self._active.get(ctx.chat_id) or self.staged_pane(ctx.chat_id)
+            if pane_id:
+                agent = find_agent(self.agents, pane_id)
+            if agent is None:
+                if not self.agents:
+                    self.reply_text(ctx.chat_id, "还没有 agent。")
+                    return
+                self.reply_card(ctx.chat_id, build_agent_picker_card(
+                    "git", self.agents, title="/git — 选一个 agent"))
+                return
+
+        payload = await fetch_git_status(agent["pane_id"])
+        project = agent.get("project") or agent.get("agent") or "?"
+        self.reply_text(ctx.chat_id,
+                        f"{project}\n{format_git_status(payload)}")
 
     async def _handle_unbind(self, ctx: MessageContext, rest: str) -> None:
         """/unbind [drop] —— 解绑本群；drop 连群一起解散。"""
@@ -3809,6 +3890,11 @@ class LarkBot:
             await self._interrupt(ctx.chat_id, agent)
         elif action == "clear":
             await self._clear_context(ctx.chat_id, agent)
+        elif action == "git":
+            payload = await fetch_git_status(pane_id)
+            project = agent.get("project") or agent.get("agent") or "?"
+            self.reply_text(ctx.chat_id,
+                            f"{project}\n{format_git_status(payload)}")
         elif action == "approval":
             await self._approve(ctx, data, pane_id)
         elif action == "submit":
@@ -4097,6 +4183,114 @@ UNBOUND_CHAT_NAME = "herdr"
 _CHAT_TITLE_LIMIT = 60
 
 
+# 未提交文件最多列这么多。几百个文件会把手机屏幕刷爆，而看列表的人真正
+# 想知道的是「有没有、大概哪些」，不是逐个数。
+GIT_FILE_LIMIT = 40
+# 飞书群描述的长度上限。超了整个更新调用会失败，宁可截断。
+CHAT_DESC_LIMIT = 100
+
+
+# 分支缓存有效期。分支变化远比状态变化少，而状态循环每 2 秒一帧——
+# 不缓存的话一个 agent 一天要查四万次 git，远程的还得走 SSH。
+BRANCH_TTL_S = 300
+
+
+class BranchCache:
+    """pane -> 分支名，带过期。
+
+    查失败也记账（存空串），否则「这不是 git 仓库」会导致每帧都去重试。
+    """
+
+    def __init__(self, ttl: float = BRANCH_TTL_S):
+        self.ttl = ttl
+        self._at: dict[str, tuple[str, float]] = {}
+
+    def get(self, pane_id: str, now: float) -> str | None:
+        hit = self._at.get(str(pane_id))
+        if hit is None or now - hit[1] > self.ttl:
+            return None
+        return hit[0]
+
+    def put(self, pane_id: str, branch: str, now: float) -> None:
+        self._at[str(pane_id)] = (branch or "", now)
+
+    def due(self, pane_id: str, now: float) -> bool:
+        """该去查一次了吗。"""
+        hit = self._at.get(str(pane_id))
+        return hit is None or now - hit[1] > self.ttl
+
+    def forget(self, pane_id: str) -> None:
+        self._at.pop(str(pane_id), None)
+
+
+def short_branch(branch: str) -> str:
+    """去掉 `...origin/x` 这段跟踪信息。
+
+    porcelain 的 `## feat/x...origin/feat/x` 在手机上占掉半行，而上游分支名
+    几乎总是本地名的重复。
+    """
+    return (branch or "").split("...")[0].strip()
+
+
+def format_git_status(payload: dict | None) -> str:
+    """把 relay 的 git_status 响应渲染成群里能看的文本。
+
+    relay 那边已经解析好了 branch/files/clean（_parse_git_porcelain），这里
+    只管排版，不重复实现 git。
+    """
+    if not isinstance(payload, dict) or not payload:
+        return "(没拿到 git 状态)"
+    if not payload.get("ok"):
+        return f"git 失败: {payload.get('message') or '未知原因'}"
+
+    branch = short_branch(payload.get("branch", ""))
+    files = payload.get("files") or []
+    head = f"⎇ {branch}" if branch else "⎇ (游离 HEAD)"
+    if payload.get("clean") or not files:
+        return f"{head}\n工作区干净，没有未提交的改动。"
+
+    lines = [f"{head}\n未提交 {len(files)} 个文件："]
+    for item in files[:GIT_FILE_LIMIT]:
+        status = (item.get("status") or "?").strip()
+        lines.append(f"  {status:<2} {item.get('path', '')}")
+    if len(files) > GIT_FILE_LIMIT:
+        lines.append(f"  …另有 {len(files) - GIT_FILE_LIMIT} 个（共 {len(files)}）")
+    return "\n".join(lines)
+
+
+def format_chat_description(agent: dict, branch: str = "") -> str:
+    """群描述里维护 space 的额外信息：分支、路径、agent 类型。
+
+    群公告是 docx 类型、API 改不了（im/v1/chats 里根本没有公告字段），
+    群描述是唯一能写的地方，它显示在群信息页。
+
+    分支没查到时**不写这一项**，而不是写「分支: 未知」——留空比显示一个
+    可能过时的值好，看的人不会被误导。
+
+    本地主机不写：本地是常态，占一行纯属噪音；远程必须写，否则会以为在
+    本地跑，找错机器。
+    """
+    agent = agent or {}
+    parts = []
+    branch = short_branch(branch)
+    if branch:
+        parts.append(f"⎇ {branch}")
+    kind = agent.get("agent") or ""
+    if kind:
+        parts.append(kind)
+    host = (agent.get("host") or "").strip()
+    if host and host != "local":
+        parts.append(f"@{host}")
+    cwd = agent.get("cwd") or ""
+    if cwd:
+        parts.append(cwd)
+    text = " · ".join(parts)
+    if len(text) > CHAT_DESC_LIMIT:
+        # 超限就从尾部截——尾部是路径，前面的分支/类型信息更值钱。
+        text = text[:CHAT_DESC_LIMIT - 1] + "…"
+    return text
+
+
 def chat_title_for(project: str, marker: str = "", status: str = "") -> str:
     """把群名改成「<状态符号> [标记] <项目>」，一眼看出这个群管的是谁、忙不忙。
 
@@ -4258,6 +4452,48 @@ def _notify_blocked(bot: "LarkBot", msg: dict) -> None:
         bot.remember(chat_id, bot.reply_card(chat_id, final_card), pane_id)
 
 
+async def _sync_chat_descriptions(bot: "LarkBot", agents: list[dict],
+                                  now: float | None = None) -> None:
+    """把 space 的额外信息（分支、路径、agent 类型）写进群描述。
+
+    群公告是 docx、API 改不了（im/v1/chats 里没有公告字段），群描述是唯一
+    能写的地方，显示在群信息页。
+
+    改描述和改群名一样会在群里留系统消息，所以复用同一套节流（describer
+    是独立的 ChatRenamer 实例，与群名各算各的防抖）。
+
+    分支要走 relay 查 git，所以套一层 TTL 缓存：状态循环每 2 秒一帧，
+    不缓存的话一个 agent 一天四万次 git 调用。
+    """
+    if now is None:
+        now = time.time()
+    by_pane = {str(a.get("pane_id")): a for a in agents if a.get("pane_id")}
+    for chat_id, pane_id in list(bot._active.items()):
+        agent = by_pane.get(str(pane_id))
+        if not agent:
+            continue
+        pane_id = str(pane_id)
+        branch = bot.branches.get(pane_id, now)
+        if branch is None and bot.branches.due(pane_id, now):
+            # 先记账再查：查失败也别让下一帧立刻重试。
+            bot.branches.put(pane_id, "", now)
+            payload = await fetch_git_status(pane_id)
+            branch = short_branch(payload.get("branch", "")) if payload.get("ok") else ""
+            bot.branches.put(pane_id, branch, now)
+        target = format_chat_description(agent, branch or "")
+        if not target:
+            continue
+        # status 传空串：描述不像群名那样需要 blocked 抢占——描述里没有
+        # 状态信息，抢了也看不出区别，只是多刷一条系统消息。
+        desired = bot.describer.decide(chat_id, target, "", now)
+        if not desired:
+            continue
+        try:
+            bot.api.set_chat_description(chat_id, desired)
+        except Exception as exc:
+            log.warning("改群描述失败 %s: %s", chat_id, scrub(exc))
+
+
 def _sync_chat_names(bot: "LarkBot", agents: list[dict],
                      now: float | None = None) -> None:
     """按当前状态刷各群群名，节流器说不改就不改。
@@ -4324,6 +4560,8 @@ def _track_updates(bot: "LarkBot", updated: list[dict]) -> None:
 
     # 状态可能变了，群名跟上（节流器决定这次要不要真改）
     _sync_chat_names(bot, updated, now)
+    # 描述要查 git，走 relay 往返——不能卡住监听循环。
+    asyncio.create_task(_sync_chat_descriptions(bot, updated, now))
 
 
 async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
