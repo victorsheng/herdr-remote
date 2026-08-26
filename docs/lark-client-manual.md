@@ -104,6 +104,24 @@ relay 仍然只监听 localhost，飞书客户端只是它的一个本地客户�
 
 多群配置：`HERDR_LARK_CHAT_ID` 支持逗号分隔，`/spaces` 建的群会自动加进授权列表。
 
+### 手工建的群：配 `HERDR_LARK_USER_ID` 就不用登记了
+
+群白名单要求「先建群、再查 chat_id、再改配置、再重启」，四步里三步是机械劳动。
+漏一步的表现是**机器人在群里装死**——不报错，只是不理人。
+
+配上 `HERDR_LARK_USER_ID`（你的 open_id）之后，你发的消息在任何群都放行，
+并且这个群会被自动**收养**：登记进授权列表 + 把 observer 拉进去。手工建的群
+直接可用，不必再动配置文件。
+
+判据是**发消息的人**，不是群主。群主是你的群里也可能有别人，而过了守门就能用
+`/reply`、`/send` 往 agent 终端塞任意文本——按群主放行等于把机器控制权交给
+群里所有人。所以别人在群里 @ 机器人依然不生效，除非那个群本身在群白名单里。
+
+两份白名单是**并集**：群命中或人命中都放行，现有配置照旧能用。
+
+open_id 按应用隔离，同一个人在不同应用下的 open_id 不一样。填错了的表现同样是
+「装死」，所以入站日志会打 `sender=`，照着日志抄即可。
+
 **绑定会落盘**（`lark_bindings.json`），服务重启后自动恢复，不用重新 `/read`。
 
 **同一个群的消息串行处理**：连发两条时，`send_text` 的「粘贴 + 回车」不会交错糊成一条；不同群之间并行，互不阻塞。
@@ -519,6 +537,7 @@ grep -v "^\[Lark\]\|^INFO:Lark" /tmp/lark_run.log
 | `HERDR_LARK_APP_ID` | 飞书自建应用 App ID | 必填 |
 | `HERDR_LARK_APP_SECRET` | App Secret | 必填 |
 | `HERDR_LARK_CHAT_ID` | 授权会话；留空则进入发现模式（响应任何会话） | 空 |
+| `HERDR_LARK_USER_ID` | 授权的人（open_id，逗号分隔）；这些人发的消息在任何群都放行，并自动收养该群 | 空 |
 | `HERDR_LARK_DOMAIN` | `feishu`(国内) / `lark`(海外) | `feishu` |
 | `HERDR_LARK_SEEN_PATH` | 去重缓存路径 | `~/.config/herdr-remote/lark_seen.json` |
 | `HERDR_LARK_BINDING_PATH` | 群↔agent 绑定落盘路径 | `~/.config/herdr-remote/lark_bindings.json` |

@@ -51,6 +51,12 @@ CHATS_PATH = os.environ.get(
 # 空值表示没部署 observer，跳过即可。
 OBSERVER_APP_ID = os.environ.get("HERDR_LARK_OBSERVER_APP_ID", "").strip()
 
+# 按人授权：这些 open_id 发来的消息，无论在哪个群都放行，并顺手把群收养
+# （登记 + 拉 observer）。群白名单要求「先建群、再查 ID、再改配置、再重启」，
+# 漏一步的表现是机器人在群里装死——不报错，只是不理人。
+# 注意 open_id 按应用隔离：这里要填 herdr 机器人看到的你，不是别的应用里的。
+USER_IDS = os.environ.get("HERDR_LARK_USER_ID", "")
+
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
 # 不带 token 的变体，用于展示与日志；带 token 的原串绝不外泄。
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]
@@ -1110,6 +1116,27 @@ def parse_chat_list(value) -> list[str]:
     return out
 
 
+def parse_user_ids(value: str) -> set[str]:
+    """逗号分隔的 open_id 列表。与 parse_chat_ids 同形，只是不需要保序。"""
+    if not isinstance(value, str):
+        value = ",".join(value or [])
+    return {u.strip() for u in value.split(",") if u.strip()}
+
+
+def is_authorized_sender(sender_open_id: str, allowed) -> bool:
+    """这个人授权了吗。
+
+    与 is_authorized_chat 的空集语义**相反**：空集授权任何人都不通过。
+    群白名单空集是「发现模式」（第一次部署时要能拿到 chat_id），而用户
+    白名单空集如果也放行，就等于把群白名单的限制整个绕过去了。
+    """
+    if not allowed or not sender_open_id:
+        return False
+    if isinstance(allowed, str):
+        return sender_open_id == allowed
+    return sender_open_id in allowed
+
+
 def is_authorized_chat(chat_id: str, allowed) -> bool:
     """这个群授权了吗。空集合 = 发现模式，放行任何群。"""
     if not allowed:
@@ -1119,11 +1146,24 @@ def is_authorized_chat(chat_id: str, allowed) -> bool:
     return chat_id in allowed
 
 
-def should_handle(ctx: MessageContext, bot_open_id: str, chat_id) -> bool:
-    """守门：授权、自言自语、群里没 @ 我，三种情况直接丢掉。"""
+def should_handle(ctx: MessageContext, bot_open_id: str, chat_id,
+                  users=None) -> bool:
+    """守门：授权、自言自语、群里没 @ 我，三种情况直接丢掉。
+
+    授权走「群 or 人」的并集：群在白名单里放行（谁发都算），或者发消息
+    的人在用户白名单里放行（在哪个群都算）。后者让自己新建的群不必再
+    手工登记 chat_id。
+
+    判据是**发消息的人**，不是群主：群主是自己的群里也可能有别人，而过了
+    守门就能用 /reply、/send 往 agent 终端塞任意文本。
+
+    自言自语的判定必须排在授权之前——否则把机器人自己的 open_id 配进
+    白名单会让它自己跟自己聊到天荒地老。
+    """
     if bot_open_id and ctx.sender_open_id == bot_open_id:
         return False
-    if not is_authorized_chat(ctx.chat_id, chat_id):
+    if not (is_authorized_chat(ctx.chat_id, chat_id)
+            or is_authorized_sender(ctx.sender_open_id, users)):
         return False
     if ctx.chat_type == "group" and not ctx.mentioned_bot and not ctx.solo_group:
         return False
@@ -3011,6 +3051,10 @@ class LarkBot:
         self.chat_store = ChatIdStore()
         self.chat_store.seed(env_chats)
         self.chat_ids = self.chat_store.all() or env_chats
+        # 按人授权：自己发的消息在哪个群都放行，省掉手工登记 chat_id。
+        self.user_ids = parse_user_ids(USER_IDS)
+        # 本次进程已收养过的群，避免每条消息都去调一次拉人接口。
+        self._adopted: set[str] = set()
         # 没有「主群」这个概念：通知只发显式绑过的群（见 chats_watching）。
         # 曾经有过主群回落，但主群自己也会被某个 pane 绑走，无主通知因此串群。
         self.loop = loop
@@ -3086,14 +3130,39 @@ class LarkBot:
         质检——比建群整个失败要好得多。但必须记，否则这个群会永远处于
         「看着正常、其实没人检查」的状态。
         """
-        if not OBSERVER_APP_ID:
+        # 实例属性只做覆盖（测试注入用）；为空时回落到模块常量，这样
+        # patch 模块常量的既有测试仍然有效。
+        app_id = getattr(self, "_observer_app_id", "") or OBSERVER_APP_ID
+        if not app_id:
             return
         try:
-            self.api.add_bot_to_chat(chat_id, OBSERVER_APP_ID)
+            self.api.add_bot_to_chat(chat_id, app_id)
             log.info("observer 已加入新群 %s", chat_id)
         except Exception as exc:
             log.warning("observer 未能加入 %s: %s —— 该群不会被质检",
                         chat_id, scrub(exc))
+
+    def adopt_chat(self, chat_id: str) -> None:
+        """收养一个靠用户白名单放行的群：登记 + 拉 observer。
+
+        只登记不拉 observer 的话，这个群会「看着正常、其实没人质检」——
+        datapilot6 就是这么坏的（群建在自动拉 observer 之前）。按人授权
+        省掉了手工登记，这里必须把 observer 一起补上，否则等于把那个坑
+        从偶尔踩变成每次都踩。
+
+        幂等：每条消息都会走到这里，已收养过的直接返回，不然会对同一个
+        群反复调拉人接口。
+        """
+        chat_id = str(chat_id or "")
+        if not chat_id or chat_id in self.chat_ids:
+            return
+        if chat_id in self._adopted:
+            return
+        self._adopted.add(chat_id)
+        self.chat_ids.add(chat_id)
+        self.chat_store.add(chat_id)
+        log.info("收养新群 %s（发消息的人在用户白名单里）", chat_id)
+        self.invite_observer(chat_id)
 
     def stage_binding(self, chat_id: str, pane_id: str) -> None:
         """预绑定，等用户在群里确认后才生效。"""
@@ -3150,14 +3219,20 @@ class LarkBot:
         ctx = parse_message_event(event, self.api.bot_open_id)
         if ctx.chat_type == "group" and not ctx.mentioned_bot:
             ctx.solo_group = self._is_solo_group(ctx.chat_id)
-        log.info("inbound message chat=%s type=%s mention=%s text=%r",
-                 ctx.chat_id, ctx.chat_type, ctx.mentioned_bot, ctx.text[:80])
+        # sender 一定要打：按人授权配错 open_id 的表现是「机器人装死」，
+        # 没有这一行就只能靠猜（open_id 按应用隔离，很容易填错来源）。
+        log.info("inbound message chat=%s sender=%s type=%s mention=%s text=%r",
+                 ctx.chat_id, ctx.sender_open_id, ctx.chat_type,
+                 ctx.mentioned_bot, ctx.text[:80])
         if not ctx.message_id or not self.seen.add(ctx.message_id):
             log.info("  dropped: duplicate or missing message_id")
             return  # 飞书会重推，去重后才处理
-        if not should_handle(ctx, self.api.bot_open_id, self.chat_ids):
+        if not should_handle(ctx, self.api.bot_open_id, self.chat_ids,
+                             self.user_ids):
             log.info("  dropped: gate rejected (authorized=%s)", self.chat_ids or "any")
             return
+        # 放行了但群没登记过：靠用户白名单进来的新群，收养它。
+        self.adopt_chat(ctx.chat_id)
         self._dispatch(ctx)
 
     def on_card_action(self, event: dict) -> None:
@@ -3167,9 +3242,11 @@ class LarkBot:
         if ctx is None:
             log.info("  dropped: no action value")
             return
-        if not should_handle(ctx, self.api.bot_open_id, self.chat_ids):
+        if not should_handle(ctx, self.api.bot_open_id, self.chat_ids,
+                             self.user_ids):
             log.info("  dropped: gate rejected")
             return
+        self.adopt_chat(ctx.chat_id)
         self._dispatch(ctx)
 
     def _dispatch(self, ctx: MessageContext) -> None:

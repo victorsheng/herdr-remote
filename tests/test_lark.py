@@ -16,6 +16,7 @@ import string
 import pathlib
 import re
 import sys
+import types
 import tempfile
 import unittest
 import unittest.mock
@@ -2266,6 +2267,161 @@ class MultiChatAuthTests(unittest.TestCase):
     def test_gate_accepts_legacy_string(self):
         """向后兼容：单个字符串 chat_id 仍能用。"""
         self.assertTrue(lk.should_handle(self.ctx("oc_1"), "ou_bot", "oc_1"))
+
+
+class UserAllowlistTests(unittest.TestCase):
+    """按人授权：自己建的群不必再手工登记 chat_id。
+
+    群白名单要求「先建群、再查 ID、再改配置、再重启」，四步里三步是
+    机械劳动，漏一步的表现是机器人在群里装死——不报错，只是不理人。
+    发消息的人是自己就放行，这一整套就省了。
+
+    判据必须是**发消息的人**而不是群主：群主是自己的群里也可能有别人，
+    而过了守门就能用 /reply、/send 往 agent 终端塞任意文本。按群主放行
+    等于把机器控制权交给群里所有人。
+    """
+
+    def ctx(self, **kw):
+        base = dict(chat_id="oc_new", message_id="om_1",
+                    sender_open_id="ou_me", chat_type="p2p")
+        base.update(kw)
+        return lk.MessageContext(**base)
+
+    def test_known_user_allows_unlisted_chat(self):
+        """核心诉求：新建的群没登记，但发消息的是我，照样能用。"""
+        self.assertTrue(lk.should_handle(
+            self.ctx(), "ou_bot", {"oc_old"}, users={"ou_me"}))
+
+    def test_stranger_still_rejected_in_unlisted_chat(self):
+        """别人在没授权的群里 @ 机器人，仍然拒绝。"""
+        self.assertFalse(lk.should_handle(
+            self.ctx(sender_open_id="ou_other"),
+            "ou_bot", {"oc_old"}, users={"ou_me"}))
+
+    def test_stranger_rejected_even_in_authorized_chat(self):
+        """群授权了不等于群里每个人都授权——这是并集里最容易搞错的一格。
+
+        群白名单放行的是「这个群」，用户白名单放行的是「这个人」。
+        任一命中即可，但陌生人 + 未授权群这一格必须挡住。
+        """
+        self.assertFalse(lk.should_handle(
+            self.ctx(chat_id="oc_x", sender_open_id="ou_other"),
+            "ou_bot", {"oc_old"}, users={"ou_me"}))
+
+    def test_chat_allowlist_still_works_for_others(self):
+        """并集：群在白名单里，谁发都放行，保持原有行为不变。"""
+        self.assertTrue(lk.should_handle(
+            self.ctx(chat_id="oc_old", sender_open_id="ou_other"),
+            "ou_bot", {"oc_old"}, users={"ou_me"}))
+
+    def test_no_users_configured_keeps_old_behavior(self):
+        """没配用户白名单时，行为与改动前完全一致。"""
+        self.assertTrue(lk.should_handle(
+            self.ctx(chat_id="oc_old"), "ou_bot", {"oc_old"}, users=set()))
+        self.assertFalse(lk.should_handle(
+            self.ctx(chat_id="oc_new"), "ou_bot", {"oc_old"}, users=set()))
+
+    def test_users_param_is_optional(self):
+        """15 处调用点不能因为多一个参数就全炸。"""
+        self.assertTrue(lk.should_handle(self.ctx(), "ou_bot", ""))
+
+    def test_bot_own_message_still_ignored(self):
+        """自言自语的判定优先于用户白名单，否则机器人自己会被放行。"""
+        self.assertFalse(lk.should_handle(
+            self.ctx(sender_open_id="ou_bot"),
+            "ou_bot", set(), users={"ou_bot"}))
+
+    def test_group_mention_rule_still_applies(self):
+        """授权的人在群里也得 @ 一下，否则聊天里随口一句会被当命令。"""
+        self.assertFalse(lk.should_handle(
+            self.ctx(chat_type="group", mentioned_bot=False),
+            "ou_bot", set(), users={"ou_me"}))
+        self.assertTrue(lk.should_handle(
+            self.ctx(chat_type="group", mentioned_bot=True),
+            "ou_bot", set(), users={"ou_me"}))
+
+    def test_authorized_sender_helper(self):
+        self.assertTrue(lk.is_authorized_sender("ou_me", {"ou_me"}))
+        self.assertFalse(lk.is_authorized_sender("ou_x", {"ou_me"}))
+
+    def test_empty_user_allowlist_authorizes_nobody(self):
+        """空用户白名单不是发现模式——那是群白名单的语义。
+
+        用户白名单空集必须返回 False：否则「没配用户白名单」会变成
+        「放行所有人」，把群白名单的限制整个绕过去。
+        """
+        self.assertFalse(lk.is_authorized_sender("ou_me", set()))
+
+    def test_parse_user_ids(self):
+        self.assertEqual(lk.parse_user_ids("ou_1,ou_2"), {"ou_1", "ou_2"})
+        self.assertEqual(lk.parse_user_ids(" ou_1 , ou_2 "), {"ou_1", "ou_2"})
+        self.assertEqual(lk.parse_user_ids(""), set())
+
+
+class AdoptChatTests(unittest.TestCase):
+    """用户白名单放行的新群要「收养」：登记 + 拉 observer。
+
+    真实故障（见 test_lark_observer 里 datapilot6 那组）：手工建的群
+    没拉 observer，质检静默关掉，面板上显示「质检盲区」但没有任何报错。
+    按人授权省掉了手工登记，如果不顺手补上 observer，等于把这个坑
+    从「偶尔踩」变成「每次都踩」。
+    """
+
+    def setUp(self):
+        self.invited = []
+        self.registered = []
+
+    def bot(self, observer="cli_obs"):
+        bot = lk.LarkBot.__new__(lk.LarkBot)
+        bot.chat_ids = {"oc_old"}
+        bot._adopted = set()
+        bot.chat_store = types.SimpleNamespace(
+            add=lambda c: self.registered.append(c))
+        bot.api = types.SimpleNamespace(
+            add_bot_to_chat=lambda c, a: self.invited.append((c, a)))
+        bot._observer_app_id = observer
+        return bot
+
+    def test_adopts_unlisted_chat(self):
+        bot = self.bot()
+        bot.adopt_chat("oc_new")
+        self.assertIn("oc_new", bot.chat_ids)
+        self.assertEqual(self.registered, ["oc_new"])
+        self.assertEqual(self.invited, [("oc_new", "cli_obs")])
+
+    def test_known_chat_not_re_invited(self):
+        """已登记的群不该每条消息都去拉一次 observer。"""
+        bot = self.bot()
+        bot.adopt_chat("oc_old")
+        self.assertEqual(self.invited, [])
+        self.assertEqual(self.registered, [])
+
+    def test_adopt_is_idempotent(self):
+        """同一个新群连发两条消息，只收养一次。"""
+        bot = self.bot()
+        bot.adopt_chat("oc_new")
+        bot.adopt_chat("oc_new")
+        self.assertEqual(len(self.invited), 1)
+
+    def test_invite_failure_does_not_break_adoption(self):
+        """拉 observer 失败不能连累群本身可用——但要留痕。"""
+        bot = self.bot()
+
+        def boom(chat_id, app_id):
+            raise RuntimeError("bot is invisible to user")
+
+        bot.api = types.SimpleNamespace(add_bot_to_chat=boom)
+        bot.adopt_chat("oc_new")
+        self.assertIn("oc_new", bot.chat_ids)
+        self.assertEqual(self.registered, ["oc_new"])
+
+    def test_no_observer_configured_still_registers(self):
+        """没部署 observer 时只登记，不该报错。"""
+        bot = self.bot(observer="")
+        with unittest.mock.patch.object(lk, "OBSERVER_APP_ID", ""):
+            bot.adopt_chat("oc_new")
+        self.assertIn("oc_new", bot.chat_ids)
+        self.assertEqual(self.invited, [])
 
 
 class MultiChatIsolationTests(unittest.TestCase):
