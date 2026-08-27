@@ -4580,6 +4580,73 @@ class SplitLongPromptTests(unittest.TestCase):
         self.assertNotIn("⋯", "".join(lk.split_prompt_cards(text)))
 
 
+class BlockedPanelDeliveryTests(unittest.TestCase):
+    """发送层：preview 面板另发一条，选项卡片保持干净。
+
+    面板是判断依据（画着「选哪个分别保留什么」的结构图），过去被
+    _drop_panel_block 整块丢掉，飞书上只剩问题和按钮，人只能盲选。
+    现在面板先发一条代码块消息，选项卡片跟在后面。
+
+    顺序不能反：人往下滑，最后看到的该是要点的按钮。
+    """
+
+    PROMPT_WITH_PANEL = (
+        "这次对齐做到哪一层？\n"
+        "  1. 全量结构对齐（推荐）          ┌────────────────────┐\n"
+        "❯ 2. 仅表单形态对齐               │ 保留：             │\n"
+        "  3. 先出差异报告再定             │  该表下的测试任务  │\n"
+        "                                  └────────────────────┘")
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.agents = make_agents(1)
+        self.bot.set_active("oc_1", "w0:p1", "project0")
+        self.sent = []
+        self.bot.reply_card = lambda chat_id, card: (
+            self.sent.append(card) or f"om_{len(self.sent)}")
+
+    def _notify(self, prompt):
+        lk._notify_blocked(self.bot, {
+            "pane_id": "w0:p1", "agent": "claude", "project": "project0",
+            "prompt": prompt, "options": ["1", "2", "3"],
+        })
+        return self.sent
+
+    def _text_of(self, card):
+        return json.dumps(card, ensure_ascii=False)
+
+    def test_panel_is_sent_as_its_own_card(self):
+        """面板内容要到得了飞书——这是整个修复的目的。"""
+        cards = self._notify(self.PROMPT_WITH_PANEL)
+        blob = " ".join(self._text_of(c) for c in cards)
+        self.assertIn("该表下的测试任务", blob)
+
+    def test_panel_card_comes_before_the_option_card(self):
+        """面板在前、按钮在后：人往下滑，最后看到要点的东西。"""
+        cards = self._notify(self.PROMPT_WITH_PANEL)
+        panel_at = next(i for i, c in enumerate(cards)
+                        if "该表下的测试任务" in self._text_of(c))
+        button_at = next(i for i, c in enumerate(cards) if buttons_in(c))
+        self.assertLess(panel_at, button_at)
+
+    def test_option_card_stays_clean(self):
+        """带按钮那张卡上不该再有面板内容——重复一遍纯占地方。"""
+        cards = self._notify(self.PROMPT_WITH_PANEL)
+        final = next(c for c in cards if buttons_in(c))
+        self.assertNotIn("该表下的测试任务", self._text_of(final))
+
+    def test_options_survive(self):
+        """选项按钮一个都不能少。"""
+        cards = self._notify(self.PROMPT_WITH_PANEL)
+        final = next(c for c in cards if buttons_in(c))
+        self.assertGreaterEqual(len(buttons_in(final)), 3)
+
+    def test_no_panel_no_extra_card(self):
+        """没面板就别多发一条空的。"""
+        cards = self._notify("要执行 rm -rf 吗？")
+        self.assertEqual(len(cards), 1)
+
+
 class BlockedCardSplitDeliveryTests(unittest.TestCase):
     """发送层：拆出来的前文先发，带按钮的审批卡最后发。"""
 
@@ -5253,6 +5320,92 @@ class PreviewPanelLeadingBorderTests(unittest.TestCase):
             lk.detect_option_groups(lk.clean_pane(self.REAL_CARD_PANE)))
         self.assertIn("抓屏改带", group["options"][0])
         self.assertIn("只带出", group["options"][1])
+
+
+class PreviewPanelExtractionTests(unittest.TestCase):
+    """preview 面板不能只是丢掉，得单独捞出来发。
+
+    真实故障（本轮两张飞书截图）：AskUserQuestion 带 preview 时，面板画的是
+    「选项 1 和选项 2 分别保留什么」的结构图——那是**唯一**的判断依据。
+    现有管线为了保住选项按钮，把面板整块丢了（见 _drop_panel_block），于是
+    飞书卡片上只剩问题和三个按钮，人在手机上等于盲选。
+
+    丢是对的（面板混进选项文字会让整组选项消失），但丢完得还回来：面板另发
+    一条代码块消息，选项卡片保持干净。
+    """
+
+    # 面板在右侧并排（截图 2 的形态）
+    SIDE_BY_SIDE = (
+        "生产的数据测试面板与原型不一致。这次对齐做到哪一层？\n"
+        "  1. 全量结构对齐（推荐）          ┌────────────────────┐\n"
+        "❯ 2. 仅表单形态对齐               │ 保留：             │\n"
+        "  3. 先出差异报告再定             │  该表下的测试任务  │\n"
+        "                                  │  ← Table 不动      │\n"
+        "                                  └────────────────────┘\n"
+        "    Notes: press n to add notes")
+
+    # 面板在选项下方居中（截图 1 的形态）
+    BELOW = (
+        "这次对齐做到哪一层？\n"
+        "  1. 全量结构对齐（推荐）\n"
+        "  2. 仅表单形态对齐\n"
+        "  3. 先出差异报告再定\n"
+        "              ┌──────────────────────┐\n"
+        "              │ 原型形态：           │\n"
+        "              │  测试任务（3）       │\n"
+        "              │  ▶运行 ✎编辑 ▤报告   │\n"
+        "              └──────────────────────┘\n"
+        "    Notes: press n to add notes")
+
+    def test_side_by_side_panel_is_extracted(self):
+        """右侧并排的面板要能捞出来，内容一个字不少。"""
+        panel = lk.extract_preview_panel(self.SIDE_BY_SIDE)
+        self.assertTrue(panel, "面板没提取到")
+        self.assertIn("保留", panel)
+        self.assertIn("该表下的测试任务", panel)
+        self.assertIn("Table 不动", panel)
+
+    def test_below_panel_is_extracted(self):
+        """面板画在选项下方时也要捞得到——两种布局都有。"""
+        panel = lk.extract_preview_panel(self.BELOW)
+        self.assertTrue(panel, "面板没提取到")
+        self.assertIn("原型形态", panel)
+        self.assertIn("测试任务（3）", panel)
+        self.assertIn("▶运行", panel)
+
+    def test_outer_border_is_stripped(self):
+        """剥掉最外层那圈框：纯装饰，在手机窄屏上白占宽度。
+
+        只剥最外层，里面的结构线（表格、嵌套框）是内容，得留着。
+        """
+        panel = lk.extract_preview_panel(self.SIDE_BY_SIDE)
+        for line in panel.splitlines():
+            self.assertFalse(line.strip().startswith("┌"), f"外层顶边没剥: {line!r}")
+            self.assertFalse(line.strip().startswith("└"), f"外层底边没剥: {line!r}")
+            self.assertFalse(
+                line.strip().startswith("│") and line.strip().endswith("│")
+                and line.count("│") == 2,
+                f"外层侧边没剥: {line!r}")
+
+    def test_option_text_is_not_in_panel(self):
+        """左边的选项文字不能跟着面板一起被捞走——那边卡片已经有了。"""
+        panel = lk.extract_preview_panel(self.SIDE_BY_SIDE)
+        self.assertNotIn("仅表单形态对齐", panel)
+        self.assertNotIn("先出差异报告再定", panel)
+
+    def test_no_panel_returns_empty(self):
+        """没有面板时返回空串，调用方据此决定不发那条消息。"""
+        plain = ("要继续吗？\n"
+                 "  1. 继续\n"
+                 "  2. 停下\n"
+                 "Enter to select · Esc to cancel")
+        self.assertEqual(lk.extract_preview_panel(plain), "")
+
+    def test_options_still_parse_after_extraction(self):
+        """提取面板不能动到选项解析——那是之前修好的，别回退。"""
+        group = lk.current_option_group(lk.detect_option_groups(self.SIDE_BY_SIDE))
+        self.assertEqual(len(group["options"]), 3)
+        self.assertIn("全量结构对齐", group["options"][0])
 
 
 class PreviewPanelPollutionTests(unittest.TestCase):

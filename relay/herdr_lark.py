@@ -1531,6 +1531,87 @@ def _drop_panel_block(lines: list[str]) -> list[str]:
     return out
 
 
+def extract_preview_panel(text: str) -> str:
+    """把 preview 面板从 TUI 输出里捞出来，剥掉最外层框后返回。
+
+    _drop_panel_block 为了保住选项按钮，把面板整块丢了——那是对的，面板
+    内容混进选项文字会让整组选项消失。但面板本身往往是**唯一**的判断依据
+    （AskUserQuestion 用它画「选项 A 和选项 B 分别保留什么」的结构图），
+    丢完不还回来，人在手机上就只能盲选。
+
+    所以丢归丢，这里单独捞一份，由调用方另发一条代码块消息。
+
+    两种布局都要认：
+      - 右侧并排：`  1. 甲选项        ┌─────┐`，面板在选项右边
+      - 下方居中：选项列完之后，面板整块画在下面
+
+    只剥**最外层**那圈框（纯装饰，手机窄屏上白占宽度），里面的表格线和
+    嵌套框是内容，留着。
+
+    没有面板时返回空串——调用方据此决定不发那条消息，别推一条空的。
+    """
+    lines = (text or "").splitlines()
+    collected: list[str] = []
+    in_panel = False
+    for line in lines:
+        match = _PREVIEW_PANEL_RE.search(line)
+        if match:
+            head = line[:match.start()]
+            if not any(ch in head for ch in _BOX_CHARS):
+                # 右侧并排：只取框线那一段，左边是选项文字，不要。
+                in_panel = True
+                collected.append(line[match.start():].strip())
+                continue
+        if _LEADING_PANEL_RE.match(line):
+            # 框线顶到行首。可能是下方居中的面板，也可能是并排面板的续行。
+            in_panel = True
+            collected.append(line.strip())
+            continue
+        indexed = _INDEX_THEN_PANEL_RE.match(line)
+        if indexed:
+            # 序号后面直接跟面板：序号归选项卡片，面板那段归这里。
+            in_panel = True
+            collected.append(line[indexed.end(1):].strip())
+            continue
+        if in_panel and line.strip():
+            in_panel = False
+    if not collected:
+        return ""
+    return _strip_outer_border(collected)
+
+
+def _strip_outer_border(lines: list[str]) -> str:
+    """剥掉面板最外层的那圈框，保留里面的结构。
+
+    外层框是纯装饰：顶边 `┌───┐`、底边 `└───┘`、以及每行首尾那对 `│`。
+    里面的表格线和嵌套框是内容——`│ │名 │创建│` 剥掉最外那根之后还剩
+    `│名 │创建│`，那是真的表格，不能一起剥。
+
+    左右两边的框在竖直方向上是对齐的，所以按**列位置**剥而不是按字符
+    数：面板里每行内容长短不一，只有列位置是稳定的。
+    """
+    kept: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # 纯框线行（顶边/底边/分隔线）：整行都是装饰，丢掉。
+        if all(ch in _BOX_CHARS + " " for ch in stripped):
+            continue
+        # 剥首尾那对最外层竖线。
+        if stripped.startswith("│"):
+            stripped = stripped[1:]
+        if stripped.endswith("│"):
+            stripped = stripped[:-1]
+        kept.append(stripped.rstrip())
+    # 剥完之后普遍多出来的左缩进去掉，手机上省一截宽度。
+    indents = [len(l) - len(l.lstrip()) for l in kept if l.strip()]
+    if indents:
+        shift = min(indents)
+        kept = [l[shift:] if l.strip() else l for l in kept]
+    return "\n".join(kept).strip()
+
+
 def _strip_table_pipes(line: str) -> str:
     """去掉表格行的竖线；并排的 diff 两列则拆成两行。
 
@@ -4641,6 +4722,15 @@ def _notify_blocked(bot: "LarkBot", msg: dict) -> None:
     # 说不清答的是谁。
     lead_cards = [build_pane_card(project, agent, "blocked", piece)
                   for piece in pieces[:-1]]
+
+    # preview 面板单独发一条。它被 strip_selector 连同选项一起切掉了，但
+    # 面板画的往往是「选 1 和选 2 分别保留什么」的结构图——**唯一**的判断
+    # 依据，丢了人就只能盲选。放在选项卡片之前：人往下滑，最后看到的该是
+    # 要点的按钮。
+    panel = extract_preview_panel(prompt) if group else ""
+    if panel:
+        lead_cards.append(
+            build_pane_card(project, agent, "blocked", panel))
     final_card = build_blocked_card(pane_id, agent, project, prompt,
                                    msg.get("options"), generation,
                                    body_override=pieces[-1] or " ")
