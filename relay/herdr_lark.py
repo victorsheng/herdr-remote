@@ -564,6 +564,42 @@ async def read_pane(pane_id: str, lines: int = READ_LINES) -> str:
     return "(no response)"
 
 
+# 按 ↓ 展开折叠消息的次数上限。按键会动 TUI 焦点，是有副作用的操作；
+# TUI 不响应时（提示一直在）不设限就会无限按下去——Left 切组那处踩过。
+MAX_EXPAND_PRESSES = 3
+
+
+async def read_pane_expanded(pane_id: str, lines: int = READ_LINES) -> str:
+    """读屏，遇到折叠的消息就按 ↓ 展开，把前后内容拼起来。
+
+    TUI 折叠时屏幕上只留 `8 new messages (click) ↓`，那几条在飞书上根本
+    读不到——手机上也点不了那个 (click)。
+
+    只在**真的发现折叠提示**时才按键：按 ↓ 会动 TUI 焦点，没折叠还按就是
+    平白干扰 agent。任何一步失败都退回已有内容——展开失败最多是看不到折叠
+    的那几条，绝不能反过来把本来能看的也弄没了。
+    """
+    content = await read_pane(pane_id)
+    if is_pane_read_error(content):
+        return content            # 让调用方的 is_pane_read_error 认出来
+    for _ in range(MAX_EXPAND_PRESSES):
+        if find_collapsed_messages(content) is None:
+            break
+        try:
+            await send_keys_to_relay(pane_id, ["Down"])
+            nxt = await read_pane(pane_id, lines)
+        except Exception as exc:
+            log.warning("展开折叠消息失败 %s: %s", pane_id, scrub(exc))
+            break
+        if is_pane_read_error(nxt):
+            break                 # 保住已经拿到的内容
+        merged = drop_collapsed_hints(merge_expanded(content, nxt))
+        if merged == content:
+            break                 # 按了没变化，别再按
+        content = merged
+    return content
+
+
 async def fetch_git_status(pane_id: str) -> dict:
     """向 relay 要这个 pane 的 git 状态。
 
@@ -1255,6 +1291,91 @@ def follow_up_hint(project: str) -> str:
 # 都靠「提示符前面没有正文」来判定，所以 agent 正文里以这串字开头的句子
 # （比如本次修复的讨论）不受影响——那种情况前面是行首、后面紧跟中文。
 _SCROLL_HINT_RE = re.compile(r"(?:\s{2,}|^\s*)Jump to bottom \(click\)\s*↓\s*$")
+
+
+# TUI 把消息折叠起来时，屏幕上只留一行 `8 new messages (click) ↓`。
+# 那些内容在飞书上根本读不到——手机上也点不了那个 (click)。
+#
+# 判据沿用 _SCROLL_HINT_RE：提示符是**拼在行尾、前面垫大段空格**的装饰。
+# 不能按字面匹配整行——agent 讨论这个提示本身时（本次修复的对话里就有），
+# 那串字出现在正文句子中间，误判会把真内容当成装饰。
+_COLLAPSED_RE = re.compile(
+    r"(?:\s{2,}|^\s*)(\d+)\s+new messages?\s*\(click\)\s*↓\s*$")
+
+
+def collapsed_message_count(line: str) -> int | None:
+    """这一行是折叠提示吗，是的话折了几条。"""
+    match = _COLLAPSED_RE.search(line or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def find_collapsed_messages(text: str) -> int | None:
+    """整屏里有没有折叠提示。有多处时取最后一处——那是最新的。"""
+    found = None
+    for line in (text or "").splitlines():
+        count = collapsed_message_count(line)
+        if count is not None:
+            found = count
+    return found
+
+
+def drop_collapsed_hints(text: str) -> str:
+    """去掉折叠提示行。
+
+    展开之后这行就只是装饰了，留着有两个害处：手机上点不了那个 (click)
+    纯占地方；更要紧的是合并后的内容里还留着它，下一轮会被当成「还有折叠」
+    而多按一次 ↓，白白干扰 TUI。
+    """
+    kept = []
+    for line in (text or "").splitlines():
+        if collapsed_message_count(line) is not None:
+            # 提示可能拼在正文行尾，剪掉提示、留下正文。
+            head = _COLLAPSED_RE.sub("", line)
+            if head.strip():
+                kept.append(head)
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def merge_expanded(before: str, after: str) -> str:
+    """把展开前后的两屏拼起来。
+
+    两边都不能单独用：
+      只留展开后的 —— 折叠提示上面那些**已经可见**的内容会丢，TUI 展开时
+        视口往下滚，上面的内容滚出屏幕。
+      只留展开前的 —— 折叠的那几条还是看不到，等于没修。
+
+    按行找最大重叠（before 的后缀 == after 的前缀），重叠部分只留一份。
+    终端两屏之间本来就是滚动关系，重叠必然存在；找不到重叠就直接接上，
+    宁可多一点也别丢。
+    """
+    before = (before or "").rstrip()
+    after = (after or "").rstrip()
+    if not after:
+        return before
+    if not before or before == after:
+        return after if not before else before
+    b_lines = before.splitlines()
+    a_lines = after.splitlines()
+    # before 整段出现在 after 里（展开后是超集，视口没往下滚）——直接用
+    # after，拼的话前半段会重复一遍。
+    for offset in range(len(a_lines) - len(b_lines) + 1):
+        if a_lines[offset:offset + len(b_lines)] == b_lines:
+            return after
+    # 从最大可能的重叠往下试，第一个命中的就是最大重叠。
+    for size in range(min(len(b_lines), len(a_lines)), 0, -1):
+        if b_lines[-size:] == a_lines[:size]:
+            return "\n".join(b_lines + a_lines[size:])
+    # after 整个被 before 包住（按 ↓ 没滚动）——不重复拼。
+    if after in before:
+        return before
+    return "\n".join(b_lines + a_lines)
 
 
 def _strip_scroll_hint(line: str) -> str:
@@ -3755,6 +3876,9 @@ class LarkBot:
             while idle_rounds < WATCH_IDLE_ROUNDS:
                 if watch_expired(started, time.time(), limit):
                     break
+                # 这里**故意不展开**：watch 每隔几秒轮询一次，每轮都按 ↓
+                # 会持续动 TUI 焦点，干扰正在干活的 agent。想看折叠的内容
+                # 用 /read（那是一次性的）。
                 raw = clean_pane(await read_pane(pane_id))
                 if is_transient_read(raw):
                     # 读失败就跳过这一帧，别把卡片刷空。
@@ -4111,7 +4235,9 @@ class LarkBot:
         return sent
 
     async def _send_pane_content(self, chat_id: str, agent: dict, prompt: bool = False) -> None:
-        content = clean_pane(await read_pane(agent["pane_id"]))
+        # 用主动展开的版本：TUI 折叠起来的消息在手机上点不了 (click)，
+        # 不展开就永远看不到。这是用户主动 /read，按一下 ↓ 的干扰可接受。
+        content = clean_pane(await read_pane_expanded(agent["pane_id"]))
         project = agent.get("project") or agent.get("agent") or "agent"
         pane_id = agent["pane_id"]
         # 读过之后就把它设成当前 agent：接下来直接打字就是发给它，
@@ -4650,7 +4776,9 @@ async def _notify_finished(bot: "LarkBot", agent: dict) -> None:
     project = agent.get("project") or agent.get("agent") or "agent"
     log.info("agent finished, pushing to Lark: %s (%s)", project, pane_id)
     try:
-        content = clean_pane(await read_pane(pane_id))
+        # 干完活推一次，同样展开折叠的消息——这是一次性的，不像 watch
+        # 那样反复按键。
+        content = clean_pane(await read_pane_expanded(pane_id))
     except Exception as exc:
         log.warning("finish notify read failed: %s", scrub(exc))
         content = ""

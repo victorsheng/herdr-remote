@@ -283,7 +283,7 @@ uv run relay/herdr_usage.py --detail  # 加缓存明细与耗时
 | `/agents` | 列出全部 agent，**带稳定序号**，行首图标表状态；并附一张可点的卡片 |
 | `/status` | relay 连接状态与 agent 计数 |
 | `/git [序号]` | 分支、与远端的 ahead/behind、未提交的文件列表；不带序号用本群绑的 agent |
-| `/read <序号>` | 读终端输出（200 行，清理后约 40 行） |
+| `/read <序号>` | 读终端输出（200 行，清理后约 40 行）；TUI 折叠的消息会自动按 ↓ 展开 |
 | `/reply <序号>` | 同 `/read`，并提示可直接回复 |
 | `/send <序号> <内容>` | 发文本给指定 agent |
 | `/trust <序号>` | 对 blocked 的 agent 发「trust, always allow」 |

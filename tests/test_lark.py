@@ -2914,6 +2914,175 @@ class BlockedPromptPanelTests(unittest.TestCase):
             self.assertFalse(self.BOX & set(opt))
 
 
+class CollapsedMessagesTests(unittest.TestCase):
+    """TUI 把消息折叠起来时，屏幕上只留一行 `8 new messages (click) ↓`。
+
+    那 8 条内容在飞书上**根本读不到**——手机上也点不了那个 (click)。
+    要按 ↓ 让 TUI 展开，再把展开前后的内容拼起来发。
+
+    判据沿用 _SCROLL_HINT_RE 的思路：提示符是**拼在行尾、前面垫大段空格**
+    的装饰。不能按字面匹配整行——agent 讨论这个提示本身时（比如本次修复的
+    对话），那串字会出现在正文句子里，误判会把真内容当装饰。
+    """
+
+    def test_detects_collapsed_hint(self):
+        line = "                          8 new messages (click) ↓"
+        self.assertEqual(lk.collapsed_message_count(line), 8)
+
+    def test_singular_form(self):
+        """1 条时 TUI 用单数 message。"""
+        line = "                          1 new message (click) ↓"
+        self.assertEqual(lk.collapsed_message_count(line), 1)
+
+    def test_hint_appended_to_content_line(self):
+        """提示符常拼在正文行尾，中间垫空格。"""
+        line = "5. Chat about this            3 new messages (click) ↓"
+        self.assertEqual(lk.collapsed_message_count(line), 3)
+
+    def test_prose_mentioning_hint_is_not_a_hint(self):
+        """agent 正文里讨论这串字时不能误判——前面没有大段空格。"""
+        line = "8 new messages (click) ↓ 是 TUI 的折叠提示，需要按下箭头"
+        self.assertIsNone(lk.collapsed_message_count(line))
+
+    def test_no_hint_returns_none(self):
+        self.assertIsNone(lk.collapsed_message_count("普通的一行输出"))
+        self.assertIsNone(lk.collapsed_message_count(""))
+
+    def test_scans_whole_screen(self):
+        text = "第一行\n第二行                    4 new messages (click) ↓\n第三行"
+        self.assertEqual(lk.find_collapsed_messages(text), 4)
+
+    def test_screen_without_hint(self):
+        self.assertIsNone(lk.find_collapsed_messages("第一行\n第二行"))
+
+
+class ReadPaneExpandedTests(unittest.TestCase):
+    """读屏时若发现折叠，按 ↓ 展开再合并。
+
+    按 ↓ 会动 TUI 的焦点，是**有副作用**的操作，所以：
+      - 只在发现折叠提示时才按，没折叠一次都不按
+      - 按的次数有上限（照搬 Left 切组那处的教训：不设限会无限按下去）
+      - 任何一步失败都退回原始内容，不能因为展开失败反而什么都看不到
+    """
+
+    def setUp(self):
+        self.keys = []
+
+    def fake_env(self, screens):
+        """screens 按调用顺序返回，keys 记录按了什么。"""
+        seq = list(screens)
+
+        async def fake_read(pane_id, lines=None):
+            return seq.pop(0) if seq else seq_last[0]
+
+        seq_last = [screens[-1]]
+
+        async def fake_keys(pane_id, keys):
+            self.keys.append(tuple(keys))
+
+        return fake_read, fake_keys
+
+    def run_expanded(self, screens, keys_impl=None):
+        read, keys = self.fake_env(screens)
+        with unittest.mock.patch.object(lk, "read_pane", new=read), \
+             unittest.mock.patch.object(lk, "send_keys_to_relay",
+                                        new=keys_impl or keys):
+            return asyncio.run(lk.read_pane_expanded("w1:p1"))
+
+    def test_no_hint_means_no_keypress(self):
+        """没有折叠提示时一个键都不该按——按键有副作用。"""
+        out = self.run_expanded(["普通输出\n第二行"])
+        self.assertEqual(self.keys, [])
+        self.assertIn("普通输出", out)
+
+    def test_expands_and_merges(self):
+        before = "可见的上文\n              3 new messages (click) ↓"
+        after = "              3 new messages (click) ↓\n折叠的甲\n折叠的乙"
+        out = self.run_expanded([before, after])
+        self.assertEqual(self.keys, [("Down",)])
+        self.assertIn("可见的上文", out)   # 展开前独有的不能丢
+        self.assertIn("折叠的甲", out)     # 折叠的内容要出来
+        self.assertIn("折叠的乙", out)
+
+    def test_stops_when_hint_gone(self):
+        """展开后没有提示了就停手，不要多按。"""
+        before = "上文\n              2 new messages (click) ↓"
+        after = "上文\n甲\n乙"
+        self.run_expanded([before, after])
+        self.assertEqual(len(self.keys), 1)
+
+    def test_keypress_is_capped(self):
+        """提示一直在（TUI 不响应）也不能无限按下去。"""
+        stuck = "上文\n              9 new messages (click) ↓"
+        self.run_expanded([stuck] * 12)
+        self.assertLessEqual(len(self.keys), lk.MAX_EXPAND_PRESSES)
+        self.assertGreater(len(self.keys), 0)
+
+    def test_key_failure_falls_back_to_original(self):
+        """按键失败要退回原始内容，不能什么都看不到。"""
+        before = "上文\n              3 new messages (click) ↓"
+
+        async def boom(pane_id, keys):
+            raise RuntimeError("relay rejected keys")
+
+        out = self.run_expanded([before], keys_impl=boom)
+        self.assertIn("上文", out)
+
+    def test_read_error_falls_back(self):
+        """展开后读失败，保住展开前的内容。"""
+        before = "上文\n              3 new messages (click) ↓"
+        out = self.run_expanded([before, "(error reading pane: boom)"])
+        self.assertIn("上文", out)
+        self.assertNotIn("error reading pane", out)
+
+    def test_initial_read_error_passthrough(self):
+        """第一次就读失败：原样返回，让调用方的 is_pane_read_error 认出来。"""
+        out = self.run_expanded(["(error reading pane: boom)"])
+        self.assertEqual(self.keys, [])
+        self.assertTrue(lk.is_pane_read_error(out))
+
+
+class MergeExpandedTests(unittest.TestCase):
+    """展开前后的内容要拼起来，不能只留其一。
+
+    只留展开后的：折叠提示上面那些**已经可见**的内容会丢——TUI 展开时会
+    把视口往下滚，上面的内容滚出屏幕。
+    只留展开前的：折叠的 8 条还是看不到，等于没修。
+    """
+
+    def test_appends_new_content(self):
+        before = "A\nB\nC"
+        after = "B\nC\nD\nE"
+        merged = lk.merge_expanded(before, after)
+        self.assertIn("A", merged)      # 展开前独有的，不能丢
+        self.assertIn("E", merged)      # 展开后新出现的，要带上
+        self.assertEqual(merged.count("B"), 1)   # 重叠部分不重复
+
+    def test_no_overlap_concatenates(self):
+        merged = lk.merge_expanded("A\nB", "C\nD")
+        self.assertIn("A", merged)
+        self.assertIn("D", merged)
+
+    def test_identical_screens_not_doubled(self):
+        """按 ↓ 没变化时不能把整屏复制一遍。"""
+        same = "A\nB\nC"
+        self.assertEqual(lk.merge_expanded(same, same), same)
+
+    def test_after_empty_keeps_before(self):
+        """读失败时至少保住原来能看到的。"""
+        self.assertEqual(lk.merge_expanded("A\nB", ""), "A\nB")
+
+    def test_before_empty_uses_after(self):
+        self.assertEqual(lk.merge_expanded("", "C\nD"), "C\nD")
+
+    def test_after_is_superset(self):
+        """展开后完全包含展开前——直接用展开后的，别拼出重复。"""
+        merged = lk.merge_expanded("B\nC", "A\nB\nC\nD")
+        self.assertEqual(merged.count("B"), 1)
+        self.assertIn("A", merged)
+        self.assertIn("D", merged)
+
+
 class MultiChatIsolationTests(unittest.TestCase):
     """两个群各绑各的 agent，互不串台。"""
 
